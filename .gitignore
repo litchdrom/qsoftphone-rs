@@ -1,0 +1,16 @@
+# Build output
+/target
+**/*.rs.bk
+
+# Local runtime state
+*.db
+*.db-wal
+*.db-shm
+config.json
+config.json.tmp
+*.log
+logs/
+
+# Packet captures (see .gitignore in the C++ sibling repo)
+*.pcap
+*.pcapng

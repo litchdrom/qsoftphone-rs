@@ -1,0 +1,20 @@
+# Normalise line endings in the repository to LF, and check them out
+# as LF on every platform. Rust sources are LF everywhere; without
+# this, a Windows checkout with core.autocrlf=true produces CRLF
+# churn in diffs against a Linux CI run.
+* text=auto eol=lf
+
+# These are meant to be run by a Windows shell.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary-ish assets.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.wav binary
+*.pcap binary
+*.pcapng binary
+*.sqlite binary
