@@ -61,16 +61,25 @@ pub fn resolve_dialed_number(
 ///    `From`, `Remote-Party-ID`, ...)
 /// 2. the local contact lookup
 /// 3. the user-part of the caller URI
+/// 4. the SIP Display Name — last resort only
 ///
 /// Step 1 is careful about *what kind* of header it is. A name-addr
 /// (`"Alice" <sip:alice@host>`) carries the display name outright. A
 /// bare URI (`Remote-Party-ID: sip:alice@host`) identifies the
 /// number, not the name — so it is fed to the contact lookup instead
 /// of being shown as a name.
+///
+/// Step 4 is the last resort because most SIP stacks put the URI in
+/// the Display Name: preferring it made the history column read
+/// `<sip:asterisk@193.178.169.164:5161>` instead of `asterisk`. The
+/// user-part of the URI (step 3) is preferred for exactly that
+/// reason, and the display name is only consulted when there is no
+/// user-part to show.
 pub fn resolve_caller_display_name(
     profile: &AccountProfile,
     captured: &HeaderMap,
     caller_uri: &str,
+    display_name: Option<&str>,
     contacts: Option<&Contacts<'_>>,
 ) -> String {
     let raw = profile.resolve_caller_id(captured);
@@ -92,12 +101,19 @@ pub fn resolve_caller_display_name(
 
     // 2. Local contact lookup on the caller's number.
     let number = sip_uri_user_part(caller_uri);
-    if let Some(name) = lookup_contact(contacts, &number) {
-        return name;
+    if !number.is_empty() {
+        if let Some(name) = lookup_contact(contacts, &number) {
+            return name;
+        }
+
+        // 3. The user-part of the caller URI.
+        return number;
     }
 
-    // 3. The user-part of the caller URI.
-    number
+    // 4. The SIP Display Name, last resort only.
+    display_name
+        .and_then(display_name_from_header)
+        .unwrap_or_default()
 }
 
 /// Extract a human-readable display name from a SIP header value.
@@ -246,7 +262,7 @@ mod tests {
         };
         let captured = headers(&[("X-Caller-Name", "Alice Smith")]);
         assert_eq!(
-            resolve_caller_display_name(&profile, &captured, "sip:6666@host", None),
+            resolve_caller_display_name(&profile, &captured, "sip:6666@host", None, None),
             "Alice Smith"
         );
     }
@@ -259,7 +275,7 @@ mod tests {
         };
         let captured = headers(&[("From", "\"Alice Smith\" <sip:6666@host>")]);
         assert_eq!(
-            resolve_caller_display_name(&profile, &captured, "sip:6666@host", None),
+            resolve_caller_display_name(&profile, &captured, "sip:6666@host", None, None),
             "Alice Smith"
         );
     }
@@ -268,8 +284,50 @@ mod tests {
     fn caller_name_falls_back_to_the_uri_user_part() {
         let profile = AccountProfile::default();
         assert_eq!(
-            resolve_caller_display_name(&profile, &HeaderMap::new(), "sip:6666@host", None),
+            resolve_caller_display_name(&profile, &HeaderMap::new(), "sip:6666@host", None, None),
             "6666"
+        );
+    }
+
+    #[test]
+    fn the_user_part_beats_the_display_name() {
+        // §5.2 step 3 comes before step 4: most stacks put the URI in
+        // the Display Name, so it must not win over a real user-part.
+        let profile = AccountProfile::default();
+        assert_eq!(
+            resolve_caller_display_name(
+                &profile,
+                &HeaderMap::new(),
+                "sip:6666@host",
+                Some("Alice Smith"),
+                None
+            ),
+            "6666"
+        );
+    }
+
+    #[test]
+    fn the_display_name_is_the_last_resort() {
+        // No user-part anywhere — the Display Name is all we have.
+        let profile = AccountProfile::default();
+        assert_eq!(
+            resolve_caller_display_name(&profile, &HeaderMap::new(), "", Some("Alice Smith"), None),
+            "Alice Smith"
+        );
+    }
+
+    #[test]
+    fn a_display_name_that_is_just_a_uri_is_not_used() {
+        let profile = AccountProfile::default();
+        assert_eq!(
+            resolve_caller_display_name(
+                &profile,
+                &HeaderMap::new(),
+                "",
+                Some("<sip:asterisk@193.178.169.164:5161>"),
+                None
+            ),
+            ""
         );
     }
 

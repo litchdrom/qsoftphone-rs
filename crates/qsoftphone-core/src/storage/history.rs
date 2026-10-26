@@ -30,9 +30,9 @@ impl<'a> HistoryStore<'a> {
             conn.execute(
                 "INSERT INTO calls
                     (account_id, call_id, direction, remote_number, remote_uri,
-                     remote_name, started_at, ended_at, duration_sec, sip_code,
-                     hangup_cause, answered, recorded)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                     remote_name, dialed_number, started_at, ended_at, duration_sec,
+                     sip_code, hangup_cause, answered, recorded)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     record.account_id,
                     record.call_id,
@@ -40,6 +40,7 @@ impl<'a> HistoryStore<'a> {
                     record.remote_number,
                     record.remote_uri,
                     record.remote_name,
+                    record.dialed_number,
                     record.started_at,
                     record.ended_at,
                     record.duration_sec,
@@ -58,7 +59,8 @@ impl<'a> HistoryStore<'a> {
         self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, account_id, call_id, direction, remote_number, remote_uri,
-                        remote_name, started_at, ended_at, duration_sec, sip_code,
+                        remote_name, dialed_number, started_at, ended_at, duration_sec,
+                        sip_code,
                         hangup_cause, answered, recorded
                  FROM calls
                  ORDER BY started_at DESC, id DESC
@@ -78,7 +80,8 @@ impl<'a> HistoryStore<'a> {
         self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, account_id, call_id, direction, remote_number, remote_uri,
-                        remote_name, started_at, ended_at, duration_sec, sip_code,
+                        remote_name, dialed_number, started_at, ended_at, duration_sec,
+                        sip_code,
                         hangup_cause, answered, recorded
                  FROM calls WHERE call_id = ?1 ORDER BY id DESC LIMIT 1",
             )?;
@@ -121,13 +124,14 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<CallRecord> {
         remote_number: row.get(4)?,
         remote_uri: row.get(5)?,
         remote_name: row.get(6)?,
-        started_at: row.get(7)?,
-        ended_at: row.get(8)?,
-        duration_sec: row.get(9)?,
-        sip_code: row.get(10)?,
-        hangup_cause: row.get(11)?,
-        answered: row.get::<_, i64>(12)? != 0,
-        recorded: row.get::<_, i64>(13)? != 0,
+        dialed_number: row.get(7)?,
+        started_at: row.get(8)?,
+        ended_at: row.get(9)?,
+        duration_sec: row.get(10)?,
+        sip_code: row.get(11)?,
+        hangup_cause: row.get(12)?,
+        answered: row.get::<_, i64>(13)? != 0,
+        recorded: row.get::<_, i64>(14)? != 0,
     })
 }
 
@@ -144,6 +148,7 @@ mod tests {
             1,
             "call-1",
             "sip:6666@193.178.169.164",
+            "6666",
             "Alice",
             1_000,
             61_000,
@@ -164,6 +169,31 @@ mod tests {
     }
 
     #[test]
+    fn the_dialed_number_round_trips() {
+        let db = Db::open_in_memory().unwrap();
+        let store = HistoryStore::new(&db);
+
+        store
+            .record(&CallRecord::from_incoming(
+                1,
+                "call-did",
+                "sip:asterisk@host",
+                "6666",
+                "Alice",
+                0,
+                0,
+                0,
+                "",
+                false,
+            ))
+            .unwrap();
+
+        let fetched = store.by_call_id("call-did").unwrap().unwrap();
+        assert_eq!(fetched.remote_number, "asterisk");
+        assert_eq!(fetched.dialed_number, "6666");
+    }
+
+    #[test]
     fn history_never_stores_the_local_aor_as_the_remote_number() {
         let db = Db::open_in_memory().unwrap();
         let store = HistoryStore::new(&db);
@@ -174,6 +204,7 @@ mod tests {
                 1,
                 "call-2",
                 "sip:6666@host",
+                "6666",
                 "",
                 0,
                 0,
@@ -218,7 +249,14 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let store = HistoryStore::new(&db);
         store
-            .record(&CallRecord::missed(1, "call-m", "sip:6666@host", "", 0))
+            .record(&CallRecord::missed(
+                1,
+                "call-m",
+                "sip:6666@host",
+                "6666",
+                "",
+                0,
+            ))
             .unwrap();
         store
             .record(&CallRecord::from_outgoing(

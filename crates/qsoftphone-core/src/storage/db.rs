@@ -90,6 +90,7 @@ impl Db {
                     remote_number TEXT,
                     remote_uri    TEXT,
                     remote_name   TEXT,
+                    dialed_number TEXT,
                     started_at    INTEGER,
                     ended_at      INTEGER,
                     duration_sec  INTEGER,
@@ -104,6 +105,27 @@ impl Db {
                     ON calls(call_id);
                 "#,
             )?;
+            Ok(())
+        })?;
+
+        self.add_missing_columns()?;
+        Ok(())
+    }
+
+    /// Bring an older database up to the current schema.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` does not touch a table that
+    /// already exists, so columns added after the first release need
+    /// an explicit `ALTER TABLE`.
+    fn add_missing_columns(&self) -> Result<()> {
+        let additions = [("calls", "dialed_number", "TEXT")];
+        self.with_conn(|conn| {
+            for (table, column, ty) in additions {
+                if !column_exists(conn, table, column)? {
+                    conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"), [])?;
+                    tracing::info!(table, column, "added a missing column");
+                }
+            }
             Ok(())
         })
     }
@@ -120,6 +142,19 @@ impl Db {
             .map_err(|_| Error::Message("database mutex poisoned".into()))?;
         f(&conn)
     }
+}
+
+/// Does `table` already have a column called `column`?
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name.eq_ignore_ascii_case(column) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -142,6 +177,65 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn an_older_database_gains_the_missing_column() {
+        // A database created before `dialed_number` existed must be
+        // brought up to the current schema on open.
+        let dir = std::env::temp_dir().join(format!("qsoftphone-mig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.sqlite");
+
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE calls (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id    INTEGER,
+                    call_id       TEXT,
+                    direction     TEXT,
+                    remote_number TEXT,
+                    remote_uri    TEXT,
+                    remote_name   TEXT,
+                    started_at    INTEGER,
+                    ended_at      INTEGER,
+                    duration_sec  INTEGER,
+                    sip_code      INTEGER,
+                    hangup_cause  TEXT,
+                    answered      INTEGER,
+                    recorded      INTEGER
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO calls (call_id, remote_number) VALUES (?1, ?2)",
+                rusqlite::params!["old-call", "6666"],
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let (has_column, old_row): (bool, i64) = db
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare("PRAGMA table_info(calls)")?;
+                let mut has = false;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let name: String = row.get(1)?;
+                    if name == "dialed_number" {
+                        has = true;
+                    }
+                }
+                let n: i64 = conn.query_row("SELECT COUNT(*) FROM calls", [], |r| r.get(0))?;
+                Ok((has, n))
+            })
+            .unwrap();
+
+        assert!(has_column, "dialed_number should have been added");
+        assert_eq!(old_row, 1, "existing rows must survive the migration");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

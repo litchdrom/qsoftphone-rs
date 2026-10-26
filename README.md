@@ -135,14 +135,16 @@ so the two can be diffed by hand.
 | URI user-part extraction, angle-bracket stripping | `src/core/sip/SipUri.cpp` | `sip::uri::sip_uri_user_part` |
 | Bare number → routable URI against the registrar | `src/core/call/CallController.cpp` (`normaliseSipTarget`) | `sip::uri::normalise_sip_target` |
 | §5.1 dialled number: header → Request-URI → To-URI | `CallController.cpp`, `src/core/call/AccountProfile.h` | `sip::identity::resolve_dialed_number` |
-| §5.2 caller display name: header → contacts → URI user-part | `CallController.cpp` | `sip::identity::resolve_caller_display_name` |
-| §5.3 history stores the *remote* number, never the local AOR | `src/core/history/CallHistory.h` | `model::history::CallRecord` |
-| §5.4 header capture allowlist | `src/core/call/AccountProfile.h` | `model::account::AccountProfile::filter_headers` |
-| §5.5 180 Ringing stops local ringback | `src/core/sip/SipEndpoint.cpp` | M1 |
-| §5.6 `Refer-To` / `Replaces` construction | `src/core/sip/SipEndpoint.cpp` | `sip::refer` |
+| §5.2 caller display name: header → contacts → URI user-part → Display Name | `CallController.cpp` | `sip::identity::resolve_caller_display_name` |
+| §5.3 history stores the *remote* number, never the local AOR | `src/core/history/CallHistory.h`, `src/app/Application.cpp` | `model::history::CallRecord` |
+| §5.4 180 Ringing on every inbound INVITE | `src/core/sip/SipEndpoint.cpp` | M2 |
+| §5.5 hang up without a forced status code | `src/core/sip/SipEndpoint.cpp` | M2 |
+| §5.6 `Refer-To` construction, blind and attended | `src/core/sip/SipEndpoint.cpp` | `sip::refer` |
+| §5.8 digest auth: MD5 + SHA-256, realm vs SIP domain | `src/core/sip/SipEndpoint.cpp` | M1 |
+| Header capture allowlist | `src/core/call/AccountProfile.h` | `model::account::AccountProfile::filter_headers` |
 | The call event contract | `src/core/call/CallEvent.h` | `model::call_event::CallEvent` |
 
-Two deliberate differences from the C++:
+Deliberate differences from the C++:
 
 * **The dialled-number header value is passed through the user-part
   extractor.** The C++ stores the raw header value; if the header
@@ -154,6 +156,39 @@ Two deliberate differences from the C++:
   returns nothing — so there was no rule to copy. Seven digits is the
   shortest national significant number (ITU-T E.123); anything shorter
   matches far too many people.
+* **`Refer-To` is built by hand, in the brief's exact form.** The C++
+  delegates to pjsip's `Call::xfer` / `Call::xferReplaces`. The brief
+  is explicit that the attended form carries `Replaces` as a URI
+  parameter inside the `Refer-To` value — not as a separate `Replaces`
+  header — and that the test suite expects exactly that.
+
+### One conflict in the brief, resolved in favour of the C++
+
+§5.3 says `remote_uri` is *"our own URI on an incoming call"*. The C++
+disagrees, and agrees with itself everywhere:
+
+* `src/core/history/CallHistory.h`: *"`remoteUri` is the full SIP URI
+  as pjsip saw it (caller for incoming, callee for outgoing)"*.
+* `src/app/Application.cpp:314-322`:
+  `otherUri = outgoing ? ev.callee : ev.caller` — the **peer** side for
+  both directions, with the comment *"For the URI line, we also pick
+  the peer side"*.
+* `src/ui/Dialer.qml` renders `remoteUri` as
+  `asterisk@193.178.169.164` for incoming calls — the peer again.
+
+The same section's load-bearing rule — *"`remote_number` is the SIP
+peer's user-part, never our own extension"* — is the one the C++
+satisfies, and the one that matters for redial. This crate therefore
+stores the **peer** URI in `remote_uri`.
+
+The brief's §5.1 requirement (*"store the resolved dialled number in
+history and use it for redial"*) is met by a separate `dialed_number`
+column, which is not in the C++ schema: under DID routing the peer may
+identify itself as `asterisk` while the customer dialled `6666`, and
+those are different numbers with different redial behaviour.
+
+If a test suite insists on the literal reading of §5.3 bullet 2, the
+change is one line in `model::history::CallRecord::new`.
 
 ### The event contract
 
@@ -190,6 +225,12 @@ Taken from the brief, recorded here so they are not re-litigated:
 * **A rejected transfer is reported, never swallowed.** If the server
   rejects the REFER, the error is shown and the call is *not* left
   running as if the transfer had succeeded.
+* **A failed transfer keeps the original call up.** §5.6 offers two
+  options — keep the original call so the user can retry, or release
+  it. This crate **keeps it up**. Releasing on failure loses a call
+  that was still good, and the user cannot retry a call that no
+  longer exists. The original leg *is* released on success, because
+  that is what "transferred" means (§5.6, and the bug the C++ had).
 * **Session recording and the CRM webhook endpoint are opt-in per
   account.** Neither is enabled by default.
 * **The REST API is bearer-token authenticated**, and the admin bind
@@ -202,11 +243,12 @@ Taken from the brief, recorded here so they are not re-litigated:
 | | Scope | State |
 |---|---|---|
 | **M0** | Workspace, pinned dependencies, tracing, config load/save, account CRUD in SQLite, the SIP pure functions with their tests | **done** |
-| M1 | rsipstack endpoint, registration, the inbound INVITE path, Request-URI capture, the 180 Ringing rule | next |
-| M2 | rtc media, cpal capture/playback, the dialer, DTMF, hold/mute | |
-| M3 | The REST API and the CRM plugin boundary | |
-| M4 | The call window, the history list, contacts | |
-| M5 | Recording, webhooks, the admin surface | |
+| **M1** | Registration: rsipstack transport, digest auth (MD5 + SHA-256), register/unregister, registration state surfaced to the UI | next |
+| M2 | Calling: outbound INVITE, inbound INVITE with automatic 180 Ringing (§5.4), answer, hang up without a forced code (§5.5), DTMF | |
+| M3 | History: SQLite persistence with the §5.3 semantics, redial using the resolved dialled number (§5.1), searchable list in the UI | |
+| M4 | Media: `rtc` RTP + `cpal` audio — SDP negotiation, send/receive audio, mute, codec selection | |
+| M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
+| M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
 One milestone at a time; M1 does not start before M0 works end to end.
 

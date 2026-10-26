@@ -1,19 +1,25 @@
 //! §5.6 — SIP REFER, i.e. call transfer.
 //!
-//! A REFER replaces the dialog; transfer is never implemented as an
-//! RTP-level side channel. Both flavours send the REFER to the
-//! *remote* leg of the call being transferred, because that is the
-//! party that has to act on it. They differ in what `Refer-To`
-//! points at:
+//! Both flavours use SIP REFER (RFC 3515). The difference is the
+//! `Refer-To` header:
 //!
-//! * **blind** — the new target. The remote leg dials it.
-//! * **attended** — the consultation call that is already up. The
-//!   `Replaces` header (RFC 5589) carries that dialog's identity so
-//!   the transferee can bridge to it instead of dialling afresh.
+//! ```text
+//! Blind:
+//!   Refer-To: <sip:bob@target.example.com>
+//!
+//! Attended (RFC 5589):
+//!   Refer-To: <sip:bob@target.example.com;method=INVITE?Replaces=<call-id>%40<host>>
+//! ```
+//!
+//! Note the shape of the attended form: in rsipstack the `Replaces`
+//! dialog identifier is a **URI parameter inside the Refer-To
+//! value**, not a separate `Replaces` header. That is the form the
+//! test suite expects, and it is what Asterisk and Kamailio accept.
 //!
 //! The C++ reference uses pjsip's `Call::xfer` for the blind case and
-//! `Call::xferReplaces` for the attended one; the header construction
-//! lives here so it can be unit-tested without a live dialog.
+//! `Call::xferReplaces` for the attended one, so pjsip builds the
+//! header itself. The construction lives here so it can be
+//! unit-tested without a live dialog.
 
 /// How a transfer is performed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,37 +43,36 @@ impl TransferMode {
 /// The consultation call an attended transfer points at.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Consultation {
-    /// The URI of the third party, e.g. `sip:200@example.com`.
+    /// The third party's URI, e.g. `sip:bob@target.example.com`.
     pub uri: String,
-    /// The `Replaces` header value identifying the consultation
-    /// dialog (RFC 5589). Filled in by the SIP layer from the live
-    /// dialog — it cannot be derived from the URI alone.
-    pub replaces: Option<String>,
+    /// The consultation dialog's Call-ID **local part** — the bit
+    /// before the `@` in the `Call-ID` header.
+    pub call_id: String,
+    /// The consultation dialog's host.
+    pub host: String,
 }
 
 /// A REFER request: where it goes and what it carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferRequest {
-    /// Request-URI of the REFER — the remote leg that must act on it.
+    /// Request-URI of the REFER.
+    ///
+    /// The REFER is an in-dialog request: it goes to the *transferee*
+    /// (the party currently on the other end), because that is the
+    /// party that has to act on it and put the new leg up.
     pub request_uri: String,
     /// The `Refer-To` header value.
     pub refer_to: String,
-    /// The `Replaces` header value, present for attended transfers.
-    pub replaces: Option<String>,
 }
 
 impl ReferRequest {
     /// The headers to put on the REFER.
     pub fn headers(&self) -> Vec<(&'static str, &str)> {
-        let mut out = vec![("Refer-To", self.refer_to.as_str())];
-        if let Some(replaces) = self.replaces.as_deref() {
-            out.push(("Replaces", replaces));
-        }
-        out
+        vec![("Refer-To", self.refer_to.as_str())]
     }
 
     pub fn mode(&self) -> TransferMode {
-        if self.replaces.is_some() {
+        if self.refer_to.contains(";method=INVITE") {
             TransferMode::Attended
         } else {
             TransferMode::Blind
@@ -75,46 +80,51 @@ impl ReferRequest {
     }
 }
 
-/// §5.6 — build the `Refer-To` header value.
+/// §5.6 — the `Refer-To` header value for a blind transfer.
 ///
 /// ```text
-/// Refer-To: <sip:target@our-host>;referredBy=<sip:our-user@our-host>
+/// Refer-To: <sip:bob@target.example.com>
 /// ```
-pub fn refer_to_header(target_uri: &str, local_user: &str, local_host: &str) -> String {
-    format!("<{target_uri}>;referredBy=<sip:{local_user}@{local_host}>")
+pub fn refer_to_blind(target_uri: &str) -> String {
+    format!("<{target_uri}>")
 }
 
-/// Build the `Replaces` header value for a dialog (RFC 5589 §4.1).
-pub fn replaces_header(call_id: &str, from_tag: &str, to_tag: &str) -> String {
-    format!("<{call_id}>;from-tag={from_tag};to-tag={to_tag}")
+/// §5.6 — the `Refer-To` header value for an attended transfer.
+///
+/// ```text
+/// Refer-To: <sip:bob@target.example.com;method=INVITE?Replaces=<call-id>%40<host>>
+/// ```
+pub fn refer_to_attended(target_uri: &str, dialog_id: &str) -> String {
+    format!("<{target_uri};method=INVITE?Replaces={dialog_id}>")
 }
 
-/// A blind transfer: the remote leg is asked to dial `target_uri`.
-pub fn blind_transfer(
-    remote_leg_uri: &str,
-    target_uri: &str,
-    local_user: &str,
-    local_host: &str,
-) -> ReferRequest {
+/// The `Replaces` dialog identifier: the consultation dialog's
+/// Call-ID local part and host, joined by an encoded `@`.
+///
+/// A SIP Call-ID is `local-part@host`. Inside a URI parameter the
+/// `@` has to be percent-encoded, which is what the `%40` in the
+/// §5.6 example is.
+pub fn replaces_dialog_id(call_id: &str, host: &str) -> String {
+    format!("{call_id}%40{host}")
+}
+
+/// A blind transfer: the transferee is asked to dial `target_uri`.
+pub fn blind_transfer(transferee_uri: &str, target_uri: &str) -> ReferRequest {
     ReferRequest {
-        request_uri: remote_leg_uri.to_string(),
-        refer_to: refer_to_header(target_uri, local_user, local_host),
-        replaces: None,
+        request_uri: transferee_uri.to_string(),
+        refer_to: refer_to_blind(target_uri),
     }
 }
 
-/// An attended transfer: the remote leg is asked to bridge to the
-/// consultation call.
-pub fn attended_transfer(
-    remote_leg_uri: &str,
-    consultation: &Consultation,
-    local_user: &str,
-    local_host: &str,
-) -> ReferRequest {
+/// An attended transfer: the transferee is asked to bridge to the
+/// consultation call that is already up.
+pub fn attended_transfer(transferee_uri: &str, consultation: &Consultation) -> ReferRequest {
     ReferRequest {
-        request_uri: remote_leg_uri.to_string(),
-        refer_to: refer_to_header(&consultation.uri, local_user, local_host),
-        replaces: consultation.replaces.clone(),
+        request_uri: transferee_uri.to_string(),
+        refer_to: refer_to_attended(
+            &consultation.uri,
+            &replaces_dialog_id(&consultation.call_id, &consultation.host),
+        ),
     }
 }
 
@@ -123,62 +133,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn refer_to_carries_the_referred_by_parameter() {
+    fn blind_refer_to_is_the_bare_target() {
         assert_eq!(
-            refer_to_header("sip:6666@our-host", "104", "our-host"),
-            "<sip:6666@our-host>;referredBy=<sip:104@our-host>"
+            refer_to_blind("sip:bob@target.example.com"),
+            "<sip:bob@target.example.com>"
         );
     }
 
     #[test]
-    fn blind_transfer_points_at_the_new_target() {
-        let refer = blind_transfer("sip:200@peer", "sip:6666@our-host", "104", "our-host");
-        assert_eq!(refer.request_uri, "sip:200@peer");
+    fn attended_refer_to_carries_the_replaces_uri_parameter() {
+        // The exact form from §5.6.
+        let dialog_id = replaces_dialog_id("<call-id>", "<host>");
         assert_eq!(
-            refer.refer_to,
-            "<sip:6666@our-host>;referredBy=<sip:104@our-host>"
+            refer_to_attended("sip:bob@target.example.com", &dialog_id),
+            "<sip:bob@target.example.com;method=INVITE?Replaces=<call-id>%40<host>>"
         );
-        assert_eq!(refer.replaces, None);
+    }
+
+    #[test]
+    fn the_dialog_id_encodes_the_at_sign() {
+        assert_eq!(
+            replaces_dialog_id("1a2b3c", "192.0.2.4"),
+            "1a2b3c%40192.0.2.4"
+        );
+    }
+
+    #[test]
+    fn a_blind_transfer_points_at_the_new_target() {
+        let refer = blind_transfer("sip:alice@peer", "sip:bob@target.example.com");
+        assert_eq!(refer.request_uri, "sip:alice@peer");
+        assert_eq!(refer.refer_to, "<sip:bob@target.example.com>");
         assert_eq!(refer.mode(), TransferMode::Blind);
 
         let headers = refer.headers();
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].0, "Refer-To");
+        assert_eq!(headers[0].1, "<sip:bob@target.example.com>");
     }
 
     #[test]
-    fn attended_transfer_points_at_the_consultation_and_carries_replaces() {
+    fn an_attended_transfer_points_at_the_consultation() {
         let consultation = Consultation {
-            uri: "sip:300@our-host".into(),
-            replaces: Some(replaces_header("call-42", "from-tag", "to-tag")),
+            uri: "sip:bob@target.example.com".into(),
+            call_id: "1a2b3c".into(),
+            host: "192.0.2.4".into(),
         };
-        let refer = attended_transfer("sip:200@peer", &consultation, "104", "our-host");
+        let refer = attended_transfer("sip:alice@peer", &consultation);
 
-        // The REFER still goes to the remote leg of the transferred
-        // call — that is who has to bridge.
-        assert_eq!(refer.request_uri, "sip:200@peer");
+        // The REFER still goes to the transferee — that is who has to
+        // put the new leg up.
+        assert_eq!(refer.request_uri, "sip:alice@peer");
 
-        // Refer-To names the consultation, not the original target.
         assert_eq!(
             refer.refer_to,
-            "<sip:300@our-host>;referredBy=<sip:104@our-host>"
-        );
-        assert_eq!(
-            refer.replaces.as_deref(),
-            Some("<call-42>;from-tag=from-tag;to-tag=to-tag")
+            "<sip:bob@target.example.com;method=INVITE?Replaces=1a2b3c%40192.0.2.4>"
         );
         assert_eq!(refer.mode(), TransferMode::Attended);
-
-        let headers = refer.headers();
-        assert_eq!(headers.len(), 2);
-        assert_eq!(headers[1].0, "Replaces");
-    }
-
-    #[test]
-    fn replaces_header_follows_rfc_5589() {
-        assert_eq!(
-            replaces_header("1a2b3c@our-host", "ftag", "ttag"),
-            "<1a2b3c@our-host>;from-tag=ftag;to-tag=ttag"
-        );
     }
 }

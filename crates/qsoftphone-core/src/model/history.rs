@@ -55,6 +55,15 @@ pub struct CallRecord {
     pub remote_uri: String,
     /// The remote party's display name.
     pub remote_name: String,
+    /// The number the remote party actually dialled (§5.1).
+    ///
+    /// This is what redial must use. It is *not* necessarily the
+    /// same as `remote_number`: when a PBX does DID routing it
+    /// forwards `sip:6666@host` to our AOR `sip:104@host`, so the
+    /// peer may identify itself as `asterisk@host` while the number
+    /// the customer dialled was 6666. Storing the To-URI instead
+    /// would make redial call our own extension back.
+    pub dialed_number: String,
     /// Epoch milliseconds.
     pub started_at: i64,
     /// Epoch milliseconds.
@@ -99,6 +108,7 @@ impl CallRecord {
             remote_number,
             remote_uri,
             remote_name: remote_name.into(),
+            dialed_number: String::new(),
             started_at,
             ended_at,
             duration_sec,
@@ -110,11 +120,16 @@ impl CallRecord {
     }
 
     /// §5.3 — an incoming call's remote party is the **caller**.
+    ///
+    /// `dialed_number` is the resolved dialled number (§5.1) — the
+    /// number the customer actually dialled, which for a DID-forwarded
+    /// call is *not* the To-URI.
     #[allow(clippy::too_many_arguments)]
     pub fn from_incoming(
         account_id: i64,
         call_id: impl Into<String>,
         caller_uri: impl Into<String>,
+        dialed_number: impl Into<String>,
         remote_name: impl Into<String>,
         started_at: i64,
         ended_at: i64,
@@ -122,7 +137,7 @@ impl CallRecord {
         hangup_cause: impl Into<String>,
         answered: bool,
     ) -> Self {
-        Self::new(
+        let mut record = Self::new(
             account_id,
             call_id,
             Direction::Incoming,
@@ -133,7 +148,9 @@ impl CallRecord {
             sip_code,
             hangup_cause,
             answered,
-        )
+        );
+        record.dialed_number = dialed_number.into();
+        record
     }
 
     /// §5.3 — an outgoing call's remote party is the **callee**.
@@ -149,7 +166,7 @@ impl CallRecord {
         hangup_cause: impl Into<String>,
         answered: bool,
     ) -> Self {
-        Self::new(
+        let mut record = Self::new(
             account_id,
             call_id,
             Direction::Outgoing,
@@ -160,7 +177,11 @@ impl CallRecord {
             sip_code,
             hangup_cause,
             answered,
-        )
+        );
+        // We dialled the callee, so the dialled number is its
+        // user-part.
+        record.dialed_number = sip_uri_user_part(&record.remote_uri);
+        record
     }
 
     /// A missed call is an incoming call that was never answered, so
@@ -169,10 +190,11 @@ impl CallRecord {
         account_id: i64,
         call_id: impl Into<String>,
         caller_uri: impl Into<String>,
+        dialed_number: impl Into<String>,
         remote_name: impl Into<String>,
         started_at: i64,
     ) -> Self {
-        Self::new(
+        let mut record = Self::new(
             account_id,
             call_id,
             Direction::Missed,
@@ -183,7 +205,9 @@ impl CallRecord {
             0,
             "",
             false,
-        )
+        );
+        record.dialed_number = dialed_number.into();
+        record
     }
 }
 
@@ -199,6 +223,7 @@ mod tests {
             1,
             "call-1",
             "sip:6666@193.178.169.164",
+            "6666",
             "Alice",
             1_000,
             61_000,
@@ -209,6 +234,28 @@ mod tests {
         assert_eq!(record.remote_number, "6666");
         assert_eq!(record.remote_uri, "sip:6666@193.178.169.164");
         assert_ne!(record.remote_number, "104");
+    }
+
+    #[test]
+    fn the_dialed_number_is_kept_separately_from_the_peer() {
+        // §5.1 + §5.3. A PBX forwards a DID call: the peer identifies
+        // itself as asterisk, but the customer dialled 6666. History
+        // stores both, and redial uses the dialled number.
+        let record = CallRecord::from_incoming(
+            1,
+            "call-did",
+            "sip:asterisk@193.178.169.164",
+            "6666",
+            "Alice",
+            0,
+            0,
+            0,
+            "",
+            false,
+        );
+        assert_eq!(record.remote_number, "asterisk");
+        assert_eq!(record.dialed_number, "6666");
+        assert_ne!(record.dialed_number, "104");
     }
 
     #[test]
@@ -226,21 +273,35 @@ mod tests {
         );
         assert_eq!(record.remote_number, "6666");
         assert_eq!(record.remote_uri, "sip:6666@193.178.169.164");
+        // We dialled the callee, so the dialled number is its
+        // user-part.
+        assert_eq!(record.dialed_number, "6666");
     }
 
     #[test]
     fn a_missed_call_is_an_incoming_call() {
-        let record = CallRecord::missed(1, "call-3", "sip:6666@host", "Alice", 1_000);
+        let record = CallRecord::missed(1, "call-3", "sip:6666@host", "6666", "Alice", 1_000);
         assert_eq!(record.direction, Direction::Missed);
         assert_eq!(record.remote_number, "6666");
+        assert_eq!(record.dialed_number, "6666");
         assert!(!record.answered);
         assert_eq!(record.duration_sec, 0);
     }
 
     #[test]
     fn the_remote_number_is_never_the_angle_bracket_junk() {
-        let record =
-            CallRecord::from_incoming(1, "call-4", "<sip:6666@host>", "", 0, 0, 0, "", false);
+        let record = CallRecord::from_incoming(
+            1,
+            "call-4",
+            "<sip:6666@host>",
+            "6666",
+            "",
+            0,
+            0,
+            0,
+            "",
+            false,
+        );
         assert_eq!(record.remote_number, "6666");
     }
 
@@ -250,6 +311,7 @@ mod tests {
             1,
             "call-5",
             "sip:6666@host",
+            "6666",
             "",
             1_000,
             61_500,
