@@ -30,6 +30,21 @@ t=0 0\r\n\
 m=audio 4000 RTP/AVP 0\r\n\
 a=rtpmap:0 PCMU/8000\r\n";
 
+/// The offer the peer sends — the one Asterisk sends.
+///
+/// G.711 A-law and telephone-event. No µ-law: an answer that names
+/// µ-law would be invalid, and Asterisk hangs up with a BYE right
+/// after the `200 OK`.
+const PEER_ALAW_OFFER: &str = "v=0\r\n\
+o=- 124519 124519 IN IP4 127.0.0.1\r\n\
+s=asterisk\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 50344 RTP/AVP 8 101\r\n\
+a=rtpmap:8 PCMA/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=ptime:20\r\n";
+
 /// The value of a header in a raw SIP message.
 fn header_value(message: &str, name: &str) -> Option<String> {
     message.lines().find_map(|line| {
@@ -82,6 +97,9 @@ struct Observations {
     /// A message is either a request (`INVITE …`) or a response
     /// (`SIP/2.0 180 Ringing`).
     messages: Vec<String>,
+    /// The full text of every message the peer received, in the same
+    /// order.
+    raw: Vec<String>,
 }
 
 impl Observations {
@@ -98,6 +116,17 @@ impl Observations {
         self.messages
             .iter()
             .any(|line| line.starts_with("SIP/") && line.contains(fragment))
+    }
+
+    /// The full text of the first response whose status line contains
+    /// `fragment`.
+    fn response(&self, fragment: &str) -> Option<String> {
+        let mut raw = self.raw.iter();
+        self.messages
+            .iter()
+            .zip(raw.by_ref())
+            .find(|(line, _)| line.starts_with("SIP/") && line.contains(fragment))
+            .map(|(_, raw)| raw.clone())
     }
 }
 
@@ -222,6 +251,11 @@ async fn run_peer(
             .expect("observations lock")
             .messages
             .push(first.clone());
+        observations
+            .lock()
+            .expect("observations lock")
+            .raw
+            .push(text.clone());
 
         // A response is not a request — answering it would start a
         // message storm.
@@ -324,6 +358,11 @@ async fn run_peer(
             if method == "REGISTER" && call_back && !already_called {
                 // The Via and the Contact both name the peer's real
                 // address: our responses to this INVITE go back to it.
+                //
+                // The offer is the one Asterisk sends: G.711 A-law and
+                // telephone-event. No µ-law — so an answer that says
+                // µ-law is invalid (RFC 3264 §6), and Asterisk hangs up
+                // with a BYE right after the 200 OK.
                 let invite = format!(
                     concat!(
                         "INVITE sip:104@{addr} SIP/2.0\r\n",
@@ -335,10 +374,13 @@ async fn run_peer(
                         "CSeq: 1 INVITE\r\n",
                         "Contact: <sip:peer@{addr}>\r\n",
                         "Content-Type: application/sdp\r\n",
-                        "Content-Length: 0\r\n",
+                        "Content-Length: {length}\r\n",
                         "\r\n",
+                        "{body}"
                     ),
-                    addr = peer_addr
+                    addr = peer_addr,
+                    length = PEER_ALAW_OFFER.len(),
+                    body = PEER_ALAW_OFFER,
                 );
                 socket
                     .send_to(invite.as_bytes(), address)
@@ -570,6 +612,24 @@ async fn an_incoming_call_rings_before_the_user_answers() {
             .expect("observations lock")
             .saw_response("200 OK"),
         "the peer never got the 200 OK"
+    );
+
+    // The answer has to name a codec the offer listed (RFC 3264 §6).
+    // The peer offered G.711 A-law and telephone-event only; an answer
+    // that said µ-law is invalid, and Asterisk hangs up with a BYE
+    // right after the 200 OK.
+    let answer = observations
+        .lock()
+        .expect("observations lock")
+        .response("200 OK")
+        .expect("the peer never got a 200 OK");
+    assert!(
+        answer.contains("a=rtpmap:8 PCMA/8000"),
+        "the answer must use the codec the peer offered: {answer}"
+    );
+    assert!(
+        !answer.contains("PCMU"),
+        "the answer must not name a codec the peer did not offer: {answer}"
     );
 }
 

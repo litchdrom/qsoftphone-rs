@@ -183,7 +183,7 @@ impl CallManager {
             callee,
             contact: contact_uri(&account, &session),
             content_type: Some("application/sdp".to_string()),
-            offer: Some(sdp::placeholder_sdp(
+            offer: Some(sdp::offer_sdp(
                 &media_address(&session),
                 sdp::PLACEHOLDER_MEDIA_PORT,
                 1,
@@ -223,6 +223,11 @@ impl CallManager {
     /// Answer an incoming call.
     ///
     /// The `200 OK` carries the SDP and a NAT-aware Contact.
+    ///
+    /// The SDP is the **answer** to the offer the peer sent, not a
+    /// fixed body: RFC 3264 §6 says the answer may only name media
+    /// formats the offer listed, and a peer that offered only G.711
+    /// A-law would hang up on a fixed G.711 µ-law answer.
     pub fn answer(&self, account_id: &str, call_id: &str) -> Result<(), CallError> {
         let session = self
             .sessions
@@ -239,7 +244,13 @@ impl CallManager {
             .ok_or_else(|| CallError::Sip("the endpoint has no local address".to_string()))?;
 
         let headers = vec![Header::ContentType("application/sdp".into())];
-        let body = sdp::placeholder_sdp(&media_address(&session), sdp::PLACEHOLDER_MEDIA_PORT, 1);
+        let offer = dialog.initial_request().body.clone();
+        let body = sdp::answer_sdp(
+            &offer,
+            &media_address(&session),
+            sdp::PLACEHOLDER_MEDIA_PORT,
+            1,
+        );
 
         dialog
             .accept_with_public_contact(
@@ -364,8 +375,22 @@ pub async fn handle_incoming_invite(
     session.remember(&call_id, dialog.clone());
 
     // §5.4 — the 180 Ringing, immediately.
+    //
+    // The Contact is the public one, the same address the `200 OK`
+    // will carry. rsipstack would otherwise put the local socket in
+    // it — `0.0.0.0` or a private address — and a peer that takes the
+    // Contact from the provisional response would send the BYE to the
+    // wrong place.
+    let contact = match session.endpoint.get_addrs().first().cloned() {
+        Some(local) => Some(vec![crate::inspector::nat_aware_contact(
+            &account.user,
+            session.public_address.get(),
+            &local,
+        )]),
+        None => None,
+    };
     dialog
-        .ringing(None, None)
+        .ringing(contact, None)
         .map_err(|e| CallError::Sip(e.to_string()))?;
 
     // The response only reaches the wire if somebody drives the

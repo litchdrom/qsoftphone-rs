@@ -467,7 +467,39 @@ the Via of any response for the registrar's `received`/`rport` and
 exposes it as the session's `PublicAddress`. The outbound INVITE's
 Contact and the inbound `200 OK` use it.
 
-### The SDP is a placeholder
+### The answer has to name a codec the offer listed
+
+The first version of the answer was a fixed body: one PCMU stream.
+Against a real Asterisk that is **wrong**, and the symptom is brutal —
+Asterisk answers the `200 OK` with a `BYE` a millisecond later.
+
+The reason is RFC 3264 §6: the answer may only use media formats the
+offer listed. Asterisk's offer is
+
+```text
+m=audio 50344 RTP/AVP 8 101
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+```
+
+— G.711 **A-law** and telephone-event. A fixed G.711 µ-law answer
+(`m=audio 4000 RTP/AVP 0`) names a format the offer never mentioned,
+so the answer is invalid and the peer is entitled to tear the call
+down. Asterisk does.
+
+So the answer is built from the offer now: the codecs this build
+speaks are looked for in what the peer offered, and the peer's own
+payload type is echoed back. A peer that put µ-law on a dynamic
+payload type gets that number back. When nothing is common the stream
+is rejected with `m=audio 0` — RFC 3264's way of saying "no media" —
+and the call itself stays up.
+
+The offer lists both G.711 codecs, and deliberately **not**
+`telephone-event`: there is no RTP yet, so negotiating RFC 2833 would
+make the peer send the digits into a stream nobody reads. Without it
+the peer falls back to RFC 4733, which this build can receive.
+
+### The SDP is otherwise a placeholder
 
 There is no audio in M2, and the SDP says so: one PCMU stream on a port
 that is not bound, `a=sendrecv`. The call connects, the SIP trace is
@@ -490,13 +522,37 @@ Duration=100
 The body is built and parsed by `qsoftphone-sip::sdp`, and rsipstack's
 own `parse_info_dtmf` is used to recognise it. M4 may switch to RFC 2833.
 
-### The UI
+### The window
+
+The window opens on the **Call** page: the dialer is at the top, the
+calls are listed under it, and the account settings are a page away
+rather than in the way.
+
+```text
+┌───────────────────────────────────────────────────────────────┐
+│ 104 · 104@193.178.169.164:5161   Not registered  [Register]  │
+├──────────┬────────────────────────────────────────────────────┤
+│ ACCOUNTS │ [Call] [Account]              M2 — calling   v0.1.0│
+│          │ Ready.                                            │
+│  104     │ Number [ 6666               ]  [Call]             │
+│          │ CALLS                                             │
+│ + Add    │  ← Alice  connected                   [Hang up]   │
+│  Remove  │    [1][2][3] [4][5][6] [7][8][9] [*][0][#]        │
+└──────────┴────────────────────────────────────────────────────┘
+```
+
+The **Register** button is in the header, next to the state it
+changes. A softphone that needs a trip through a settings form before
+it can register is a softphone nobody uses — and that was the first
+version's mistake: the whole account form sat above the dialer, and
+the dialer was below the fold.
 
 The dialer is only live for a **registered** account — a call needs an
 endpoint to go out from, and the call layer refuses it if there is
-none. The call panel follows the newest call that is not over, and shows
-the resolved peer name, the dialled number, the last DTMF digit and a
-hang-up button, with the DTMF keypad once the call is connected.
+none. The call panel follows the newest call that is not over, and
+shows the resolved peer name, the dialled number, the last DTMF digit
+and a hang-up button, with the DTMF keypad once the call is
+connected. A call that arrives switches the window to the call page.
 
 The incoming-call modal is §5.7's rule: **it cannot be closed by the
 user.** No close button, no click-outside-to-dismiss, no Esc — only
@@ -586,7 +642,7 @@ One milestone at a time; M2 does not start before M1 works end to end.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 146 tests, all passing.
+* `cargo test --workspace` — 158 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -634,10 +690,17 @@ One milestone at a time; M2 does not start before M1 works end to end.
 * **A DTMF digit arrives as an event** (`dtmf`, with the digit), and
   **a DTMF digit sent by the app arrives at the peer as an `INFO`**
   request.
+* **The answer names a codec the offer listed.** The loopback peer
+  offers G.711 A-law and telephone-event — the offer Asterisk sends —
+  and the test reads the `200 OK` off the wire and checks that it says
+  PCMA and not PCMU. This is the bug that made Asterisk hang up on
+  every answered call.
 * **The incoming-call modal cannot be dismissed.** The UI is driven
   headlessly (egui lays the widgets out without a window): Esc and a
   click outside the modal are fed in, and the modal is still up
   afterwards. Answering or ending the call closes it.
+* **The window opens on the call page, and a call brings it forward.**
+  Both are tests, not intentions.
 
 **Not verified:**
 
@@ -655,12 +718,10 @@ One milestone at a time; M2 does not start before M1 works end to end.
   instance has placed or received one.
 * **No audio.** The SDP is a placeholder and no RTP has been sent. That
   is M4.
-* The GUI has been started and its window inspected by title, but the
-  layout has not been reviewed by a human at normal resolution — the
-  desktop this was built on was locked, so the window could not be
-  photographed. What *is* proved is that the UI lays out and draws
-  without panicking, and that the M2 behaviours above hold, in a
-  headless egui run.
+* The GUI has been started and its window photographed, so the layout
+  is as it is shown above. It has not been reviewed by a human at
+  normal resolution — this machine's desktop was locked for most of
+  the build, and the screenshots were taken when it was not.
 * The Linux build has not been compiled or run. The dependency tree is
   resolved for `x86_64-unknown-linux-gnu` (384 package names) but no
   Linux binary was produced.

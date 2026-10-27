@@ -37,6 +37,6 @@ pub use digest::DigestInterop;
 pub use endpoint::{USER_AGENT, build_endpoint, split_host_port};
 pub use inspector::{PublicAddress, SessionInspector};
 pub use registrar::{RegistrationManager, RegistrationTask};
-pub use sdp::{dtmf_relay_body, placeholder_sdp};
+pub use sdp::{answer_sdp, choose_format, dtmf_relay_body, offer_sdp, offered_formats};
 pub use session::{AccountSession, SessionRegistry};
 pub use state::{RegistrationEvent, RegistrationState};

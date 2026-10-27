@@ -34,8 +34,14 @@ pub struct QSoftphoneApp {
     calls: CallManager,
     /// What the UI shows about each call, keyed by SIP Call-ID.
     call_views: HashMap<String, CallView>,
+    /// The calls in the order they arrived.
+    ///
+    /// The map above is a lookup; this is the list the UI shows.
+    call_order: Vec<String>,
     /// The call the call panel is showing.
     active_call_id: Option<String>,
+    /// Which page the middle panel shows.
+    view: View,
     /// The number the dialer has.
     dial_number: String,
     states: HashMap<String, RegistrationState>,
@@ -58,6 +64,20 @@ pub struct QSoftphoneApp {
     status: String,
     /// The theme is applied once, on the first frame.
     theme_applied: bool,
+}
+
+/// Which page the middle panel shows.
+///
+/// Two pages, and the one that matters is the first: a softphone is
+/// for calling, so the dialer is what the window opens on. The account
+/// settings are there when they are wanted and out of the way when
+/// they are not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    /// The dialer and the calls.
+    Call,
+    /// The account settings.
+    Account,
 }
 
 /// What the UI shows about one call.
@@ -164,7 +184,9 @@ impl QSoftphoneApp {
             registrations: RegistrationManager::new(runtime.clone(), sessions.clone(), bus.clone()),
             calls: CallManager::new(runtime, sessions, bus, call_events),
             call_views: HashMap::new(),
+            call_order: Vec::new(),
             active_call_id: None,
+            view: View::Call,
             dial_number: String::new(),
             states: HashMap::new(),
             accounts,
@@ -201,6 +223,7 @@ impl QSoftphoneApp {
             }
             let call_id = event.call_id.clone();
 
+            let is_new = !self.call_views.contains_key(&call_id);
             let view = self
                 .call_views
                 .entry(call_id.clone())
@@ -208,6 +231,9 @@ impl QSoftphoneApp {
                     call_id: call_id.clone(),
                     ..Default::default()
                 });
+            if is_new {
+                self.call_order.push(call_id.clone());
+            }
 
             view.account_id = update.account_id.clone();
             if let Some(direction) = event.call_direction {
@@ -226,7 +252,12 @@ impl QSoftphoneApp {
                 view.digit = event.digit.clone();
             }
             match event.event_type {
-                CallEventType::IncomingCall => view.peer = event.caller.clone(),
+                CallEventType::IncomingCall => {
+                    view.peer = event.caller.clone();
+                    // A call is coming in: show the call page, not the
+                    // account settings.
+                    self.view = View::Call;
+                }
                 CallEventType::OutgoingCallInitiated => view.peer = event.callee.clone(),
                 CallEventType::CallEnded => view.ended = true,
                 _ => {}
@@ -237,6 +268,14 @@ impl QSoftphoneApp {
                 self.active_call_id = Some(call_id);
             }
         }
+    }
+
+    /// The calls, in the order they arrived.
+    fn calls(&self) -> Vec<CallView> {
+        self.call_order
+            .iter()
+            .filter_map(|id| self.call_views.get(id).cloned())
+            .collect()
     }
 
     /// The state of an account's registration.
@@ -498,36 +537,60 @@ impl QSoftphoneApp {
         self.drain_registrations();
         self.drain_calls();
 
-        egui::Panel::top("top_bar").show(ui, |ui| {
-            // The registration state of the selected account, read from
-            // the cached state the SIP layer pushed over the channel.
-            let sip_state = self
-                .selected
-                .and_then(|i| self.accounts.get(i))
-                .map(|a| self.registration_state(&a.id).summary())
-                .unwrap_or_else(|| "No account selected".to_string());
+        // The header. One line: who we are and whether we are
+        // registered. Everything else is a page.
+        egui::Panel::top("header").exact_size(32.0).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("qsoftphone");
+                let account = self.selected_account().cloned();
+                let title = match &account {
+                    Some(account) => {
+                        let name = if account.label.is_empty() {
+                            account.user.clone()
+                        } else {
+                            account.label.clone()
+                        };
+                        format!("{name} · {}@{}", account.user, account.registrar)
+                    }
+                    None => "No account".to_string(),
+                };
+                ui.label(egui::RichText::new(title).strong().size(15.0));
+
                 ui.separator();
-                ui.label(format!("SIP: {sip_state}"));
-                ui.separator();
-                ui.label("M2 — calling");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
-                });
+                let state = account
+                    .as_ref()
+                    .map(|account| self.registration_state(&account.id).summary())
+                    .unwrap_or_default();
+                ui.label(state);
+
+                // The registration button lives next to the state it
+                // changes. A softphone that needs a trip through a
+                // settings form before it can register is a softphone
+                // nobody uses.
+                if let Some(account) = account {
+                    if self.registration_state(&account.id).is_registered() {
+                        if ui.button("Unregister").clicked() {
+                            self.unregister_selected();
+                        }
+                    } else if ui.button("Register").clicked() {
+                        self.register_selected();
+                    }
+                }
             });
         });
 
+        // The status line. It lives at the top of the page rather than
+        // in a panel of its own: the panels are for the page, and a
+        // message has to be where the eye already is.
         egui::Panel::left("accounts")
             .resizable(true)
-            .default_size(280.0)
+            .default_size(230.0)
             .show(ui, |ui| {
+                ui.label(egui::RichText::new("ACCOUNTS").strong().size(11.0));
+                ui.separator();
+
                 // Set when the user picks a different account; applied
                 // once the account list's borrow has ended.
                 let mut pending_select: Option<usize> = None;
-
-                ui.heading("Accounts");
-                ui.separator();
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     if self.accounts.is_empty() {
@@ -540,7 +603,7 @@ impl QSoftphoneApp {
                             account.label.clone()
                         };
                         let text = if label.is_empty() {
-                            format!("(unnamed account #{index})")
+                            format!("(unnamed #{index})")
                         } else {
                             label
                         };
@@ -568,201 +631,50 @@ impl QSoftphoneApp {
                 }
 
                 ui.separator();
-                egui::CollapsingHeader::new("Add account").show(ui, |ui| {
-                    let draft = &mut self.new_account;
-                    ui.label("Label");
-                    ui.text_edit_singleline(&mut draft.label);
-                    ui.label("Registrar");
-                    ui.text_edit_singleline(&mut draft.registrar);
-                    ui.label("User");
-                    ui.text_edit_singleline(&mut draft.user);
-                    ui.label("Password");
-                    ui.add(egui::TextEdit::singleline(&mut draft.password).password(true));
-                    ui.horizontal(|ui| {
-                        ui.label("Transport");
-                        egui::ComboBox::from_id_salt("new_transport")
-                            .selected_text(&draft.transport)
-                            .show_ui(ui, |ui| {
-                                for t in ["udp", "tcp", "tls"] {
-                                    ui.selectable_value(&mut draft.transport, t.to_string(), t);
-                                }
-                            });
-                    });
-                    if ui.button("Add").clicked() {
-                        self.add_account();
+                ui.horizontal(|ui| {
+                    if ui.button("+ Add").clicked() {
+                        self.view = View::Account;
+                    }
+                    if ui.button("Remove").clicked() {
+                        self.delete_selected();
                     }
                 });
-
-                if ui.button("Remove selected").clicked() {
-                    self.delete_selected();
-                }
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            let account = self.selected_account().cloned();
-
-            let Some(account) = account else {
-                ui.weak("Select an account, or add one on the left.");
-                ui.separator();
-                ui.label(format!("Status: {}", self.status));
-                return;
-            };
-
-            ui.heading(if account.label.is_empty() {
-                "(unnamed account)".to_string()
-            } else {
-                account.label.clone()
-            });
-            ui.weak(format!("id {}", account.id));
-            ui.separator();
-
-            // The editor. The borrow of the draft ends with this
-            // block, so the buttons below can take `&mut self`.
-            {
-                let draft = &mut self.edit_account;
-                egui::Grid::new("account_editor")
-                    .num_columns(2)
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.label("Label");
-                        ui.text_edit_singleline(&mut draft.label);
-                        ui.end_row();
-
-                        ui.label("Registrar");
-                        ui.text_edit_singleline(&mut draft.registrar);
-                        ui.end_row();
-
-                        ui.label("User");
-                        ui.text_edit_singleline(&mut draft.user);
-                        ui.end_row();
-
-                        ui.label("Password");
-                        ui.add(egui::TextEdit::singleline(&mut draft.password).password(true));
-                        ui.end_row();
-
-                        ui.label("Transport");
-                        egui::ComboBox::from_id_salt("edit_transport")
-                            .selected_text(&draft.transport)
-                            .show_ui(ui, |ui| {
-                                for t in ["udp", "tcp", "tls"] {
-                                    ui.selectable_value(&mut draft.transport, t.to_string(), t);
-                                }
-                            });
-                        ui.end_row();
-
-                        ui.label("Domain");
-                        ui.text_edit_singleline(&mut draft.domain);
-                        ui.end_row();
-
-                        ui.label("Outbound proxy");
-                        ui.text_edit_singleline(&mut draft.outbound_proxy);
-                        ui.end_row();
-
-                        ui.label("Caller name header");
-                        ui.text_edit_singleline(&mut draft.caller_id_header);
-                        ui.end_row();
-
-                        ui.label("Dialled number header");
-                        ui.text_edit_singleline(&mut draft.dialed_number_header);
-                        ui.end_row();
-                    });
-            }
-
+            // Two pages, one line to switch between them.
             ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    self.save_selected();
-                }
-                if ui.button("Revert").clicked() {
-                    self.load_selected();
-                    self.status = "Reverted.".to_string();
-                }
-            });
-
-            ui.separator();
-            ui.label("Registration");
-            ui.horizontal(|ui| {
-                ui.label(self.registration_state(&account.id).summary());
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Register").clicked() {
-                    self.register_selected();
-                }
-                if ui.button("Unregister").clicked() {
-                    self.unregister_selected();
-                }
-            });
-
-            ui.separator();
-            ui.label("Call");
-            let registered = self.registration_state(&account.id).is_registered();
-            ui.horizontal(|ui| {
-                let number = &mut self.dial_number;
-                ui.add(
-                    egui::TextEdit::singleline(number)
-                        .hint_text("Number to call")
-                        .desired_width(180.0),
-                );
-                let disabled = !registered || number.trim().is_empty();
                 if ui
-                    .add_enabled(!disabled, egui::Button::new("Call"))
+                    .selectable_label(self.view == View::Call, "Call")
                     .clicked()
                 {
-                    self.place_call();
+                    self.view = View::Call;
                 }
-            });
-            if !registered {
-                ui.weak("The account has to be registered before it can call.");
-            }
-
-            // The call panel.
-            if let Some(call) = self.active_call().cloned() {
+                if ui
+                    .selectable_label(self.view == View::Account, "Account")
+                    .clicked()
+                {
+                    self.view = View::Account;
+                }
                 ui.separator();
-                let who = if call.caller_id.is_empty() {
-                    call.peer.clone()
-                } else {
-                    call.caller_id.clone()
-                };
-                ui.label(format!("Call: {who} — {}", call.state));
-                if !call.dialed_number.is_empty() {
-                    ui.weak(format!("Dialled: {}", call.dialed_number));
-                }
-                if !call.digit.is_empty() {
-                    ui.weak(format!("Digit: {}", call.digit));
-                }
-                ui.horizontal(|ui| {
-                    if ui.button("Hang up").clicked() {
-                        self.hangup_call();
-                    }
-                });
-
-                if call.state == "connected" {
-                    ui.label("DTMF");
-                    egui::Grid::new("dtmf").num_columns(3).show(ui, |ui| {
-                        for row in [
-                            ["1", "2", "3"],
-                            ["4", "5", "6"],
-                            ["7", "8", "9"],
-                            ["*", "0", "#"],
-                        ] {
-                            for digit in row {
-                                if ui.button(digit).clicked() {
-                                    self.send_dtmf(digit);
-                                }
-                                ui.end_row();
-                            }
-                        }
-                    });
-                }
-            }
-
-            ui.separator();
-            ui.label(format!("Status: {}", self.status));
-            ui.separator();
-            egui::CollapsingHeader::new("Paths").show(ui, |ui| {
-                ui.monospace(format!("config  {}", self.paths.config_file().display()));
-                ui.monospace(format!("data    {}", self.paths.data_dir().display()));
-                ui.monospace(format!("logs    {}", self.paths.log_dir().display()));
+                ui.label(egui::RichText::new("M2 — calling").small());
+                ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).small());
             });
+            ui.separator();
+
+            // The status line: one line, always visible, so a message
+            // never gets pushed off the bottom of the window.
+            ui.label(
+                egui::RichText::new(&self.status)
+                    .small()
+                    .color(egui::Color32::GRAY),
+            );
+            ui.add_space(4.0);
+
+            match self.view {
+                View::Call => self.draw_calls(ui),
+                View::Account => self.draw_account(ui),
+            }
         });
 
         // The incoming-call modal.
@@ -795,6 +707,242 @@ impl QSoftphoneApp {
                 });
             });
         }
+    }
+
+    /// The call page: the dialer, and the calls.
+    fn draw_calls(&mut self, ui: &mut egui::Ui) {
+        // The dialer. It is the first thing on the page, because it is
+        // what the window is mostly for.
+        let registered = self
+            .selected_account()
+            .is_some_and(|account| self.registration_state(&account.id).is_registered());
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Number").strong());
+            let number = &mut self.dial_number;
+            ui.add(
+                egui::TextEdit::singleline(number)
+                    .hint_text("6666")
+                    .desired_width(200.0),
+            );
+
+            let disabled = !registered || number.trim().is_empty();
+            if ui
+                .add_enabled(
+                    !disabled,
+                    egui::Button::new("Call").min_size(egui::vec2(70.0, 0.0)),
+                )
+                .clicked()
+            {
+                self.place_call();
+            }
+        });
+        if !registered {
+            ui.weak("Register the account before it can call.");
+        }
+
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("CALLS").strong().size(11.0));
+        ui.separator();
+
+        let calls = self.calls();
+        if calls.is_empty() {
+            ui.weak("No calls yet.");
+            return;
+        }
+        for call in calls {
+            self.draw_call(ui, call);
+            ui.separator();
+        }
+    }
+
+    /// One call, in the call list.
+    fn draw_call(&mut self, ui: &mut egui::Ui, call: CallView) {
+        let who = if call.caller_id.is_empty() {
+            call.peer.clone()
+        } else {
+            call.caller_id.clone()
+        };
+        let arrow = match call.direction {
+            Some(Direction::Incoming) => "←",
+            Some(Direction::Outgoing) => "→",
+            None => "·",
+        };
+        let active = self.active_call_id.as_deref() == Some(call.call_id.as_str());
+
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(active, format!("{arrow}  {who}"))
+                .clicked()
+            {
+                self.active_call_id = Some(call.call_id.clone());
+            }
+            ui.label(&call.state);
+            if !call.dialed_number.is_empty() {
+                ui.weak(format!("dialled {}", call.dialed_number));
+            }
+            if !call.digit.is_empty() {
+                ui.weak(format!("digit {}", call.digit));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !call.ended && ui.button("Hang up").clicked() {
+                    self.active_call_id = Some(call.call_id.clone());
+                    self.hangup_call();
+                }
+            });
+        });
+
+        // The keypad belongs to the call the user is looking at, and
+        // only while it is up.
+        if active && call.state == "connected" {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("DTMF").strong().size(11.0));
+                for row in [
+                    ["1", "2", "3"],
+                    ["4", "5", "6"],
+                    ["7", "8", "9"],
+                    ["*", "0", "#"],
+                ] {
+                    ui.vertical(|ui| {
+                        for digit in row {
+                            if ui
+                                .add(egui::Button::new(digit).min_size(egui::vec2(34.0, 22.0)))
+                                .clicked()
+                            {
+                                self.send_dtmf(digit);
+                            }
+                        }
+                    });
+                }
+            });
+        }
+    }
+
+    /// The account page: the settings and the registration.
+    fn draw_account(&mut self, ui: &mut egui::Ui) {
+        let Some(account) = self.selected_account().cloned() else {
+            ui.weak("Select an account, or add one.");
+            return;
+        };
+
+        ui.horizontal(|ui| {
+            let title = if account.label.is_empty() {
+                "(unnamed account)".to_string()
+            } else {
+                account.label.clone()
+            };
+            ui.label(egui::RichText::new(title).strong().size(15.0));
+            ui.weak(format!("id {}", account.id));
+        });
+
+        // The editor. The borrow of the draft ends with this block, so
+        // the buttons below can take `&mut self`.
+        {
+            let draft = &mut self.edit_account;
+            egui::Grid::new("account_editor")
+                .num_columns(2)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("Label");
+                    ui.text_edit_singleline(&mut draft.label);
+                    ui.end_row();
+
+                    ui.label("Registrar");
+                    ui.text_edit_singleline(&mut draft.registrar);
+                    ui.end_row();
+
+                    ui.label("User");
+                    ui.text_edit_singleline(&mut draft.user);
+                    ui.end_row();
+
+                    ui.label("Password");
+                    ui.add(egui::TextEdit::singleline(&mut draft.password).password(true));
+                    ui.end_row();
+
+                    ui.label("Transport");
+                    egui::ComboBox::from_id_salt("edit_transport")
+                        .selected_text(&draft.transport)
+                        .show_ui(ui, |ui| {
+                            for t in ["udp", "tcp", "tls"] {
+                                ui.selectable_value(&mut draft.transport, t.to_string(), t);
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("Domain");
+                    ui.text_edit_singleline(&mut draft.domain);
+                    ui.end_row();
+
+                    ui.label("Outbound proxy");
+                    ui.text_edit_singleline(&mut draft.outbound_proxy);
+                    ui.end_row();
+
+                    ui.label("Caller name header");
+                    ui.text_edit_singleline(&mut draft.caller_id_header);
+                    ui.end_row();
+
+                    ui.label("Dialled number header");
+                    ui.text_edit_singleline(&mut draft.dialed_number_header);
+                    ui.end_row();
+                });
+        }
+
+        ui.horizontal(|ui| {
+            if ui.button("Save").clicked() {
+                self.save_selected();
+            }
+            if ui.button("Revert").clicked() {
+                self.load_selected();
+                self.status = "Reverted.".to_string();
+            }
+        });
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Registration").strong());
+            ui.label(self.registration_state(&account.id).summary());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Unregister").clicked() {
+                    self.unregister_selected();
+                }
+                if ui.button("Register").clicked() {
+                    self.register_selected();
+                }
+            });
+        });
+
+        ui.separator();
+        egui::CollapsingHeader::new("Add another account").show(ui, |ui| {
+            let draft = &mut self.new_account;
+            ui.label("Label");
+            ui.text_edit_singleline(&mut draft.label);
+            ui.label("Registrar");
+            ui.text_edit_singleline(&mut draft.registrar);
+            ui.label("User");
+            ui.text_edit_singleline(&mut draft.user);
+            ui.label("Password");
+            ui.add(egui::TextEdit::singleline(&mut draft.password).password(true));
+            ui.horizontal(|ui| {
+                ui.label("Transport");
+                egui::ComboBox::from_id_salt("new_transport")
+                    .selected_text(&draft.transport)
+                    .show_ui(ui, |ui| {
+                        for t in ["udp", "tcp", "tls"] {
+                            ui.selectable_value(&mut draft.transport, t.to_string(), t);
+                        }
+                    });
+            });
+            if ui.button("Add").clicked() {
+                self.add_account();
+            }
+        });
+
+        ui.separator();
+        egui::CollapsingHeader::new("Paths").show(ui, |ui| {
+            ui.monospace(format!("config  {}", self.paths.config_file().display()));
+            ui.monospace(format!("data    {}", self.paths.data_dir().display()));
+            ui.monospace(format!("logs    {}", self.paths.log_dir().display()));
+        });
     }
 }
 
@@ -881,6 +1029,16 @@ mod tests {
             output.platform_output.commands.is_empty(),
             "the frame asked the backend to do something"
         );
+    }
+
+    #[tokio::test]
+    async fn the_account_page_draws_too() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.view = View::Account;
+        let output = frame(&mut app, &ctx);
+        assert!(!output.shapes.is_empty(), "the frame drew nothing");
     }
 
     #[tokio::test]
@@ -1006,5 +1164,79 @@ mod tests {
             "the app must say why: {}",
             app.status
         );
+    }
+
+    #[tokio::test]
+    async fn the_window_opens_on_the_call_page() {
+        // The account settings are a page, not the front of the
+        // window: a softphone is for calling.
+        let (app, _bus) = build_app(tokio::runtime::Handle::current());
+        assert_eq!(app.view, View::Call);
+    }
+
+    #[tokio::test]
+    async fn an_incoming_call_switches_to_the_call_page() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        // The user is looking at the account settings.
+        app.view = View::Account;
+
+        bus.publish("acct-ui-1", incoming_event());
+        frame(&mut app, &ctx);
+
+        assert_eq!(app.view, View::Call, "the call page must come forward");
+    }
+
+    #[tokio::test]
+    async fn the_calls_are_listed_in_the_order_they_arrived() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        let mut first = CallEvent::new(CallEventType::OutgoingCallInitiated);
+        first.call_id = "call-1".to_string();
+        first.call_direction = Some(Direction::Outgoing);
+        first.call_state = "initiating".to_string();
+        first.callee = "111".to_string();
+
+        let mut second = CallEvent::new(CallEventType::OutgoingCallInitiated);
+        second.call_id = "call-2".to_string();
+        second.call_direction = Some(Direction::Outgoing);
+        second.call_state = "initiating".to_string();
+        second.callee = "222".to_string();
+
+        bus.publish("acct-ui-1", first);
+        bus.publish("acct-ui-1", second);
+        frame(&mut app, &ctx);
+
+        let calls = app.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].call_id, "call-1");
+        assert_eq!(calls[1].call_id, "call-2");
+    }
+
+    #[tokio::test]
+    async fn the_newest_call_is_the_one_the_panel_shows() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        let mut first = CallEvent::new(CallEventType::OutgoingCallInitiated);
+        first.call_id = "call-1".to_string();
+        first.call_direction = Some(Direction::Outgoing);
+        first.call_state = "initiating".to_string();
+        first.callee = "111".to_string();
+
+        let mut second = CallEvent::new(CallEventType::OutgoingCallInitiated);
+        second.call_id = "call-2".to_string();
+        second.call_direction = Some(Direction::Outgoing);
+        second.call_state = "initiating".to_string();
+        second.callee = "222".to_string();
+
+        bus.publish("acct-ui-1", first);
+        bus.publish("acct-ui-1", second);
+        frame(&mut app, &ctx);
+
+        let active = app.active_call().expect("no call is shown");
+        assert_eq!(active.call_id, "call-1", "the first call stays active");
     }
 }
