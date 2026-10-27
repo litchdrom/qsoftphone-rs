@@ -10,6 +10,7 @@ use rsipstack::platform::CancellationToken;
 use rsipstack::sip::Transport;
 use rsipstack::transaction::endpoint::MessageInspector;
 use rsipstack::transaction::{Endpoint, EndpointBuilder};
+use rsipstack::transport::TcpListenerConnection;
 use rsipstack::transport::TransportLayer;
 use rsipstack::transport::udp::UdpConnection;
 
@@ -89,6 +90,35 @@ pub fn parse_transport(value: &str) -> Transport {
     }
 }
 
+/// Pick the port the TCP listener binds to.
+///
+/// The configured port is preferred. If it is taken, an ephemeral one
+/// is used — a second copy of the app should not refuse to start
+/// because the first one has 5060.
+///
+/// The port is resolved *before* the listener is created, because the
+/// transport layer does the actual bind and the Contact has to name
+/// the port that was really taken.
+fn tcp_listen_port(preferred: u16) -> u16 {
+    let probe = |port: u16| {
+        std::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port)))
+            .ok()
+            .and_then(|listener| listener.local_addr().ok())
+            .map(|addr| addr.port())
+    };
+
+    if let Some(port) = probe(preferred) {
+        return port;
+    }
+    if preferred != 0 {
+        tracing::warn!(
+            port = preferred,
+            "the SIP TCP port is in use; using an ephemeral one"
+        );
+    }
+    probe(0).unwrap_or(0)
+}
+
 /// Build an endpoint for one account.
 ///
 /// UDP binds a local socket up front. If the configured port is
@@ -99,6 +129,14 @@ pub fn parse_transport(value: &str) -> Transport {
 /// TCP and TLS are dialled on demand by the transport layer — it
 /// reads the transport off the registrar's URI — so they start with
 /// an empty transport layer and the registrar's address decides.
+/// TCP *also* listens on the local port: the registrar may open a
+/// new connection to the Contact instead of reusing the one we
+/// dialled out on, and that is how the keepalive arrives.
+///
+/// TLS has no listener. An inbound TLS connection needs a server
+/// certificate, and the account model has nowhere to put one — that
+/// is M6 work. A TLS account therefore only works for requests that
+/// arrive on the connection we dialled out on.
 ///
 /// The optional inspector sees every message in and out; that is where
 /// [`crate::digest::DigestInterop`] patches the RFC 7616 algorithm
@@ -134,6 +172,16 @@ pub async fn build_endpoint(
             Err(e) => return Err(Box::new(e)),
         };
         transport_layer.add_transport(connection.into());
+    }
+
+    if matches!(transport, Transport::Tcp) {
+        let listener = TcpListenerConnection::new(
+            SocketAddr::from(([0, 0, 0, 0], tcp_listen_port(port))),
+            None,
+        )
+        .await
+        .map_err(Box::new)?;
+        transport_layer.add_transport(listener.into());
     }
 
     let mut builder = EndpointBuilder::new();

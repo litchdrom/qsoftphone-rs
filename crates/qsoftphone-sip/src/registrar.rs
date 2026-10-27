@@ -171,18 +171,47 @@ fn send(sender: &UnboundedSender<RegistrationEvent>, account: &Account, state: R
     });
 }
 
+/// Cancels the endpoint's token when the registration task ends.
+///
+/// The transport must not outlive the task, whichever way the task
+/// ends.
+struct EndpointGuard(CancellationToken);
+
+impl Drop for EndpointGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 async fn run_registration(
     account: Account,
     port: u16,
     sender: UnboundedSender<RegistrationEvent>,
     token: CancellationToken,
 ) {
+    // The endpoint gets a token of its own. Cancelling the task token
+    // would take the transport down with it, and the final
+    // `Expires: 0` REGISTER still needs a live transport to go out —
+    // otherwise the unregister races the shutdown and never lands.
+    let endpoint_token = CancellationToken::new();
+    let _guard = EndpointGuard(endpoint_token.clone());
+
+    run_registration_inner(account, port, sender, token, endpoint_token).await;
+}
+
+async fn run_registration_inner(
+    account: Account,
+    port: u16,
+    sender: UnboundedSender<RegistrationEvent>,
+    token: CancellationToken,
+    endpoint_token: CancellationToken,
+) {
     let transport = parse_transport(&account.transport);
 
     let endpoint = match build_endpoint(
         transport,
         port,
-        token.child_token(),
+        endpoint_token.clone(),
         Some(Box::new(DigestInterop::new())),
     )
     .await
@@ -206,6 +235,24 @@ async fn run_registration(
     tokio::spawn(async move {
         let _ = inner.serve().await;
     });
+
+    // The address we are listening on. The Contact the registrar binds
+    // is derived from it, unless the registrar reports a different
+    // public address (received/rport) — so this is the first thing to
+    // look at when the server cannot reach us.
+    info!(addrs = ?endpoint.get_addrs(), "the transport is open");
+
+    // Answer what the registrar sends us. Asterisk pings a registered
+    // endpoint with OPTIONS, and a UA that stays silent is marked
+    // unreachable — the registration looks fine and the calls fail.
+    match endpoint.incoming_transactions() {
+        Ok(incoming) => {
+            tokio::spawn(crate::incoming::serve(incoming, endpoint_token.clone()));
+        }
+        Err(e) => {
+            warn!(error = %e, "the incoming channel was already taken");
+        }
+    }
 
     let Some(uri) = registrar_uri(&account.registrar, transport) else {
         send(

@@ -8,6 +8,8 @@
 //!   interoperability gap in rsipstack that has to be patched from
 //!   the outside.
 //! * [`endpoint`] — building an endpoint bound to one transport.
+//! * [`incoming`] — answering the requests that arrive on that
+//!   endpoint, the registrar's OPTIONS keepalive above all.
 //! * [`registrar`] — the REGISTER flow and the refresh loop.
 //! * [`state`] — what the UI needs to know about an account's
 //!   registration.
@@ -17,6 +19,7 @@
 
 pub mod digest;
 pub mod endpoint;
+pub mod incoming;
 pub mod registrar;
 pub mod state;
 

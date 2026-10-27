@@ -57,6 +57,7 @@ qsoftphone-rs/
     ├── qsoftphone-sip/            the SIP layer: transport + registration
     │   ├── digest.rs              RFC 7616 interop with rsipstack
     │   ├── endpoint.rs            one endpoint per account, per transport
+    │   ├── incoming.rs            answering what arrives on that endpoint
     │   ├── registrar.rs           REGISTER / refresh / unregister
     │   └── state.rs               what the UI needs to know, nothing more
     └── qsoftphone-app/            the binary
@@ -279,6 +280,45 @@ SHA-256 registrar that insists on `algorithm=SHA-256` being echoed
 literally. Fixing it properly means patching rsipstack's `Algorithm`
 parser, not patching around it here.
 
+### The requests that arrive on the endpoint
+
+rsipstack hands every incoming request that has no matching transaction
+to the endpoint's `incoming_transactions()` channel. M1 had nothing
+reading that channel, so **every OPTIONS was silently dropped**.
+
+That matters more than it sounds. Asterisk pings a registered endpoint
+with SIP OPTIONS; a UA that does not answer is marked *unreachable* by
+the server, and the calls that follow fail even though the
+registration itself looks perfect. The symptom is exactly
+"it registers, and nothing else works".
+
+`qsoftphone-sip::incoming` owns that channel now:
+
+| Request | Answer | Why |
+|---|---|---|
+| `OPTIONS` | `200 OK` | The registrar's keepalive. |
+| anything else | `501 Not Implemented` | A status code beats a timeout. `INVITE` is the one that matters, and M2 takes it over. |
+
+The response copies the request's Via, From, To, Call-ID and CSeq
+(RFC 3261 §8.2.6) and carries a tag on the To header (§8.1.3.7), so
+the transaction matches on the other side.
+
+### Transports
+
+* **UDP** binds the configured port up front and falls back to an
+  ephemeral one if the port is taken — a second copy of the app should
+  not refuse to start.
+* **TCP** dials the registrar on demand *and* listens on the local
+  port. The listener matters: the registrar may open a **new**
+  connection to the Contact instead of reusing the one we dialled out
+  on, and that is how the keepalive arrives. The port is resolved
+  before the listener is created, because the transport layer does the
+  bind and the Contact has to name the port that was really taken.
+* **TLS** has no listener. An inbound TLS connection needs a server
+  certificate, and the account model has nowhere to put one — that is
+  M6. A TLS account therefore only works for requests that arrive on
+  the connection we dialled out on.
+
 ### Other M1 decisions
 
 * **The SIP domain is not applied to the From/To URI yet.** rsipstack's
@@ -295,6 +335,42 @@ parser, not patching around it here.
 * **A busy SIP port is not fatal.** If the configured port is taken, the
   endpoint falls back to an ephemeral port and logs it — a second copy
   of the app should not refuse to start.
+
+### If the server still cannot reach you
+
+The registration succeeding and the calls failing are two different
+problems, and the log tells you which one you have:
+
+1. **`the transport is open`** — the local address and port the
+   endpoint is listening on. If this is a private address, the server
+   cannot reach you directly.
+2. **What the server actually pings** is the Contact it bound, not
+   that address. On Asterisk: `pjsip show endpoint <aor>` — look at
+   `Contact:` and at `Status:`. `Unreachable` there means the
+   qualify timer is failing.
+3. If the Contact holds the *private* address, the registrar did not
+   report the public one back. rsipstack takes the Contact from the
+   Via's `received`/`rport` when the registrar sends them, so this is
+   a `nat=` setting on the Asterisk endpoint, not a setting here.
+4. The transport has to be **udp** for a complete setup today. TCP
+   listens and answers, but a TLS endpoint has no listener, because an
+   inbound TLS connection needs a server certificate and the account
+   model has nowhere to put one.
+
+### Editing an account
+
+Selecting an account loads it into an editable form in the middle
+panel: label, registrar, user, password, transport, domain, outbound
+proxy and the two identity headers. **Save** writes it back, **Revert**
+throws the changes away.
+
+The account keeps its id and its creation timestamp, so editing is an
+update and not a second account — the registration state, the call
+history and everything else that hangs off the id stay attached.
+
+The "add account" form on the left has its own draft. They used to
+share one, which meant that typing a new account silently changed what
+**Save** would write to the selected one. There is a test for that.
 
 ### Logging (§6)
 
@@ -371,7 +447,7 @@ One milestone at a time; M2 does not start before M1 works end to end.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 109 tests, all passing.
+* `cargo test --workspace` — 117 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -392,6 +468,14 @@ One milestone at a time; M2 does not start before M1 works end to end.
 * **The account id is on the log line the registration task wrote** —
   proved end to end against the loopback registrar, not just at the
   formatter.
+* **An OPTIONS keepalive is answered with `200 OK` over a real
+  socket** — UDP and TCP both, on a connection opened by the "server"
+  side. The response mirrors the request's Via, From, To, Call-ID and
+  CSeq, and carries a To tag.
+* **An unimplemented method still gets an answer** (`501`), so a peer
+  never waits for a timeout.
+* **An account can be edited in place** — same id, same creation
+  timestamp, new settings, and still exactly one account.
 * The registration state reaches the UI over the channel and is shown
   in the title bar and next to the account.
 
@@ -402,7 +486,9 @@ One milestone at a time; M2 does not start before M1 works end to end.
   The digest, the CSeq bump, the `Expires` handling and the
   `algorithm=SHA-256` echo are all correct against the spec — but an
   Asterisk, Kamailio or OpenSIPS instance has not been tried, and that
-  is the real test of §5.8.
+  is the real test of §5.8. In particular, the OPTIONS keepalive has
+  been proven against a hand-written registrar, not against Asterisk's
+  own `qualify` timer.
 * Nothing has been put on the wire beyond REGISTER. No INVITE, no RTP,
   no audio device. That is M2–M4.
 * The GUI has been started and its window inspected by title, but the
