@@ -93,7 +93,7 @@ pub fn resolve_caller_display_name(
         // A URI-shaped header: use it for the contact lookup.
         let uri_number = sip_uri_user_part(raw);
         if !uri_number.is_empty() {
-            if let Some(name) = lookup_contact(contacts, &uri_number) {
+            if let Some(name) = lookup_contact(&profile.id, contacts, &uri_number) {
                 return name;
             }
         }
@@ -102,7 +102,7 @@ pub fn resolve_caller_display_name(
     // 2. Local contact lookup on the caller's number.
     let number = sip_uri_user_part(caller_uri);
     if !number.is_empty() {
-        if let Some(name) = lookup_contact(contacts, &number) {
+        if let Some(name) = lookup_contact(&profile.id, contacts, &number) {
             return name;
         }
 
@@ -160,7 +160,11 @@ pub fn display_name_from_header(value: &str) -> Option<String> {
     Some(v.to_string())
 }
 
-fn lookup_contact(contacts: Option<&Contacts<'_>>, number: &str) -> Option<String> {
+fn lookup_contact(
+    account_id: &str,
+    contacts: Option<&Contacts<'_>>,
+    number: &str,
+) -> Option<String> {
     if number.is_empty() {
         return None;
     }
@@ -170,7 +174,7 @@ fn lookup_contact(contacts: Option<&Contacts<'_>>, number: &str) -> Option<Strin
         Ok(_) => None,
         Err(e) => {
             // A contact-lookup failure must never take the call down.
-            tracing::warn!(number, error = %e, "contact lookup failed");
+            tracing::warn!(account_id, number, error = %e, "contact lookup failed");
             None
         }
     }

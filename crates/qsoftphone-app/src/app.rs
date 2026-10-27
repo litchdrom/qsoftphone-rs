@@ -8,20 +8,26 @@
 //! which hands over a root `Ui` rather than a `Context`, and the
 //! panel types are unified into `egui::Panel`.
 
+use std::collections::HashMap;
+
 use eframe::egui;
 use qsoftphone_core::config::AppConfig;
 use qsoftphone_core::model::account::Account;
 use qsoftphone_core::paths::AppPaths;
 use qsoftphone_core::storage::{AccountStore, Db};
+use qsoftphone_sip::{RegistrationManager, RegistrationState};
 
 /// The application state.
 pub struct QSoftphoneApp {
     paths: AppPaths,
     db: Db,
     config: AppConfig,
-    /// Handle to the tokio runtime the SIP stack will run on. Kept so
+    /// Handle to the tokio runtime the SIP stack runs on. Kept so
     /// the runtime is not dropped while the window is open.
     _runtime: tokio::runtime::Handle,
+    /// The registrations, and the state each one is in.
+    registrations: RegistrationManager,
+    states: HashMap<String, RegistrationState>,
     accounts: Vec<Account>,
     /// Index into `accounts` of the selected row.
     selected: Option<usize>,
@@ -63,6 +69,7 @@ impl QSoftphoneApp {
         db: Db,
         config: AppConfig,
         runtime: tokio::runtime::Handle,
+        registrations: RegistrationManager,
     ) -> Self {
         let accounts = AccountStore::new(&db).list().unwrap_or_default();
         // Prefer the account the settings file points at; fall back
@@ -77,6 +84,8 @@ impl QSoftphoneApp {
             db,
             config,
             _runtime: runtime,
+            registrations,
+            states: HashMap::new(),
             accounts,
             selected,
             draft: Draft {
@@ -88,6 +97,51 @@ impl QSoftphoneApp {
         }
     }
 
+    /// Drain the registration state changes that arrived since the
+    /// last frame (§3: events come on a channel and are drained at
+    /// the top of each frame).
+    fn drain_registrations(&mut self) {
+        for event in self.registrations.drain() {
+            let state = event.state.clone();
+            self.status = format!("{} — {}", event.user, state.summary());
+            self.states.insert(event.account_id, state);
+        }
+    }
+
+    /// The state of an account's registration.
+    fn registration_state(&self, account_id: &str) -> &RegistrationState {
+        self.states
+            .get(account_id)
+            .unwrap_or(&RegistrationState::Idle)
+    }
+
+    fn register_selected(&mut self) {
+        let Some(index) = self.selected else {
+            return;
+        };
+        let Some(account) = self.accounts.get(index).cloned() else {
+            return;
+        };
+        if account.registrar.trim().is_empty() {
+            self.status = "That account has no registrar.".to_string();
+            return;
+        }
+        self.registrations.start(&account, self.config.network.port);
+        self.status = format!("Registering {}…", account.label);
+    }
+
+    fn unregister_selected(&mut self) {
+        let Some(index) = self.selected else {
+            return;
+        };
+        let Some(account) = self.accounts.get(index).cloned() else {
+            return;
+        };
+        self.registrations.stop(&account.id);
+        self.states.insert(account.id, RegistrationState::Idle);
+        self.status = format!("Unregistered {}.", account.label);
+    }
+
     /// Remember the selected account in the settings file.
     fn persist_active_account(&mut self) {
         let id = self
@@ -97,9 +151,13 @@ impl QSoftphoneApp {
         if id == self.config.active_account_id {
             return;
         }
-        self.config.active_account_id = id;
+        self.config.active_account_id = id.clone();
         if let Err(e) = self.config.save(&self.paths.config_file()) {
-            tracing::warn!(error = %e, "could not persist the active account");
+            tracing::warn!(
+                account_id = id.as_deref().unwrap_or_default(),
+                error = %e,
+                "could not persist the active account"
+            );
         }
     }
 
@@ -184,13 +242,24 @@ impl eframe::App for QSoftphoneApp {
             ui.ctx().set_visuals(visuals);
         }
 
+        // §3: the UI reads cached state; the network events arrive on
+        // a channel and are drained here.
+        self.drain_registrations();
+
         egui::Panel::top("top_bar").show(ui, |ui| {
+            // The registration state of the selected account, read from
+            // the cached state the SIP layer pushed over the channel.
+            let sip_state = self
+                .selected
+                .and_then(|i| self.accounts.get(i))
+                .map(|a| self.registration_state(&a.id).summary())
+                .unwrap_or_else(|| "No account selected".to_string());
             ui.horizontal(|ui| {
                 ui.heading("qsoftphone");
                 ui.separator();
-                ui.label("SIP: not registered");
+                ui.label(format!("SIP: {sip_state}"));
                 ui.separator();
-                ui.label("M0 — workspace, config, accounts");
+                ui.label("M1 — registration");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
                 });
@@ -222,6 +291,12 @@ impl eframe::App for QSoftphoneApp {
                             format!("(unnamed account #{index})")
                         } else {
                             label
+                        };
+                        let badge = self.registration_state(&account.id).badge();
+                        let text = if badge.is_empty() {
+                            text
+                        } else {
+                            format!("{text} {badge}")
                         };
                         if ui
                             .selectable_value(&mut self.selected, Some(index), text)
@@ -284,7 +359,7 @@ impl eframe::App for QSoftphoneApp {
             ui.horizontal(|ui| {
                 ui.heading("Dialer");
                 ui.separator();
-                ui.label("Available from M1, once the SIP stack is wired up.");
+                ui.label("Dialing arrives in M2.");
             });
             ui.separator();
 
@@ -321,6 +396,20 @@ impl eframe::App for QSoftphoneApp {
                         ui.label(&account.outbound_proxy);
                         ui.end_row();
                     });
+
+                ui.separator();
+                ui.label("Registration");
+                ui.horizontal(|ui| {
+                    ui.label(self.registration_state(&account.id).summary());
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Register").clicked() {
+                        self.register_selected();
+                    }
+                    if ui.button("Unregister").clicked() {
+                        self.unregister_selected();
+                    }
+                });
 
                 ui.separator();
                 ui.label("Identity headers (per-account policy)");

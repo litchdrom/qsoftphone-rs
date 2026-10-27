@@ -9,9 +9,10 @@ identity resolution, the call event contract, the history rules and
 the transfer construction all have to behave identically, including the
 bugs that have already been fixed there.
 
-**Status: M0 complete.** The workspace builds, the test suite passes,
-the app starts and exits cleanly. The SIP stack is not wired up yet —
-see [Milestones](#milestones).
+**Status: M1 complete.** The workspace builds, the test suite passes, the
+app starts and exits cleanly, and an account can be registered against a
+SIP registrar with digest authentication (MD5 and SHA-256). Calling is not
+wired up yet — see [Milestones](#milestones).
 
 ---
 
@@ -53,6 +54,11 @@ qsoftphone-rs/
     │   ├── paths.rs               per-OS config / data / log dirs
     │   ├── sip/                   pure SIP functions (uri, identity, refer)
     │   └── storage/               SQLite: accounts, contacts, history
+    ├── qsoftphone-sip/            the SIP layer: transport + registration
+    │   ├── digest.rs              RFC 7616 interop with rsipstack
+    │   ├── endpoint.rs            one endpoint per account, per transport
+    │   ├── registrar.rs           REGISTER / refresh / unregister
+    │   └── state.rs               what the UI needs to know, nothing more
     └── qsoftphone-app/            the binary
         ├── main.rs                startup order, --smoke
         └── app.rs                 the egui shell
@@ -60,7 +66,9 @@ qsoftphone-rs/
 
 The split is deliberate. Everything the brief calls out as a bug is a
 pure function over strings, which is why it can be unit-tested without
-a UDP socket, a GPU or a sound card.
+a UDP socket, a GPU or a sound card. `qsoftphone-sip` is the only crate
+that touches the network, and it never talks to the window: it reports
+state over a channel that the UI drains at the top of each frame (§3).
 
 ---
 
@@ -83,8 +91,8 @@ Pinned in the workspace `Cargo.toml`, locked in `Cargo.lock`.
 The brief asks for a resolved tree under ~250 crates, assuming
 rsipstack would be the bulk at 134.
 
-**Measured, the real number is 303 crates** for the Windows target
-(382 for Linux, which adds X11/Wayland/ALSA). The gap is not
+**Measured, the real number is 304 crates** for the Windows target
+(383 for Linux, which adds X11/Wayland/ALSA). The gap is not
 bloat — it is two subtrees the brief's estimate did not account for:
 
 | Subtree | Crates | Trimmable? |
@@ -100,6 +108,13 @@ bloat — it is two subtrees the brief's estimate did not account for:
 `rtc` and `wgpu` together are 210 crates of pinned, non-negotiable
 stack. There is no trim that reaches 250 without substituting the
 stack, which the brief forbids.
+
+The count is `cargo tree --workspace --edges normal --target
+x86_64-pc-windows-msvc`, unique package names. It moved from 303 to 304
+when M1 added the `qsoftphone-sip` workspace member — the SIP crates
+were already in the tree, because the app declared the whole pinned
+stack from M0 so the budget would be measured against the final
+dependency set rather than a moving target.
 
 **What was trimmed.** `rsipstack` is built with `default-features = false`
 and only `platform-tokio`, `std` and `rustls` enabled:
@@ -140,7 +155,7 @@ so the two can be diffed by hand.
 | §5.4 180 Ringing on every inbound INVITE | `src/core/sip/SipEndpoint.cpp` | M2 |
 | §5.5 hang up without a forced status code | `src/core/sip/SipEndpoint.cpp` | M2 |
 | §5.6 `Refer-To` construction, blind and attended | `src/core/sip/SipEndpoint.cpp` | `sip::refer` |
-| §5.8 digest auth: MD5 + SHA-256, realm vs SIP domain | `src/core/sip/SipEndpoint.cpp` | M1 |
+| §5.8 digest auth: MD5 + SHA-256, realm vs SIP domain | `src/core/sip/SipEndpoint.cpp` | `qsoftphone-sip::digest` |
 | Header capture allowlist | `src/core/call/AccountProfile.h` | `model::account::AccountProfile::filter_headers` |
 | The call event contract | `src/core/call/CallEvent.h` | `model::call_event::CallEvent` |
 
@@ -202,7 +217,102 @@ layer directly.
 
 ---
 
-## Where the files live
+## M1 — Registration
+
+### What happens
+
+1. The user picks an account and presses **Register**.
+2. `RegistrationManager::start` spawns a task on the tokio runtime. The
+   UI thread does nothing else — it never waits for the network (§3).
+3. The task opens one endpoint for that account — its own socket, its
+   own transport, its own Via branch space — and sends a REGISTER with
+   `Expires: 300`.
+4. A registrar that wants credentials answers `401` with a
+   `WWW-Authenticate` challenge; the client answers with the digest and
+   retries with a bumped CSeq.
+5. On `200 OK` the **granted** expiry is read back (`Expires` may be
+   less than what was asked for) and the account is reported as
+   registered.
+6. The task then sleeps until the refresh is due and registers again.
+   Failures back off instead of hammering the registrar.
+7. **Unregister** sends a final `REGISTER` with `Expires: 0` and then
+   stops the loop.
+
+The state changes travel over an unbounded channel; the UI drains it at
+the top of every frame and caches it. The window never polls the SIP
+stack and never blocks on it.
+
+### The SHA-256 spelling problem
+
+This is the one place where rsipstack 0.7.9 and RFC 7616 disagree, and
+it is worth stating plainly because it is not a cosmetic difference.
+
+RFC 7616 §3.4 names the algorithms `MD5`, `SHA-256` and `SHA-512`.
+rsipstack's `Algorithm::try_from`
+(`src/sip/headers/auth.rs:33-49`) only accepts `MD5`, `SHA256` and
+`SHA512` — the **unhyphenated** spelling. The rejection is not a soft
+one: `WWW-Authenticate: Digest ... algorithm=SHA-256` fails to parse
+*as a whole header*
+(`src/sip/headers/typed/www_authenticate.rs:44-46`), so a registrar
+that uses the RFC spelling could not be registered against at all.
+
+`qsoftphone-sip::digest::DigestInterop` closes that gap from the
+outside, as an endpoint-level `MessageInspector`:
+
+* **on the way in**, the challenge's algorithm token is rewritten into
+  the spelling rsipstack's parser accepts (`SHA-256` → `SHA256`);
+* **on the way out**, the `Authorization` header gets the server's own
+  token back (`SHA-256`), because RFC 7616 §3.4.1 has the client echo
+  the algorithm the server named.
+
+The digest itself is still computed by rsipstack — only the label on
+the packet is rewritten. The rewrite is idempotent, which matters
+because rsipstack applies `after_received` twice (once when the message
+arrives, once when it is handed to the transaction).
+
+**The limitation, stated plainly.** rsipstack's *typed* `Authorization`
+parser has the same gap, so an rsipstack-based **server** cannot verify
+a client that echoes the RFC spelling. Our client is unaffected against
+real servers — Asterisk, Kamailio and OpenSIPS all accept the token
+they themselves named — but this crate cannot be used as a
+SHA-256 registrar that insists on `algorithm=SHA-256` being echoed
+literally. Fixing it properly means patching rsipstack's `Algorithm`
+parser, not patching around it here.
+
+### Other M1 decisions
+
+* **The SIP domain is not applied to the From/To URI yet.** rsipstack's
+  `Registration` derives the Request-URI and the From/To headers from
+  one server URI, so the registrar host is used for all three. The
+  brief itself puts "SIP domain" in M6, and on a single-tenant PBX the
+  two are the same. When an account has a domain set, a warning is
+  logged — the domain is not silently ignored. This is the one line to
+  change when M6 lands.
+* **The refresh loop is ours, not `Registration::keep_alive`.** The
+  callback `keep_alive` takes cannot reach back into the registration
+  it is driving, and the loop needs the *granted* expiry rather than
+  the requested one.
+* **A busy SIP port is not fatal.** If the configured port is taken, the
+  endpoint falls back to an ephemeral port and logs it — a second copy
+  of the app should not refuse to start.
+
+### Logging (§6)
+
+Every log line carries the account id, and call lines carry the call
+id. This is done with spans rather than by repeating the id at every
+call site: `qsoftphone_core::logging::account_span` and `call_span`
+build the spans, and the `Full` formatter prints the current span scope
+and its fields on each line, so a line written inside the span is
+automatically attributed.
+
+```text
+2026-10-27T01:12:04.118Z  INFO qsoftphone_sip::registrar: account{account_id="acct-m1-logging" user="104" registrar="127.0.0.1:5060"}: registered expires=300
+```
+
+The registration task runs inside the account span, so every line it
+writes — including the ones from rsipstack itself — is attributable.
+
+---
 
 | | Windows | Linux | macOS |
 |---|---|---|---|
@@ -211,7 +321,9 @@ layer directly.
 | logs | `%LOCALAPPDATA%\qsoftphone\logs\` | `$XDG_CACHE_HOME/qsoftphone/logs/` | `~/Library/Logs/qsoftphone/` |
 
 Logs rotate daily: `qsoftphone.log.2026-10-26`. `RUST_LOG` overrides
-the level from the settings file.
+the level from the settings file. Every line carries the account id,
+and call lines carry the call id — see
+[Logging (§6)](#logging-6).
 
 SQLite databases live in the data directory: `accounts.sqlite`,
 `history.sqlite`, `contacts.sqlite`.
@@ -243,14 +355,14 @@ Taken from the brief, recorded here so they are not re-litigated:
 | | Scope | State |
 |---|---|---|
 | **M0** | Workspace, pinned dependencies, tracing, config load/save, account CRUD in SQLite, the SIP pure functions with their tests | **done** |
-| **M1** | Registration: rsipstack transport, digest auth (MD5 + SHA-256), register/unregister, registration state surfaced to the UI | next |
-| M2 | Calling: outbound INVITE, inbound INVITE with automatic 180 Ringing (§5.4), answer, hang up without a forced code (§5.5), DTMF | |
+| **M1** | Registration: rsipstack transport, digest auth (MD5 + SHA-256), register/unregister, registration state surfaced to the UI | **done** |
+| M2 | Calling: outbound INVITE, inbound INVITE with automatic 180 Ringing (§5.4), answer, hang up without a forced code (§5.5), DTMF | next |
 | M3 | History: SQLite persistence with the §5.3 semantics, redial using the resolved dialled number (§5.1), searchable list in the UI | |
 | M4 | Media: `rtc` RTP + `cpal` audio — SDP negotiation, send/receive audio, mute, codec selection | |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
-One milestone at a time; M1 does not start before M0 works end to end.
+One milestone at a time; M2 does not start before M1 works end to end.
 
 ---
 
@@ -259,21 +371,44 @@ One milestone at a time; M1 does not start before M0 works end to end.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 65 tests, all passing.
+* `cargo test --workspace` — 109 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
+* `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
   the database, and exits 0.
 * The GUI opens a window titled `qsoftphone` and stays up.
 * Account CRUD round-trips through SQLite, including the policy block.
 * The config file loads, saves and round-trips; a malformed file is an
   error, not a silent reset.
+* **A real REGISTER goes over a real UDP socket.** The loopback
+  registrar answers `401 Unauthorized` with a `WWW-Authenticate`
+  challenge; the client answers with the digest, retries with a bumped
+  CSeq, and gets `200 OK`. This runs for both `algorithm=MD5` and
+  `algorithm=SHA-256`.
+* **The digest is verified independently of rsipstack.** The test
+  computes the RFC 7616 SHA-256 and the RFC 2617 MD5 itself and
+  compares against what went on the wire, so a wrong hash function or a
+  wrong set of hashed strings fails the test.
+* **The account id is on the log line the registration task wrote** —
+  proved end to end against the loopback registrar, not just at the
+  formatter.
+* The registration state reaches the UI over the channel and is shown
+  in the title bar and next to the account.
 
 **Not verified:**
 
-* Nothing has been put on the wire. No SIP registration, no INVITE, no
-  RTP, no audio device. That is M1–M2.
+* **No third-party registrar has been used.** Everything above was
+  proven against a registrar written by hand, inside this repository.
+  The digest, the CSeq bump, the `Expires` handling and the
+  `algorithm=SHA-256` echo are all correct against the spec — but an
+  Asterisk, Kamailio or OpenSIPS instance has not been tried, and that
+  is the real test of §5.8.
+* Nothing has been put on the wire beyond REGISTER. No INVITE, no RTP,
+  no audio device. That is M2–M4.
 * The GUI has been started and its window inspected by title, but the
   layout has not been reviewed by a human at normal resolution.
 * The Linux build has not been compiled or run. The dependency tree is
   resolved for `x86_64-unknown-linux-gnu` (382 crates) but no Linux
   binary was produced.
+* The SIP domain is not applied to the From/To URI — M6, as noted
+  above.

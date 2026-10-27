@@ -1,0 +1,25 @@
+[package]
+name = "qsoftphone-sip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The SIP layer for qsoftphone-rs: transport, registration and RFC 7616 digest authentication."
+
+[dependencies]
+qsoftphone-core.workspace = true
+rsipstack.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+# Already in the tree through rsipstack — declaring them directly
+# costs no extra crates, and lets the tests verify the digest
+# independently of rsipstack's own implementation.
+md-5 = "0.11"
+sha2 = "0.11"
+serde_json.workspace = true
+# The §6 test captures what the registration task actually logs.
+tracing-subscriber.workspace = true

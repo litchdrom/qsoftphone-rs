@@ -3391,7 +3391,7 @@ dependencies = [
  "eframe",
  "egui",
  "qsoftphone-core",
- "rsipstack",
+ "qsoftphone-sip",
  "rtc",
  "serde",
  "serde_json",
@@ -3411,6 +3411,21 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "qsoftphone-sip"
+version = "0.1.0"
+dependencies = [
+ "md-5 0.11.0",
+ "qsoftphone-core",
+ "rsipstack",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -65,6 +65,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     let handle = runtime.handle().clone();
+    let registrations = qsoftphone_sip::RegistrationManager::new(handle.clone());
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -81,6 +82,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 db,
                 config.clone(),
                 handle.clone(),
+                registrations,
             )))
         }),
     )

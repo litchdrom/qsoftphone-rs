@@ -134,16 +134,21 @@ impl<'a> AccountStore<'a> {
 }
 
 fn row_to_account(row: &Row<'_>) -> rusqlite::Result<Account> {
+    let id: String = row.get(0)?;
     let capture: String = row.get(10)?;
     let capture_headers = match serde_json::from_str::<Vec<String>>(&capture) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(error = %e, "account has malformed capture_headers; treating as empty");
+            tracing::warn!(
+                account_id = %id,
+                error = %e,
+                "account has malformed capture_headers; treating as empty"
+            );
             Vec::new()
         }
     };
     Ok(Account {
-        id: row.get(0)?,
+        id,
         label: row.get(1)?,
         registrar: row.get(2)?,
         user: row.get(3)?,
