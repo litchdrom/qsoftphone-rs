@@ -27,8 +27,10 @@ use tracing::{Instrument, info, warn};
 use qsoftphone_core::logging::account_span;
 use qsoftphone_core::model::account::Account;
 
-use crate::digest::DigestInterop;
+use crate::call::CallBus;
 use crate::endpoint::{build_endpoint, parse_transport, split_host_port, transport_param};
+use crate::inspector::SessionInspector;
+use crate::session::{AccountSession, SessionRegistry};
 use crate::state::{RegistrationEvent, RegistrationState};
 
 /// How long we ask the registrar to keep the binding, in seconds.
@@ -85,6 +87,11 @@ pub struct RegistrationManager {
     tasks: HashMap<String, RegistrationTask>,
     sender: UnboundedSender<RegistrationEvent>,
     receiver: UnboundedReceiver<RegistrationEvent>,
+    /// Where the live endpoints are published, so the call layer can
+    /// place a call from a registered account.
+    sessions: SessionRegistry,
+    /// Where the incoming calls are reported.
+    calls: CallBus,
     /// The runtime the registration tasks run on.
     ///
     /// The UI thread is not inside the runtime, so tasks have to be
@@ -93,12 +100,14 @@ pub struct RegistrationManager {
 }
 
 impl RegistrationManager {
-    pub fn new(handle: tokio::runtime::Handle) -> Self {
+    pub fn new(handle: tokio::runtime::Handle, sessions: SessionRegistry, calls: CallBus) -> Self {
         let (sender, receiver) = unbounded_channel();
         Self {
             tasks: HashMap::new(),
             sender,
             receiver,
+            sessions,
+            calls,
             handle,
         }
     }
@@ -113,6 +122,8 @@ impl RegistrationManager {
         let token = CancellationToken::new();
         let child = token.clone();
         let sender = self.sender.clone();
+        let sessions = self.sessions.clone();
+        let calls = self.calls.clone();
         let account_id = account.id.clone();
         let account = account.clone();
 
@@ -122,7 +133,7 @@ impl RegistrationManager {
             // is made on the runtime thread — the UI thread does no
             // work beyond handing the task over (§3).
             let span = account_span(&account);
-            run_registration(account, port, sender, child)
+            run_registration(account, port, sender, child, sessions, calls)
                 .instrument(span)
                 .await
         });
@@ -188,6 +199,8 @@ async fn run_registration(
     port: u16,
     sender: UnboundedSender<RegistrationEvent>,
     token: CancellationToken,
+    sessions: SessionRegistry,
+    calls: CallBus,
 ) {
     // The endpoint gets a token of its own. Cancelling the task token
     // would take the transport down with it, and the final
@@ -196,7 +209,16 @@ async fn run_registration(
     let endpoint_token = CancellationToken::new();
     let _guard = EndpointGuard(endpoint_token.clone());
 
-    run_registration_inner(account, port, sender, token, endpoint_token).await;
+    run_registration_inner(
+        account,
+        port,
+        sender,
+        token,
+        endpoint_token,
+        sessions,
+        calls,
+    )
+    .await;
 }
 
 async fn run_registration_inner(
@@ -205,14 +227,22 @@ async fn run_registration_inner(
     sender: UnboundedSender<RegistrationEvent>,
     token: CancellationToken,
     endpoint_token: CancellationToken,
+    sessions: SessionRegistry,
+    calls: CallBus,
 ) {
     let transport = parse_transport(&account.transport);
+
+    // The inspector does two jobs: it patches the RFC 7616 algorithm
+    // spelling, and it notes the public address the registrar reports
+    // — the address the Contact of an INVITE has to name.
+    let inspector = SessionInspector::new();
+    let public_address = inspector.public_address();
 
     let endpoint = match build_endpoint(
         transport,
         port,
         endpoint_token.clone(),
-        Some(Box::new(DigestInterop::new())),
+        Some(Box::new(inspector)),
     )
     .await
     {
@@ -242,12 +272,23 @@ async fn run_registration_inner(
     // look at when the server cannot reach us.
     info!(addrs = ?endpoint.get_addrs(), "the transport is open");
 
-    // Answer what the registrar sends us. Asterisk pings a registered
-    // endpoint with OPTIONS, and a UA that stays silent is marked
-    // unreachable — the registration looks fine and the calls fail.
-    match endpoint.incoming_transactions() {
+    // The session: the endpoint plus the dialog layer. It is
+    // published so the call layer can place a call from this account.
+    let session = AccountSession::new(account.clone(), endpoint, public_address);
+    sessions.insert(&account.id, session.clone());
+
+    // Answer what the registrar sends us, and take the calls that
+    // arrive. Asterisk pings a registered endpoint with OPTIONS, and
+    // a UA that stays silent is marked unreachable — the registration
+    // looks fine and the calls fail.
+    match session.endpoint.incoming_transactions() {
         Ok(incoming) => {
-            tokio::spawn(crate::incoming::serve(incoming, endpoint_token.clone()));
+            tokio::spawn(crate::incoming::serve(
+                incoming,
+                endpoint_token.clone(),
+                session.clone(),
+                calls,
+            ));
         }
         Err(e) => {
             warn!(error = %e, "the incoming channel was already taken");
@@ -288,7 +329,7 @@ async fn run_registration_inner(
         })
     };
 
-    let mut registration = Registration::new(endpoint.inner.clone(), credential);
+    let mut registration = Registration::new(session.endpoint.inner.clone(), credential);
 
     if let Some(proxy) = parse_outbound_proxy(&account.outbound_proxy) {
         registration.outbound_proxy = Some(proxy);

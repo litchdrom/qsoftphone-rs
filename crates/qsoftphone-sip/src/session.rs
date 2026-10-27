@@ -1,0 +1,176 @@
+//! One account's SIP session.
+//!
+//! A session is the endpoint (one socket, one Via branch space), the
+//! dialog layer that lives on it, and the dialogs that are currently
+//! up. The registrar creates it and publishes it in the
+//! [`SessionRegistry`]; the call layer finds it there.
+//!
+//! The split matters: the endpoint has to outlive a single
+//! registration — a registered account is what a call is placed from,
+//! and it is what an incoming INVITE arrives on.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use rsipstack::dialog::dialog_layer::DialogLayer;
+use rsipstack::dialog::invite_dialog::InviteDialog;
+use rsipstack::transaction::endpoint::Endpoint;
+
+use qsoftphone_core::model::account::Account;
+
+use crate::inspector::PublicAddress;
+
+/// One account's SIP session.
+pub struct AccountSession {
+    /// The account this session belongs to.
+    pub account: Account,
+    /// The endpoint: the socket and the transaction layer.
+    pub endpoint: Endpoint,
+    /// The dialog layer. One per endpoint.
+    ///
+    /// It is an `Arc` because `do_invite_async` needs one: the
+    /// outbound INVITE has to be driven on the runtime, and the
+    /// dialog layer is what owns it.
+    pub dialog_layer: Arc<DialogLayer>,
+    /// The address the registrar sees us at.
+    pub public_address: PublicAddress,
+    /// The dialogs we can still act on, keyed by SIP Call-ID.
+    dialogs: Mutex<HashMap<String, InviteDialog>>,
+}
+
+impl AccountSession {
+    /// A session for an account and the endpoint it owns.
+    pub fn new(account: Account, endpoint: Endpoint, public_address: PublicAddress) -> Arc<Self> {
+        let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
+        Arc::new(Self {
+            account,
+            endpoint,
+            dialog_layer,
+            public_address,
+            dialogs: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Remember a dialog so the UI can act on it later.
+    pub fn remember(&self, call_id: &str, dialog: InviteDialog) {
+        self.dialogs
+            .lock()
+            .expect("dialog lock")
+            .insert(call_id.to_string(), dialog);
+    }
+
+    /// The dialog for a call, if it is still up.
+    pub fn dialog(&self, call_id: &str) -> Option<InviteDialog> {
+        self.dialogs
+            .lock()
+            .expect("dialog lock")
+            .get(call_id)
+            .cloned()
+    }
+
+    /// Forget a dialog that has ended.
+    pub fn forget(&self, call_id: &str) {
+        self.dialogs.lock().expect("dialog lock").remove(call_id);
+    }
+
+    /// The calls that are currently up.
+    pub fn call_ids(&self) -> Vec<String> {
+        self.dialogs
+            .lock()
+            .expect("dialog lock")
+            .keys()
+            .cloned()
+            .collect()
+    }
+}
+
+/// The live sessions, keyed by account id.
+///
+/// The registrar publishes into it, the call layer reads from it. It is
+/// cloned by handle, so both hold the same map.
+#[derive(Clone, Default)]
+pub struct SessionRegistry {
+    inner: Arc<Mutex<HashMap<String, Arc<AccountSession>>>>,
+}
+
+impl SessionRegistry {
+    /// A new, empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publish a session under its account id.
+    pub fn insert(&self, account_id: &str, session: Arc<AccountSession>) {
+        self.inner
+            .lock()
+            .expect("session lock")
+            .insert(account_id.to_string(), session);
+    }
+
+    /// The session for an account, if it has one.
+    pub fn get(&self, account_id: &str) -> Option<Arc<AccountSession>> {
+        self.inner
+            .lock()
+            .expect("session lock")
+            .get(account_id)
+            .cloned()
+    }
+
+    /// Drop a session — the account was unregistered, or the app is
+    /// shutting down.
+    pub fn remove(&self, account_id: &str) {
+        self.inner.lock().expect("session lock").remove(account_id);
+    }
+
+    /// How many sessions are live.
+    pub fn len(&self) -> usize {
+        self.inner.lock().expect("session lock").len()
+    }
+
+    /// Whether no session is live.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rsipstack::platform::CancellationToken;
+    use rsipstack::sip::Transport;
+
+    #[test]
+    fn a_registry_starts_empty() {
+        let registry = SessionRegistry::new();
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+        assert!(registry.get("acct-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_session_can_be_published_and_found() {
+        let token = CancellationToken::new();
+        let endpoint = crate::build_endpoint(Transport::Udp, 0, token.clone(), None)
+            .await
+            .expect("endpoint");
+        let account = Account::new("Office", "example.com", "104", "pw", "udp");
+        let session = AccountSession::new(account, endpoint, PublicAddress::default());
+
+        let registry = SessionRegistry::new();
+        registry.insert("acct-1", session.clone());
+
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get("acct-1").is_some());
+        assert!(registry.get("acct-2").is_none());
+
+        // The registry is a handle, not a copy: the session the call
+        // layer finds is the one the registrar published.
+        assert!(Arc::ptr_eq(
+            &registry.get("acct-1").expect("session"),
+            &session
+        ));
+
+        registry.remove("acct-1");
+        assert!(registry.is_empty());
+    }
+}

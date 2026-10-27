@@ -65,7 +65,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     let handle = runtime.handle().clone();
-    let registrations = qsoftphone_sip::RegistrationManager::new(handle.clone());
+
+    // The session registry is where the registrar publishes the live
+    // endpoints, and the bus is where the call events travel. Both are
+    // handles: the registrar and the call manager share them.
+    let sessions = qsoftphone_sip::SessionRegistry::new();
+    let (bus, call_events) = qsoftphone_sip::CallBus::new();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -82,7 +87,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 db,
                 config.clone(),
                 handle.clone(),
-                registrations,
+                sessions.clone(),
+                bus.clone(),
+                call_events,
             )))
         }),
     )

@@ -1,29 +1,31 @@
-//! Incoming requests — the keepalives the registrar sends us.
-//!
-//! Asterisk pings a registered endpoint with SIP OPTIONS. A UA that
-//! does not answer is marked *unreachable* by the server, and the calls
-//! that follow fail even though the registration itself looks perfect.
-//! That is the whole symptom: the registration succeeds and nothing
-//! else works.
+//! Incoming requests — the keepalives, and the calls.
 //!
 //! rsipstack hands every incoming request that has no matching
 //! transaction to the endpoint's `incoming_transactions()` channel.
-//! Nothing was reading that channel, so every OPTIONS was dropped and
-//! the server timed out waiting for an answer.
+//! This module owns that channel and routes what arrives:
 //!
-//! This module owns that channel and answers what it can:
+//! | Request | What happens |
+//! |---|---|
+//! | `OPTIONS` | `200 OK`. The registrar's keepalive. |
+//! | `INVITE` (no To tag) | A new call: `180 Ringing` right away (§5.4), then the call layer takes over. |
+//! | anything with a To tag | An in-dialog request — the `BYE`, the DTMF `INFO`, a re-INVITE. It goes to the dialog it belongs to. |
+//! | anything else | `501 Not Implemented`. A status code beats a timeout. |
 //!
-//! * **OPTIONS** → `200 OK`. The keepalive.
-//! * **anything else** → `501 Not Implemented`, so the peer gets an
-//!   answer instead of a timeout. INVITE is the one that matters, and
-//!   M2 takes it over.
+//! The distinction between a new call and an in-dialog request is the
+//! To tag: an initial request has none, everything that follows in the
+//! dialog has one.
+
+use std::sync::Arc;
 
 use rsipstack::platform::CancellationToken;
 use rsipstack::sip::{
-    Header, Headers, Method, Request, Response, StatusCode, ToTypedHeader, Version,
+    Header, Headers, HeadersExt, Method, Request, Response, StatusCode, ToTypedHeader, Version,
 };
 use rsipstack::transaction::{TransactionReceiver, make_tag};
 use tracing::{info, warn};
+
+use crate::call::{CallBus, handle_in_dialog_request, handle_incoming_invite};
+use crate::session::AccountSession;
 
 /// Build the response to an incoming request.
 ///
@@ -66,9 +68,24 @@ pub fn make_response(request: &Request, status: StatusCode) -> Response {
     }
 }
 
+/// Whether a request carries a To tag — and is therefore in-dialog.
+fn has_to_tag(request: &Request) -> bool {
+    request
+        .to_header()
+        .ok()
+        .and_then(|to| to.tag().ok())
+        .flatten()
+        .is_some()
+}
+
 /// Answer the requests that arrive on the endpoint, until the token is
 /// cancelled.
-pub async fn serve(mut incoming: TransactionReceiver, cancelled: CancellationToken) {
+pub async fn serve(
+    mut incoming: TransactionReceiver,
+    cancelled: CancellationToken,
+    session: Arc<AccountSession>,
+    calls: CallBus,
+) {
     loop {
         let transaction = tokio::select! {
             _ = cancelled.cancelled() => break,
@@ -81,21 +98,39 @@ pub async fn serve(mut incoming: TransactionReceiver, cancelled: CancellationTok
         let mut transaction = transaction;
         let request = transaction.original.clone();
 
-        let response = match request.method {
+        // An in-dialog request: the BYE, the DTMF INFO, a re-INVITE.
+        // It goes to the dialog it belongs to.
+        if has_to_tag(&request) {
+            if let Err(e) = handle_in_dialog_request(session.clone(), transaction).await {
+                warn!(error = %e, "could not route an in-dialog request");
+            }
+            continue;
+        }
+
+        match request.method {
+            Method::Invite => {
+                if let Err(e) =
+                    handle_incoming_invite(session.clone(), transaction, calls.clone()).await
+                {
+                    warn!(error = %e, "the incoming call could not be set up");
+                }
+            }
             Method::Options => {
                 info!("answered an OPTIONS keepalive");
-                make_response(&request, StatusCode::OK)
+                let response = make_response(&request, StatusCode::OK);
+                if let Err(e) = transaction.respond(response).await {
+                    warn!(error = %e, "could not answer the OPTIONS");
+                }
             }
             method => {
                 // The caller gets an answer rather than a timeout.
                 // M2 takes over INVITE.
                 warn!(%method, "the method is not implemented yet");
-                make_response(&request, StatusCode::NotImplemented)
+                let response = make_response(&request, StatusCode::NotImplemented);
+                if let Err(e) = transaction.respond(response).await {
+                    warn!(error = %e, "could not answer the request");
+                }
             }
-        };
-
-        if let Err(e) = transaction.respond(response).await {
-            warn!(error = %e, "could not answer the request");
         }
     }
 }
@@ -104,6 +139,7 @@ pub async fn serve(mut incoming: TransactionReceiver, cancelled: CancellationTok
 mod tests {
     use super::*;
     use rsipstack::sip::Uri;
+    use rsipstack::sip::headers::typed::To;
 
     fn request(method: Method) -> Request {
         Request {
@@ -125,5 +161,21 @@ mod tests {
     fn a_not_implemented_response_is_built_for_unknown_methods() {
         let response = make_response(&request(Method::Invite), StatusCode::NotImplemented);
         assert_eq!(response.status_code, StatusCode::NotImplemented);
+    }
+
+    #[test]
+    fn a_request_without_a_to_tag_is_not_in_dialog() {
+        assert!(!has_to_tag(&request(Method::Invite)));
+    }
+
+    #[test]
+    fn a_request_with_a_to_tag_is_in_dialog() {
+        let mut request = request(Method::Bye);
+        request.headers.push(Header::To(
+            To::parse("<sip:104@example.com>;tag=abc123")
+                .expect("to")
+                .into(),
+        ));
+        assert!(has_to_tag(&request));
     }
 }

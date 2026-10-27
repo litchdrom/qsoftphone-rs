@@ -11,10 +11,13 @@
 
 use std::time::Duration;
 
+use qsoftphone_core::model::account::Account;
 use qsoftphone_sip::endpoint::build_endpoint;
 use qsoftphone_sip::incoming::serve;
+use qsoftphone_sip::{AccountSession, CallBus, PublicAddress};
 use rsipstack::platform::CancellationToken;
 use rsipstack::sip::Transport;
+use rsipstack::transaction::Endpoint;
 use tokio::net::UdpSocket;
 
 /// The OPTIONS request Asterisk sends to qualify an endpoint.
@@ -46,6 +49,29 @@ fn header_value(message: &str, name: &str) -> Option<String> {
     })
 }
 
+/// Serve the requests that arrive on an endpoint.
+///
+/// The session and the bus are what the call layer needs; the
+/// keepalive does not use either, but the same loop serves both.
+fn serve_incoming(endpoint: &Endpoint, token: &CancellationToken) {
+    let incoming = endpoint.incoming_transactions().expect("incoming channel");
+
+    let account = Account::new("Office", "example.com", "104", "pw", "udp");
+    let session = AccountSession::new(
+        account,
+        Endpoint {
+            inner: endpoint.inner.clone(),
+        },
+        PublicAddress::default(),
+    );
+    let (bus, _receiver) = CallBus::new();
+
+    let token = token.clone();
+    tokio::spawn(async move {
+        serve(incoming, token, session, bus).await;
+    });
+}
+
 /// Bring an endpoint up and answer whatever arrives on it.
 async fn answering_endpoint() -> (rsipstack::transaction::Endpoint, u16, CancellationToken) {
     let token = CancellationToken::new();
@@ -58,8 +84,7 @@ async fn answering_endpoint() -> (rsipstack::transaction::Endpoint, u16, Cancell
         let _ = inner.serve().await;
     });
 
-    let incoming = endpoint.incoming_transactions().expect("incoming channel");
-    tokio::spawn(serve(incoming, token.clone()));
+    serve_incoming(&endpoint, &token);
 
     let port = endpoint
         .get_addrs()
@@ -178,8 +203,7 @@ async fn a_tcp_endpoint_answers_an_options_on_a_new_connection() {
         let _ = inner.serve().await;
     });
 
-    let incoming = endpoint.incoming_transactions().expect("incoming channel");
-    tokio::spawn(serve(incoming, token.clone()));
+    serve_incoming(&endpoint, &token);
 
     // The listener is bound by the transport layer when the endpoint
     // starts serving, so the port is only known once it is up.

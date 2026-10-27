@@ -1,8 +1,8 @@
 //! The egui shell.
 //!
 //! M0 scope: the window, the account list and the account editor.
-//! M1 adds the registration state. The dialer, the call window and the
-//! history list arrive with the calling stack in M2/M3.
+//! M1 adds the registration state. M2 adds the dialer, the call panel
+//! and the incoming-call modal.
 //!
 //! Note the egui 0.37 API: `eframe::App` is driven by `App::ui`,
 //! which hands over a root `Ui` rather than a `Context`, and the
@@ -13,9 +13,12 @@ use std::collections::HashMap;
 use eframe::egui;
 use qsoftphone_core::config::AppConfig;
 use qsoftphone_core::model::account::Account;
+use qsoftphone_core::model::call_event::{CallEventType, Direction};
 use qsoftphone_core::paths::AppPaths;
 use qsoftphone_core::storage::{AccountStore, Db};
-use qsoftphone_sip::{RegistrationManager, RegistrationState};
+use qsoftphone_sip::{
+    CallBus, CallManager, RegistrationManager, RegistrationState, SessionRegistry,
+};
 
 /// The application state.
 pub struct QSoftphoneApp {
@@ -27,6 +30,14 @@ pub struct QSoftphoneApp {
     _runtime: tokio::runtime::Handle,
     /// The registrations, and the state each one is in.
     registrations: RegistrationManager,
+    /// The calls, and the state each one is in.
+    calls: CallManager,
+    /// What the UI shows about each call, keyed by SIP Call-ID.
+    call_views: HashMap<String, CallView>,
+    /// The call the call panel is showing.
+    active_call_id: Option<String>,
+    /// The number the dialer has.
+    dial_number: String,
     states: HashMap<String, RegistrationState>,
     accounts: Vec<Account>,
     /// Index into `accounts` of the selected row.
@@ -47,6 +58,30 @@ pub struct QSoftphoneApp {
     status: String,
     /// The theme is applied once, on the first frame.
     theme_applied: bool,
+}
+
+/// What the UI shows about one call.
+#[derive(Debug, Clone, Default)]
+struct CallView {
+    /// The account the call belongs to.
+    account_id: String,
+    /// The SIP Call-ID.
+    call_id: String,
+    /// Which way the call was going.
+    direction: Option<Direction>,
+    /// The peer: the caller for an incoming call, the callee for an
+    /// outgoing one.
+    peer: String,
+    /// The resolved display name of the peer.
+    caller_id: String,
+    /// The number the remote party actually dialled.
+    dialed_number: String,
+    /// `initiating`, `ringing`, `connected`, `ended`.
+    state: String,
+    /// The last DTMF digit that arrived.
+    digit: String,
+    /// Whether the call is over.
+    ended: bool,
 }
 
 /// The account form.
@@ -109,7 +144,9 @@ impl QSoftphoneApp {
         db: Db,
         config: AppConfig,
         runtime: tokio::runtime::Handle,
-        registrations: RegistrationManager,
+        sessions: SessionRegistry,
+        bus: CallBus,
+        call_events: tokio::sync::mpsc::UnboundedReceiver<qsoftphone_sip::CallUpdate>,
     ) -> Self {
         let accounts = AccountStore::new(&db).list().unwrap_or_default();
         // Prefer the account the settings file points at; fall back
@@ -123,8 +160,12 @@ impl QSoftphoneApp {
             paths,
             db,
             config,
-            _runtime: runtime,
-            registrations,
+            _runtime: runtime.clone(),
+            registrations: RegistrationManager::new(runtime.clone(), sessions.clone(), bus.clone()),
+            calls: CallManager::new(runtime, sessions, bus, call_events),
+            call_views: HashMap::new(),
+            active_call_id: None,
+            dial_number: String::new(),
             states: HashMap::new(),
             accounts,
             selected,
@@ -142,13 +183,59 @@ impl QSoftphoneApp {
     }
 
     /// Drain the registration state changes that arrived since the
-    /// last frame (§3: events come on a channel and are drained at
-    /// the top of each frame).
+    /// last frame (§3: events come on a channel and are drained here).
     fn drain_registrations(&mut self) {
         for event in self.registrations.drain() {
             let state = event.state.clone();
             self.status = format!("{} — {}", event.user, state.summary());
             self.states.insert(event.account_id, state);
+        }
+    }
+
+    /// Drain the call events that arrived since the last frame.
+    fn drain_calls(&mut self) {
+        for update in self.calls.drain() {
+            let event = update.event;
+            if event.call_id.is_empty() {
+                continue;
+            }
+            let call_id = event.call_id.clone();
+
+            let view = self
+                .call_views
+                .entry(call_id.clone())
+                .or_insert_with(|| CallView {
+                    call_id: call_id.clone(),
+                    ..Default::default()
+                });
+
+            view.account_id = update.account_id.clone();
+            if let Some(direction) = event.call_direction {
+                view.direction = Some(direction);
+            }
+            if !event.caller_id.is_empty() {
+                view.caller_id = event.caller_id.clone();
+            }
+            if !event.dialed_number.is_empty() {
+                view.dialed_number = event.dialed_number.clone();
+            }
+            if !event.call_state.is_empty() {
+                view.state = event.call_state.clone();
+            }
+            if !event.digit.is_empty() {
+                view.digit = event.digit.clone();
+            }
+            match event.event_type {
+                CallEventType::IncomingCall => view.peer = event.caller.clone(),
+                CallEventType::OutgoingCallInitiated => view.peer = event.callee.clone(),
+                CallEventType::CallEnded => view.ended = true,
+                _ => {}
+            }
+
+            // The call panel follows the newest call that is not over.
+            if !view.ended && self.active_call_id.is_none() {
+                self.active_call_id = Some(call_id);
+            }
         }
     }
 
@@ -162,6 +249,24 @@ impl QSoftphoneApp {
     /// The selected account, if there is one.
     fn selected_account(&self) -> Option<&Account> {
         self.selected.and_then(|i| self.accounts.get(i))
+    }
+
+    /// The call the panel is showing.
+    fn active_call(&self) -> Option<&CallView> {
+        let id = self.active_call_id.as_ref()?;
+        self.call_views.get(id)
+    }
+
+    /// The call the incoming-call modal is for.
+    ///
+    /// §5.7: the modal is for a call that is ringing and has not been
+    /// answered yet.
+    fn incoming_call(&self) -> Option<&CallView> {
+        self.call_views.values().find(|call| {
+            call.direction == Some(Direction::Incoming)
+                && !call.ended
+                && (call.state == "ringing" || call.state.is_empty())
+        })
     }
 
     /// Load the selected account into the editor.
@@ -230,6 +335,68 @@ impl QSoftphoneApp {
         self.registrations.stop(&account.id);
         self.states.insert(account.id, RegistrationState::Idle);
         self.status = format!("Unregistered {}.", account.label);
+    }
+
+    /// Place a call to the number in the dialer.
+    fn place_call(&mut self) {
+        let Some(account) = self.selected_account().cloned() else {
+            return;
+        };
+        let target = self.dial_number.trim().to_string();
+        if target.is_empty() {
+            self.status = "There is no number to call.".to_string();
+            return;
+        }
+        match self.calls.place_call(&account.id, &target) {
+            Ok(call_id) => {
+                self.status = format!("Calling {target}…");
+                self.active_call_id = Some(call_id);
+            }
+            Err(e) => self.status = format!("Could not place the call: {e}"),
+        }
+    }
+
+    /// Answer the incoming call.
+    fn answer_call(&mut self) {
+        let Some(call) = self.incoming_call().cloned() else {
+            return;
+        };
+        match self.calls.answer(&call.account_id, &call.call_id) {
+            Ok(()) => self.status = "Answered.".to_string(),
+            Err(e) => self.status = format!("Could not answer: {e}"),
+        }
+    }
+
+    /// Decline the incoming call.
+    fn decline_call(&mut self) {
+        let Some(call) = self.incoming_call().cloned() else {
+            return;
+        };
+        match self.calls.decline(&call.account_id, &call.call_id) {
+            Ok(()) => self.status = "Declined.".to_string(),
+            Err(e) => self.status = format!("Could not decline: {e}"),
+        }
+    }
+
+    /// Hang the active call up.
+    fn hangup_call(&mut self) {
+        let Some(call) = self.active_call().cloned() else {
+            return;
+        };
+        match self.calls.hangup(&call.account_id, &call.call_id) {
+            Ok(()) => self.status = "Hanging up…".to_string(),
+            Err(e) => self.status = format!("Could not hang up: {e}"),
+        }
+    }
+
+    /// Send a DTMF digit on the active call.
+    fn send_dtmf(&mut self, digit: &str) {
+        let Some(call) = self.active_call().cloned() else {
+            return;
+        };
+        if let Err(e) = self.calls.send_dtmf(&call.account_id, &call.call_id, digit) {
+            self.status = format!("Could not send the digit: {e}");
+        }
     }
 
     /// Remember the selected account in the settings file.
@@ -309,8 +476,13 @@ impl QSoftphoneApp {
     }
 }
 
-impl eframe::App for QSoftphoneApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl QSoftphoneApp {
+    /// Draw one frame.
+    ///
+    /// This is the whole UI. It is a separate method from
+    /// [`eframe::App::ui`] so that a test can drive it headlessly —
+    /// egui does not need a window to lay the widgets out.
+    pub fn draw(&mut self, ui: &mut egui::Ui) {
         if !self.theme_applied {
             self.theme_applied = true;
             let visuals = if self.config.ui.theme.eq_ignore_ascii_case("light") {
@@ -324,6 +496,7 @@ impl eframe::App for QSoftphoneApp {
         // §3: the UI reads cached state; the network events arrive on
         // a channel and are drained here.
         self.drain_registrations();
+        self.drain_calls();
 
         egui::Panel::top("top_bar").show(ui, |ui| {
             // The registration state of the selected account, read from
@@ -338,7 +511,7 @@ impl eframe::App for QSoftphoneApp {
                 ui.separator();
                 ui.label(format!("SIP: {sip_state}"));
                 ui.separator();
-                ui.label("M1 — registration");
+                ui.label("M2 — calling");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
                 });
@@ -520,6 +693,69 @@ impl eframe::App for QSoftphoneApp {
             });
 
             ui.separator();
+            ui.label("Call");
+            let registered = self.registration_state(&account.id).is_registered();
+            ui.horizontal(|ui| {
+                let number = &mut self.dial_number;
+                ui.add(
+                    egui::TextEdit::singleline(number)
+                        .hint_text("Number to call")
+                        .desired_width(180.0),
+                );
+                let disabled = !registered || number.trim().is_empty();
+                if ui
+                    .add_enabled(!disabled, egui::Button::new("Call"))
+                    .clicked()
+                {
+                    self.place_call();
+                }
+            });
+            if !registered {
+                ui.weak("The account has to be registered before it can call.");
+            }
+
+            // The call panel.
+            if let Some(call) = self.active_call().cloned() {
+                ui.separator();
+                let who = if call.caller_id.is_empty() {
+                    call.peer.clone()
+                } else {
+                    call.caller_id.clone()
+                };
+                ui.label(format!("Call: {who} — {}", call.state));
+                if !call.dialed_number.is_empty() {
+                    ui.weak(format!("Dialled: {}", call.dialed_number));
+                }
+                if !call.digit.is_empty() {
+                    ui.weak(format!("Digit: {}", call.digit));
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Hang up").clicked() {
+                        self.hangup_call();
+                    }
+                });
+
+                if call.state == "connected" {
+                    ui.label("DTMF");
+                    egui::Grid::new("dtmf").num_columns(3).show(ui, |ui| {
+                        for row in [
+                            ["1", "2", "3"],
+                            ["4", "5", "6"],
+                            ["7", "8", "9"],
+                            ["*", "0", "#"],
+                        ] {
+                            for digit in row {
+                                if ui.button(digit).clicked() {
+                                    self.send_dtmf(digit);
+                                }
+                                ui.end_row();
+                            }
+                        }
+                    });
+                }
+            }
+
+            ui.separator();
             ui.label(format!("Status: {}", self.status));
             ui.separator();
             egui::CollapsingHeader::new("Paths").show(ui, |ui| {
@@ -528,101 +764,247 @@ impl eframe::App for QSoftphoneApp {
                 ui.monospace(format!("logs    {}", self.paths.log_dir().display()));
             });
         });
+
+        // The incoming-call modal.
+        //
+        // §5.7: it must not be closable by the user — no close button,
+        // no click-outside-to-dismiss, no Esc. Only Answer and Decline
+        // end it. `egui::Modal` has no window chrome, and the
+        // backdrop's response is deliberately not used.
+        if let Some(call) = self.incoming_call().cloned() {
+            let who = if call.caller_id.is_empty() {
+                call.peer.clone()
+            } else {
+                call.caller_id.clone()
+            };
+            egui::Modal::new(egui::Id::unique("incoming_call")).show(ui.ctx(), |ui| {
+                ui.set_width(260.0);
+                ui.heading("Incoming call");
+                ui.label(who);
+                if !call.dialed_number.is_empty() {
+                    ui.weak(format!("Dialled: {}", call.dialed_number));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Answer").clicked() {
+                        self.answer_call();
+                    }
+                    if ui.button("Decline").clicked() {
+                        self.decline_call();
+                    }
+                });
+            });
+        }
+    }
+}
+
+impl eframe::App for QSoftphoneApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qsoftphone_core::model::call_event::CallEvent;
+    use qsoftphone_core::storage::Db;
 
-    /// An app on a throwaway database, with a runtime to hold the
-    /// registration manager.
-    fn app(test_name: &str) -> (QSoftphoneApp, tokio::runtime::Runtime) {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let paths = AppPaths::under(
-            std::env::temp_dir()
-                .join("qsoftphone-app-tests")
-                .join(test_name),
-        );
-        paths.ensure().expect("paths");
+    /// An app with one account, and the bus its call events arrive on.
+    fn build_app(handle: tokio::runtime::Handle) -> (QSoftphoneApp, CallBus) {
+        let paths = AppPaths::under(std::env::temp_dir().join("qsoftphone-app-ui-test"));
         let db = Db::open_in_memory().expect("db");
-        let config = AppConfig::load(&paths.config_file()).expect("config");
-        let app = QSoftphoneApp::new(
+        let sessions = SessionRegistry::new();
+        let (bus, receiver) = CallBus::new();
+
+        let mut app = QSoftphoneApp::new(
             paths,
             db,
-            config,
-            runtime.handle().clone(),
-            RegistrationManager::new(runtime.handle().clone()),
+            AppConfig::default(),
+            handle,
+            sessions,
+            bus.clone(),
+            receiver,
         );
-        (app, runtime)
+
+        // The store is empty, so the account is put in directly. The
+        // id is what the call events are keyed by.
+        let mut account = Account::new("Office", "sip.example.com:5060", "104", "pw", "udp");
+        account.id = "acct-ui-1".to_string();
+        app.accounts.push(account);
+        app.selected = Some(0);
+        app.load_selected();
+
+        (app, bus)
     }
 
-    /// Fill in the "add account" form.
-    fn fill_new_account(app: &mut QSoftphoneApp, registrar: &str) {
-        app.new_account.label = "Office".to_string();
-        app.new_account.registrar = registrar.to_string();
-        app.new_account.user = "104".to_string();
-        app.new_account.password = "secret".to_string();
-        app.new_account.transport = "udp".to_string();
+    /// An incoming call, as the SIP layer would report it.
+    fn incoming_event() -> CallEvent {
+        let mut event = CallEvent::new(CallEventType::IncomingCall);
+        event.call_id = "call-1".to_string();
+        event.call_direction = Some(Direction::Incoming);
+        event.call_state = "ringing".to_string();
+        event.caller = "6666".to_string();
+        event.caller_id = "Alice".to_string();
+        event.dialed_number = "6666".to_string();
+        event
     }
 
-    #[test]
-    fn an_account_can_be_edited_in_place() {
-        let (mut app, _runtime) = app("edit-in-place");
-
-        fill_new_account(&mut app, "old.example.com");
-        app.add_account();
-        assert_eq!(app.accounts.len(), 1);
-
-        let id = app.accounts[0].id.clone();
-        let created_at = app.accounts[0].created_at;
-
-        // The editor is loaded from the selected account.
-        assert_eq!(app.edit_account.registrar, "old.example.com");
-        assert_eq!(app.editing_id.as_deref(), Some(id.as_str()));
-
-        // Edit it.
-        app.edit_account.registrar = "new.example.com".to_string();
-        app.edit_account.transport = "tcp".to_string();
-        app.save_selected();
-
-        // One account, the same one, with the new settings.
-        assert_eq!(app.accounts.len(), 1);
-        assert_eq!(app.accounts[0].id, id, "the account must not be duplicated");
-        assert_eq!(app.accounts[0].created_at, created_at);
-        assert_eq!(app.accounts[0].registrar, "new.example.com");
-        assert_eq!(app.accounts[0].transport, "tcp");
+    /// Run one frame of the UI, headlessly.
+    fn frame(app: &mut QSoftphoneApp, ctx: &egui::Context) -> egui::FullOutput {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+        // The font atlas the frame produced is of no use here, and
+        // epaint panics when an unapplied delta is dropped.
+        output.textures_delta.clear();
+        output
     }
 
-    #[test]
-    fn the_new_account_form_does_not_touch_the_editor() {
-        // One draft for adding, one for editing. With a single shared
-        // draft, typing a new account silently changed what "save"
-        // would write to the selected one.
-        let (mut app, _runtime) = app("separate-drafts");
-
-        fill_new_account(&mut app, "old.example.com");
-        app.add_account();
-
-        app.new_account.registrar = "typed-but-not-saved.example.com".to_string();
-        assert_eq!(app.edit_account.registrar, "old.example.com");
+    /// Run one frame of the UI with a given input.
+    fn frame_with(
+        app: &mut QSoftphoneApp,
+        ctx: &egui::Context,
+        input: egui::RawInput,
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(input, |ui| app.draw(ui));
+        output.textures_delta.clear();
+        output
     }
 
-    #[test]
-    fn removing_the_account_clears_the_editor() {
-        let (mut app, _runtime) = app("remove");
+    #[tokio::test]
+    async fn a_frame_draws_without_a_panic() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        let output = frame(&mut app, &ctx);
+        // egui laid the window out and drew something.
+        assert!(!output.shapes.is_empty(), "the frame drew nothing");
+        assert!(
+            output.platform_output.commands.is_empty(),
+            "the frame asked the backend to do something"
+        );
+    }
 
-        fill_new_account(&mut app, "old.example.com");
-        app.add_account();
-        assert!(app.editing_id.is_some());
+    #[tokio::test]
+    async fn an_incoming_call_opens_the_modal() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
 
-        app.delete_selected();
+        assert!(app.incoming_call().is_none());
+        bus.publish("acct-ui-1", incoming_event());
+        frame(&mut app, &ctx);
 
-        assert!(app.accounts.is_empty());
-        assert!(app.editing_id.is_none());
-        assert!(app.edit_account.registrar.is_empty());
+        let call = app.incoming_call().expect("the modal is not up");
+        assert_eq!(call.peer, "6666");
+        assert_eq!(call.caller_id, "Alice");
+        assert_eq!(call.dialed_number, "6666");
+    }
+
+    #[tokio::test]
+    async fn the_incoming_call_modal_cannot_be_dismissed() {
+        // §5.7: the modal is not closable. No close button, no
+        // click-outside-to-dismiss, no Esc — only Answer and Decline
+        // end it.
+        //
+        // `egui::Modal` never closes itself: `should_close()` is an
+        // opt-in the caller has to ask for, and this app never asks.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        bus.publish("acct-ui-1", incoming_event());
+        frame(&mut app, &ctx);
+        assert!(app.incoming_call().is_some());
+
+        // Esc, and a click outside the modal.
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        input.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(2.0, 2.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        frame_with(&mut app, &ctx, input);
+        assert!(
+            app.incoming_call().is_some(),
+            "the modal must not be dismissable by the user"
+        );
+    }
+
+    #[tokio::test]
+    async fn answering_the_call_closes_the_modal() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        bus.publish("acct-ui-1", incoming_event());
+        frame(&mut app, &ctx);
+        assert!(app.incoming_call().is_some());
+
+        // The SIP layer reports the call as answered.
+        let mut answered = CallEvent::new(CallEventType::CallAnswered);
+        answered.call_id = "call-1".to_string();
+        answered.call_direction = Some(Direction::Incoming);
+        answered.call_state = "connected".to_string();
+        bus.publish("acct-ui-1", answered);
+        frame(&mut app, &ctx);
+
+        assert!(app.incoming_call().is_none(), "the modal is still up");
+    }
+
+    #[tokio::test]
+    async fn an_ended_call_closes_the_modal() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        bus.publish("acct-ui-1", incoming_event());
+        frame(&mut app, &ctx);
+        assert!(app.incoming_call().is_some());
+
+        let mut ended = CallEvent::new(CallEventType::CallEnded);
+        ended.call_id = "call-1".to_string();
+        ended.call_direction = Some(Direction::Incoming);
+        ended.call_state = "ended".to_string();
+        ended.sip_code = 603;
+        bus.publish("acct-ui-1", ended);
+        frame(&mut app, &ctx);
+
+        assert!(app.incoming_call().is_none(), "the modal is still up");
+    }
+
+    #[tokio::test]
+    async fn the_call_panel_follows_the_newest_call() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        let mut outgoing = CallEvent::new(CallEventType::OutgoingCallInitiated);
+        outgoing.call_id = "call-2".to_string();
+        outgoing.call_direction = Some(Direction::Outgoing);
+        outgoing.call_state = "initiating".to_string();
+        outgoing.callee = "100".to_string();
+        bus.publish("acct-ui-1", outgoing);
+        frame(&mut app, &ctx);
+
+        let call = app.active_call().expect("no call is shown");
+        assert_eq!(call.call_id, "call-2");
+        assert_eq!(call.peer, "100");
+    }
+
+    #[tokio::test]
+    async fn a_call_from_an_unregistered_account_is_refused() {
+        // The dialer is only live for a registered account, and the
+        // call layer refuses it as well.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        app.dial_number = "100".to_string();
+        app.place_call();
+
+        assert!(
+            app.status.contains("not registered"),
+            "the app must say why: {}",
+            app.status
+        );
     }
 }

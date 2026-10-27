@@ -9,10 +9,13 @@ identity resolution, the call event contract, the history rules and
 the transfer construction all have to behave identically, including the
 bugs that have already been fixed there.
 
-**Status: M1 complete.** The workspace builds, the test suite passes, the
-app starts and exits cleanly, and an account can be registered against a
-SIP registrar with digest authentication (MD5 and SHA-256). Calling is not
-wired up yet — see [Milestones](#milestones).
+**Status: M2 complete.** The workspace builds, the test suite passes, the
+app starts and exits cleanly, an account can be registered against a SIP
+registrar with digest authentication (MD5 and SHA-256), and calls can be
+placed and received over that registration — outbound INVITE, inbound
+INVITE with an automatic 180 Ringing, answer, decline, hang up, and DTMF.
+There is no audio yet: the media plane is M4. See
+[Milestones](#milestones).
 
 ---
 
@@ -54,11 +57,15 @@ qsoftphone-rs/
     │   ├── paths.rs               per-OS config / data / log dirs
     │   ├── sip/                   pure SIP functions (uri, identity, refer)
     │   └── storage/               SQLite: accounts, contacts, history
-    ├── qsoftphone-sip/            the SIP layer: transport + registration
+    ├── qsoftphone-sip/            the SIP layer: transport, registration, calls
+    │   ├── call.rs                placing, answering and ending calls
     │   ├── digest.rs              RFC 7616 interop with rsipstack
     │   ├── endpoint.rs            one endpoint per account, per transport
     │   ├── incoming.rs            answering what arrives on that endpoint
+    │   ├── inspector.rs           the message inspector: digest + public address
     │   ├── registrar.rs           REGISTER / refresh / unregister
+    │   ├── sdp.rs                 the SDP placeholder and the DTMF encoding
+    │   ├── session.rs             one account's endpoint and the dialogs on it
     │   └── state.rs               what the UI needs to know, nothing more
     └── qsoftphone-app/            the binary
         ├── main.rs                startup order, --smoke
@@ -92,9 +99,11 @@ Pinned in the workspace `Cargo.toml`, locked in `Cargo.lock`.
 The brief asks for a resolved tree under ~250 crates, assuming
 rsipstack would be the bulk at 134.
 
-**Measured, the real number is 304 crates** for the Windows target
-(383 for Linux, which adds X11/Wayland/ALSA). The gap is not
-bloat — it is two subtrees the brief's estimate did not account for:
+**Measured, the real number is 305 package names** for the Windows target
+(384 for Linux, which adds X11/Wayland/ALSA). Three of those are this
+workspace's own crates, so 302 and 381 are third-party packages. The gap
+is not bloat — it is two subtrees the brief's estimate did not account
+for:
 
 | Subtree | Crates | Trimmable? |
 |---|---|---|
@@ -110,12 +119,17 @@ bloat — it is two subtrees the brief's estimate did not account for:
 stack. There is no trim that reaches 250 without substituting the
 stack, which the brief forbids.
 
-The count is `cargo tree --workspace --edges normal --target
+The count is `cargo tree --workspace --prefix none --edges normal --target
 x86_64-pc-windows-msvc`, unique package names. It moved from 303 to 304
 when M1 added the `qsoftphone-sip` workspace member — the SIP crates
 were already in the tree, because the app declared the whole pinned
 stack from M0 so the budget would be measured against the final
 dependency set rather than a moving target.
+
+**M2 added no dependency at all.** The resolved tree for `c19bd90` (the
+last M1 commit) and for the M2 tree is identical — same package names,
+same versions. The call layer is built on rsipstack's dialog API, which
+was already there.
 
 **What was trimmed.** `rsipstack` is built with `default-features = false`
 and only `platform-tokio`, `std` and `rustls` enabled:
@@ -153,8 +167,8 @@ so the two can be diffed by hand.
 | §5.1 dialled number: header → Request-URI → To-URI | `CallController.cpp`, `src/core/call/AccountProfile.h` | `sip::identity::resolve_dialed_number` |
 | §5.2 caller display name: header → contacts → URI user-part → Display Name | `CallController.cpp` | `sip::identity::resolve_caller_display_name` |
 | §5.3 history stores the *remote* number, never the local AOR | `src/core/history/CallHistory.h`, `src/app/Application.cpp` | `model::history::CallRecord` |
-| §5.4 180 Ringing on every inbound INVITE | `src/core/sip/SipEndpoint.cpp` | M2 |
-| §5.5 hang up without a forced status code | `src/core/sip/SipEndpoint.cpp` | M2 |
+| §5.4 180 Ringing on every inbound INVITE | `src/core/sip/SipEndpoint.cpp` | `qsoftphone-sip::call::handle_incoming_invite` |
+| §5.5 hang up without a forced status code | `src/core/sip/SipCall.cpp` (`hangup`) | `qsoftphone-sip::call::CallManager::hangup` |
 | §5.6 `Refer-To` construction, blind and attended | `src/core/sip/SipEndpoint.cpp` | `sip::refer` |
 | §5.8 digest auth: MD5 + SHA-256, realm vs SIP domain | `src/core/sip/SipEndpoint.cpp` | `qsoftphone-sip::digest` |
 | Header capture allowlist | `src/core/call/AccountProfile.h` | `model::account::AccountProfile::filter_headers` |
@@ -297,11 +311,17 @@ registration itself looks perfect. The symptom is exactly
 | Request | Answer | Why |
 |---|---|---|
 | `OPTIONS` | `200 OK` | The registrar's keepalive. |
-| anything else | `501 Not Implemented` | A status code beats a timeout. `INVITE` is the one that matters, and M2 takes it over. |
+| `INVITE` without a To tag | `100 Trying`, then `180 Ringing` | A new call — M2 takes it over. |
+| anything with a To tag | routed to its dialog | An in-dialog request: the BYE, the DTMF `INFO`, a re-INVITE. |
+| anything else | `501 Not Implemented` | A status code beats a timeout. |
 
 The response copies the request's Via, From, To, Call-ID and CSeq
 (RFC 3261 §8.2.6) and carries a tag on the To header (§8.1.3.7), so
 the transaction matches on the other side.
+
+The To tag is also what tells a **new call** apart from an **in-dialog
+request**: an initial request has no To tag, everything that follows in
+the dialog has one.
 
 ### Transports
 
@@ -390,6 +410,125 @@ writes — including the ones from rsipstack itself — is attributable.
 
 ---
 
+## M2 — Calling
+
+### What happens
+
+**Outgoing.** The user types a number and presses **Call**. `CallManager`
+takes the number, turns it into a routable URI (a bare number is dialled
+at the registrar, the way the C++ does it), and sends an INVITE with an
+SDP offer. The dialog's state channel reports `180 Ringing` as
+`call_ringing` and the `200 OK` as `call_answered`.
+
+**Incoming.** A `100 Trying` goes out, then — **immediately**, before the
+user has seen anything — a `180 Ringing`. A PBX that does not get one
+aborts with `503`/`480` after its ringing timeout, so this is not a
+nicety (§5.4). The call is reported to the UI, the incoming-call modal
+opens, and the user answers or declines.
+
+**Hanging up** never forces a status code (§5.5). The stack picks the
+right one for the state and the role:
+
+| State | Role | What goes out | Status |
+|---|---|---|---|
+| established | either | `BYE` | `200 OK` |
+| early | the side that called | `CANCEL` | `487 Request Terminated` |
+| early | the side that was called | `603 Decline` | `603` |
+
+Those are the same three cases `pjsua_call_hangup` picks when the status
+code is left at zero — see the C++ `SipCall::hangup()` and its comment.
+Forcing `603` onto a normal hangup used to make every twelve-second call
+show up in the history as "declined"; the same bug would have been easy
+to port along with the code.
+
+rsipstack's own `InviteDialog::hangup()` covers two of the three cases —
+it cancels an early call of ours and it says `BYE` on a confirmed one —
+but it is a **no-op for an early incoming call**, which has to be
+declined instead. `CallManager::hangup` makes that third case explicit.
+
+### The two rsipstack behaviours worth knowing
+
+Both of these cost a rewrite to get right, and both are the sort of
+thing that works in a unit test and fails on the wire.
+
+**A response only reaches the wire if somebody drives the transaction.**
+`InviteDialog::ringing`, `accept` and `reject` *enqueue* the response;
+it is sent while `InviteDialog::handle(&mut tx)` is running. Without that
+loop the 180 Ringing of §5.4 never leaves the machine. So the sequence
+for an inbound call is: `send_trying()` → `get_or_create_server_invite`
+→ `ringing()` → **spawn** `handle()`. The spawned loop is also what
+answers the ACK and drives the in-dialog requests.
+
+**The Contact has to name the public address.** rsipstack's
+`build_local_contact` would produce `sip:104@0.0.0.0:5060`, and every
+in-dialog request the peer sends — the BYE, a re-INVITE — would go
+nowhere. `qsoftphone-sip::inspector::SessionInspector` therefore watches
+the Via of any response for the registrar's `received`/`rport` and
+exposes it as the session's `PublicAddress`. The outbound INVITE's
+Contact and the inbound `200 OK` use it.
+
+### The SDP is a placeholder
+
+There is no audio in M2, and the SDP says so: one PCMU stream on a port
+that is not bound, `a=sendrecv`. The call connects, the SIP trace is
+clean, and M4 replaces the whole thing with the session `rtc` negotiated.
+
+### DTMF is RFC 4733 over `INFO`
+
+RFC 2833 puts the digits in the RTP stream, which needs the media
+plane. The signalling-only way to send a digit is an `INFO` request with
+an `application/dtmf-relay` body (RFC 4733 §3), so that is what M2 uses:
+
+```text
+INFO sip:peer@host SIP/2.0
+Content-Type: application/dtmf-relay
+
+Signal=5
+Duration=100
+```
+
+The body is built and parsed by `qsoftphone-sip::sdp`, and rsipstack's
+own `parse_info_dtmf` is used to recognise it. M4 may switch to RFC 2833.
+
+### The UI
+
+The dialer is only live for a **registered** account — a call needs an
+endpoint to go out from, and the call layer refuses it if there is
+none. The call panel follows the newest call that is not over, and shows
+the resolved peer name, the dialled number, the last DTMF digit and a
+hang-up button, with the DTMF keypad once the call is connected.
+
+The incoming-call modal is §5.7's rule: **it cannot be closed by the
+user.** No close button, no click-outside-to-dismiss, no Esc — only
+Answer and Decline end it. `egui::Modal` never closes itself:
+`should_close()` is an opt-in the caller has to ask for, and this app
+never asks. The modal is drawn from the call's state, so it disappears
+when the call is answered or ends, and not before.
+
+### The identity of an incoming call (§5.2, §5.3)
+
+The caller's display name and the number the remote party actually
+dialled are resolved when the INVITE arrives:
+
+* the caller display name goes header → contacts → URI user-part → SIP
+  Display Name, the same order as the C++;
+* the dialled number goes header → Request-URI → To-URI. The
+  **Request-URI** is the DID case — the PBX forwards `sip:6666@host` to
+  our AOR — and it is the only way to tell `6666` from `104`;
+* only the headers on the account's capture allowlist are kept.
+
+### What is *not* in M2
+
+* **No audio.** The media plane is M4; the SDP is a placeholder.
+* **No call history.** The events are produced and shown, but nothing is
+  written to SQLite yet — that is M3.
+* **No transfer.** REFER is M5; `sip::refer` (the `Refer-To`
+  construction) is already ported and tested, but nothing sends it.
+* **The SIP domain is still not applied** to the From/To URI — M6, as
+  noted above.
+
+---
+
 | | Windows | Linux | macOS |
 |---|---|---|---|
 | config | `%APPDATA%\qsoftphone\config.json` | `$XDG_CONFIG_HOME/qsoftphone/config.json` | `~/Library/Application Support/qsoftphone/config.json` |
@@ -432,8 +571,8 @@ Taken from the brief, recorded here so they are not re-litigated:
 |---|---|---|
 | **M0** | Workspace, pinned dependencies, tracing, config load/save, account CRUD in SQLite, the SIP pure functions with their tests | **done** |
 | **M1** | Registration: rsipstack transport, digest auth (MD5 + SHA-256), register/unregister, registration state surfaced to the UI | **done** |
-| M2 | Calling: outbound INVITE, inbound INVITE with automatic 180 Ringing (§5.4), answer, hang up without a forced code (§5.5), DTMF | next |
-| M3 | History: SQLite persistence with the §5.3 semantics, redial using the resolved dialled number (§5.1), searchable list in the UI | |
+| **M2** | Calling: outbound INVITE, inbound INVITE with automatic 180 Ringing (§5.4), answer, decline, hang up without a forced code (§5.5), DTMF | **done** |
+| M3 | History: SQLite persistence with the §5.3 semantics, redial using the resolved dialled number (§5.1), searchable list in the UI | next |
 | M4 | Media: `rtc` RTP + `cpal` audio — SDP negotiation, send/receive audio, mute, codec selection | |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
@@ -447,7 +586,7 @@ One milestone at a time; M2 does not start before M1 works end to end.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 117 tests, all passing.
+* `cargo test --workspace` — 146 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -478,6 +617,27 @@ One milestone at a time; M2 does not start before M1 works end to end.
   timestamp, new settings, and still exactly one account.
 * The registration state reaches the UI over the channel and is shown
   in the title bar and next to the account.
+* **A call goes out and comes back, over a real UDP socket.** The
+  loopback peer is a hand-written registrar and call agent: it answers
+  the REGISTER, rings the call, answers it and hangs up. The test proves
+  the INVITE reached it, the `180 Ringing` came back as `call_ringing`,
+  the `200 OK` came back as `call_answered`, and the BYE reached the
+  peer.
+* **The hangup is a BYE, not a forced `603`.** The test asserts the
+  status code the call ended with is `200`, and that the peer saw a
+  `BYE`.
+* **A call that is still ringing is declined with `603`** — the third
+  case of §5.5, the one rsipstack's own `hangup()` leaves alone.
+* **An inbound call rings before the user does anything.** The peer
+  records the `180 Ringing` it received, and the test checks it *before*
+  the answer is sent — so §5.4's ordering is proved, not assumed.
+* **A DTMF digit arrives as an event** (`dtmf`, with the digit), and
+  **a DTMF digit sent by the app arrives at the peer as an `INFO`**
+  request.
+* **The incoming-call modal cannot be dismissed.** The UI is driven
+  headlessly (egui lays the widgets out without a window): Esc and a
+  click outside the modal are fed in, and the modal is still up
+  afterwards. Answering or ending the call closes it.
 
 **Not verified:**
 
@@ -489,12 +649,20 @@ One milestone at a time; M2 does not start before M1 works end to end.
   is the real test of §5.8. In particular, the OPTIONS keepalive has
   been proven against a hand-written registrar, not against Asterisk's
   own `qualify` timer.
-* Nothing has been put on the wire beyond REGISTER. No INVITE, no RTP,
-  no audio device. That is M2–M4.
+* **No third-party softphone has been called.** The calls above were
+  made against the hand-written peer in this repository. The SIP
+  messages on the wire are the real ones, but no Asterisk or Kamailio
+  instance has placed or received one.
+* **No audio.** The SDP is a placeholder and no RTP has been sent. That
+  is M4.
 * The GUI has been started and its window inspected by title, but the
-  layout has not been reviewed by a human at normal resolution.
+  layout has not been reviewed by a human at normal resolution — the
+  desktop this was built on was locked, so the window could not be
+  photographed. What *is* proved is that the UI lays out and draws
+  without panicking, and that the M2 behaviours above hold, in a
+  headless egui run.
 * The Linux build has not been compiled or run. The dependency tree is
-  resolved for `x86_64-unknown-linux-gnu` (382 crates) but no Linux
-  binary was produced.
+  resolved for `x86_64-unknown-linux-gnu` (384 package names) but no
+  Linux binary was produced.
 * The SIP domain is not applied to the From/To URI — M6, as noted
   above.

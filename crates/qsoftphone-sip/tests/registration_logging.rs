@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use qsoftphone_core::model::account::Account;
-use qsoftphone_sip::{RegistrationManager, RegistrationState};
+use qsoftphone_sip::{CallBus, RegistrationManager, RegistrationState, SessionRegistry};
 use tokio::net::UdpSocket;
 
 /// A writer that keeps what it is given.
@@ -102,7 +102,11 @@ async fn the_registration_task_logs_the_account_id() {
     let mut account = Account::new("Office", registrar_addr.to_string(), "104", "s3cret", "udp");
     account.id = "acct-m1-logging".to_string();
 
-    let mut manager = RegistrationManager::new(tokio::runtime::Handle::current());
+    let mut manager = RegistrationManager::new(
+        tokio::runtime::Handle::current(),
+        SessionRegistry::new(),
+        CallBus::new().0,
+    );
     manager.start(&account, 0);
 
     // The UI drains the channel at the top of every frame; this is the
