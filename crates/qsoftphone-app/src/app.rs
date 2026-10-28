@@ -795,6 +795,17 @@ impl QSoftphoneApp {
         // The keypad belongs to the call the user is looking at, and
         // only while it is up.
         if active && call.state == "connected" {
+            // Say plainly that the call is signalling only. The SDP
+            // names a placeholder port, because the RTP stack is M4 —
+            // a call that is "connected" here is connected in SIP, not
+            // in audio, and saying so saves the user from looking for
+            // a sound card that was never opened.
+            ui.label(
+                egui::RichText::new("Media: not connected — the RTP stack lands in M4.")
+                    .small()
+                    .color(egui::Color32::GRAY),
+            );
+
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("DTMF").strong().size(11.0));
                 for row in [

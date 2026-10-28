@@ -499,11 +499,68 @@ The offer lists both G.711 codecs, and deliberately **not**
 make the peer send the digits into a stream nobody reads. Without it
 the peer falls back to RFC 4733, which this build can receive.
 
+### The UI thread is not on the runtime
+
+`eframe` owns the main thread and the SIP stack runs on a tokio runtime
+of its own, so the thread that draws the window is **not** inside that
+runtime. The window is not blocked — the runtime has its own workers —
+but the thread-local runtime context is missing.
+
+That matters because rsipstack drives the INVITE from a task it spawns
+with `tokio::spawn`, and `tokio::spawn` panics when the calling thread
+has no runtime:
+
+```text
+thread 'main' panicked at rsipstack-0.7.9/src/platform/mod.rs:92:5:
+there is no reactor running, must be called from the context of a Tokio 1.x runtime
+```
+
+The panic is on the UI thread, and it happens *before* a single byte
+goes out: the INVITE is built, the dialog is registered, and only then
+does the spawn fail. The window dies with that message on stderr and
+nothing in the log — which is exactly what the report looked like.
+
+The fix is to enter the runtime's context around the call:
+
+```rust
+let runtime = self.handle.clone();
+let (dialog, _handle) = {
+    let _runtime = runtime.enter();
+    session.dialog_layer.do_invite_async(option, state_sender)?
+};
+```
+
+Nothing else in the UI thread needs it: `ringing()`, `accept()` and
+`reject()` only queue a message on the dialog's channel, and the hangup
+and the DTMF are already spawned on the runtime.
+
+**This is the class of bug the loopback test could not see.** Every
+outgoing-call test was a `#[tokio::test]`, which runs *inside* a
+runtime — the one situation that never crashed. The regression test is
+deliberately a plain `#[test]` that builds its own runtime and places
+the call from outside it.
+
+### The INVITE carries the credential
+
+The REGISTER has always answered Asterisk's challenge with the
+account's digest (§5.8). The **INVITE** did not: `InviteOption.credential`
+was `None`, so a PBX that challenges the INVITE — and Asterisk does,
+with the same `realm="asterisk"` — was treated as if it had sent the
+final response. The dialog ended with `TerminatedReason::ProxyAuthRequired`
+and the call died without ringing.
+
+The credential now comes from the same place the registrar's does, so
+the two cannot drift apart.
+
 ### The SDP is otherwise a placeholder
 
-There is no audio in M2, and the SDP says so: one PCMU stream on a port
-that is not bound, `a=sendrecv`. The call connects, the SIP trace is
-clean, and M4 replaces the whole thing with the session `rtc` negotiated.
+There is no audio in M2, and the SDP says so: one G.711 stream
+(`PCMU` and `PCMA`) on a port that is not bound, `a=sendrecv`. The call
+connects, the SIP trace is clean, and M4 replaces the whole thing with
+the session `rtc` negotiated.
+The call panel says so too, under the call that is up — "Media: not
+connected — the RTP stack lands in M4" — so that a connected call is
+not mistaken for a call with audio.
 
 ### DTMF is RFC 4733 over `INFO`
 
@@ -635,6 +692,49 @@ Taken from the brief, recorded here so they are not re-litigated:
 
 One milestone at a time; M2 does not start before M1 works end to end.
 
+### Backlog — low priority
+
+Wanted, but not next. Each item says which milestone it lands in, so
+none of them is lost and none of them disturbs the order above.
+
+| Item | Lands in | Notes |
+|---|---|---|
+| **Codec selection per account** | M4 | M4 already has "codec selection". What is missing is that it is **per account**: one account may only speak PCMU, another only PCMA. `AccountProfile` has no codec field yet, and the account editor has no control for one. |
+| **Media device selection, in the main settings** | M4, the page in M6 | The device list comes from `cpal`, so it cannot exist before the media plane. It is an **app-level** setting, not a per-account one — one microphone and one speaker for the whole window — so it belongs in `AppConfig`'s `AudioConfig`, which already holds the volumes and the ringtone. The picker itself is M4 (it has to open the streams); the settings page it lives on is M6, which has to build that page anyway. |
+| **Expandable history, with the call time and the SIP code** | M3 | The **data** is already there: the `calls` table has `duration_sec`, `sip_code` and `hangup_cause`, and `HistoryStore` writes and reads all three. What is missing is the **UI** — a row that expands to show how long the call lasted, the final SIP status code and the cause, next to the searchable list M3 already has to build. |
+| **NAT traversal for the media plane** | M4 | The signalling side already does what it can: the public `Contact` is learned from the `received`/`rport` the registrar echoes (RFC 3581), the binding is refreshed before it expires, and Asterisk's OPTIONS keepalive is answered. The **RTP** side has nothing yet. At the very least the SDP has to carry the NAT-mapped port and the stack has to accept the symmetric RTP a NAT sends back from a different source port; beyond that, `rtc` 0.21.1 already ships `ice`, `stun` and `turn` as unconditional dependencies, so full ICE with host/srflx/relay candidates is available without adding a crate. |
+| **Configurable, playable ring tone for incoming calls, in the main settings** | M6 | The config keys are already there: `audio.ringtone_file` (empty = the bundled default) and `audio.ringtone_volume`. What is missing is the **player** — nothing opens a sound card yet — and the **Settings → Audio** page: a file picker, a volume slider and a preview. The C++ reference is `RingtonePlayer`. |
+| **A generated ring tone when a call is ringing and there is no media** | M4 | A **synthesised** tone, not a file: it starts on 180 Ringing when there is no RTP to carry audio, so an incoming call still rings audibly before the media plane exists. It needs a sound card, not RTP — the one item on this list that could be pulled forward. |
+
+**Why NAT traversal is on this list and not in M2.** The SDP names
+port 4000, and nothing binds it. Against the real Asterisk the call
+comes up — `200 OK` with an SDP, then the ACK — and the PBX starts
+sending RTP (G.711 A-law) at that port immediately, because our offer
+lists PCMU and PCMA and Asterisk picked A-law. The audio has nowhere
+to land. That is the whole of the remaining media gap, and it is M4's
+job, not a NAT problem in the signalling.
+
+**The two ring tones are not the same thing, and the C++ has both.**
+`RingtonePlayer` — the **inbound** one — plays a **WAV file**:
+`src/ui/assets/ringtone.wav`, 8 kHz mono 16-bit, 6 seconds long.
+Decoded, it is 2 s of tone and then 4 s of silence — the North
+American cadence, with the on/off pattern baked into that one loop. It
+is copied next to the binary as `share/qsoftphone/ringtone.wav` and
+overridden with `audio.ringtone_file`. `RingbackPlayer` — the
+**outgoing** one — **synthesises** a 440 Hz tone, 1 s on / 3 s off, at
+48 kHz mono (the bundled `ringback.wav` is the same cadence as a file:
+1 s of tone, then 3 s of silence), and it takes its own volume
+(`audio.ringback_volume`, a separate slider from the inbound
+ringtone's).
+
+Two rules carry over from the C++ unchanged. The tone stops when the
+call is answered, declined or disconnected — **and** a 60-second
+watchdog caps it, because pjsip 2.14 has a path where the call is torn
+down so fast that the disconnected state never reaches the UI, and
+without the cap the tone would play forever. The Rust tree's default
+`ringtone_volume` is 0.9 where the C++ uses 0.7; align it when the
+player lands.
+
 ---
 
 ## Verified, and not
@@ -642,7 +742,7 @@ One milestone at a time; M2 does not start before M1 works end to end.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 158 tests, all passing.
+* `cargo test --workspace` — 160 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -701,21 +801,42 @@ One milestone at a time; M2 does not start before M1 works end to end.
   afterwards. Answering or ending the call closes it.
 * **The window opens on the call page, and a call brings it forward.**
   Both are tests, not intentions.
+* **A call placed from the UI thread does not take the app down.** The
+  test places the call from a thread that is *not* inside the tokio
+  runtime — the same situation the egui UI thread is in — because a
+  `#[tokio::test]` would run inside the runtime and hide the bug. See
+  "The UI thread is not on the runtime" below.
+* **A challenged INVITE is answered with the account's digest.** The
+  loopback peer answers the first INVITE with `401 Unauthorized` and a
+  `WWW-Authenticate` challenge; the client retries with an
+  `Authorization` header, and the test verifies the digest against the
+  account's password with rsipstack's own verifier.
+
+**Verified against a real Asterisk:**
+
+* **The REGISTER works against Asterisk PBX 22.8.0.** The registrar
+  answers `401 Unauthorized` with
+  `WWW-Authenticate: Digest realm="asterisk", …, algorithm=MD5, qop="auth"`,
+  the client answers with the digest, and Asterisk replies `200 OK` with
+  `Contact: <sip:104@181.28.198.57:…>;expires=299`.
+* **An outbound INVITE reaches Asterisk, survives its challenge and is
+  answered.** Asterisk challenges the INVITE with `401` exactly as it
+  challenges the REGISTER; the client retries with the
+  `Authorization` header, and Asterisk answers with a status code
+  (`404 Not Found` for a SIP user that does not exist — the probe
+  dialled a user that cannot exist, so nothing could ring).
+* The INVITE carries the **public** Contact —
+  `<sip:104@181.28.198.57:…>` — learned from the `received` and `rport`
+  parameters the registrar echoes back, and the Request-URI keeps the
+  registrar's port.
 
 **Not verified:**
 
-* **No third-party registrar has been used.** Everything above was
-  proven against a registrar written by hand, inside this repository.
-  The digest, the CSeq bump, the `Expires` handling and the
-  `algorithm=SHA-256` echo are all correct against the spec — but an
-  Asterisk, Kamailio or OpenSIPS instance has not been tried, and that
-  is the real test of §5.8. In particular, the OPTIONS keepalive has
-  been proven against a hand-written registrar, not against Asterisk's
-  own `qualify` timer.
-* **No third-party softphone has been called.** The calls above were
-  made against the hand-written peer in this repository. The SIP
-  messages on the wire are the real ones, but no Asterisk or Kamailio
-  instance has placed or received one.
+* **No third-party softphone has been called.** The calls in the test
+  suite were made against the hand-written peer in this repository; the
+  Asterisk run above ended in a `404`. The SIP messages on the wire are
+  the real ones, but no call has yet been *answered* by a peer this
+  repository did not write.
 * **No audio.** The SDP is a placeholder and no RTP has been sent. That
   is M4.
 * The GUI has been started and its window photographed, so the layout

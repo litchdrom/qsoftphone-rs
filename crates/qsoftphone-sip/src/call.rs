@@ -23,6 +23,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use rsipstack::dialog::authenticate::Credential;
 use rsipstack::dialog::dialog::{Dialog, DialogState, TerminatedReason};
 use rsipstack::dialog::invitation::InviteOption;
 use rsipstack::sip::event_packages::parse_info_dtmf;
@@ -161,6 +162,15 @@ impl CallManager {
     /// `target` may be a bare number (`6666`), a SIP URI, or a URI
     /// with a display name. A bare number is dialled at the
     /// registrar, the way the C++ does it.
+    ///
+    /// This is called from the UI thread, which is **not** inside the
+    /// tokio runtime — `eframe` owns the main thread and the SIP
+    /// stack runs on a runtime of its own. rsipstack drives the
+    /// INVITE from a task it spawns with `tokio::spawn`, and
+    /// `tokio::spawn` panics when the calling thread has no runtime.
+    /// The runtime's context is therefore entered around the call;
+    /// without it, placing a call takes the whole app down before a
+    /// single byte goes out.
     pub fn place_call(&mut self, account_id: &str, target: &str) -> Result<String, CallError> {
         let session = self
             .sessions
@@ -188,13 +198,22 @@ impl CallManager {
                 sdp::PLACEHOLDER_MEDIA_PORT,
                 1,
             )),
+            // §5.8: a PBX that challenges the INVITE with 401/407 has
+            // to be answered with the account's digest. Without a
+            // credential the stack treats the challenge as the final
+            // response and the call dies before it rings.
+            credential: credential_of(&account),
             ..Default::default()
         };
 
-        let (dialog, _handle) = session
-            .dialog_layer
-            .do_invite_async(option, state_sender)
-            .map_err(|e| CallError::Sip(e.to_string()))?;
+        let runtime = self.handle.clone();
+        let (dialog, _handle) = {
+            let _runtime = runtime.enter();
+            session
+                .dialog_layer
+                .do_invite_async(option, state_sender)
+                .map_err(|e| CallError::Sip(e.to_string()))?
+        };
 
         let call_id = dialog.id().call_id.clone();
         session.remember(&call_id, dialog);
@@ -567,6 +586,29 @@ pub fn aor_of(account: &Account) -> String {
         account.domain.trim().to_string()
     };
     format!("sip:{}@{host}", account.user)
+}
+
+/// The digest credential of an account.
+///
+/// §5.8: the realm defaults to the registrar host. The registrar
+/// answers the REGISTER with it, and a PBX that challenges an INVITE
+/// with 401 or 407 is answered with the same one — a stack that has
+/// no credential treats the challenge as the final response and the
+/// call never rings.
+///
+/// The realm here is what we *expect*; the digest itself is computed
+/// over the realm the server names in its challenge, which is what
+/// RFC 7616 requires.
+pub fn credential_of(account: &Account) -> Option<Credential> {
+    if account.user.trim().is_empty() {
+        return None;
+    }
+    Some(Credential {
+        username: account.user.clone(),
+        password: account.password.clone(),
+        realm: Some(split_host_port(&account.registrar).0),
+        auth_username: None,
+    })
 }
 
 /// The Contact URI for an account.

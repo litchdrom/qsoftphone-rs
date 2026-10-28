@@ -16,7 +16,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use rsipstack::dialog::authenticate::Credential;
 use rsipstack::dialog::registration::{Registration, backoff_interval, refresh_interval};
 use rsipstack::platform::CancellationToken;
 use rsipstack::sip::{StatusCodeKind, Transport, Uri};
@@ -27,7 +26,7 @@ use tracing::{Instrument, info, warn};
 use qsoftphone_core::logging::account_span;
 use qsoftphone_core::model::account::Account;
 
-use crate::call::CallBus;
+use crate::call::{CallBus, credential_of};
 use crate::endpoint::{build_endpoint, parse_transport, split_host_port, transport_param};
 use crate::inspector::SessionInspector;
 use crate::session::{AccountSession, SessionRegistry};
@@ -317,17 +316,7 @@ async fn run_registration_inner(
         );
     }
 
-    let credential = if account.user.trim().is_empty() {
-        None
-    } else {
-        Some(Credential {
-            username: account.user.clone(),
-            password: account.password.clone(),
-            // §5.8: the realm defaults to the registrar host.
-            realm: Some(split_host_port(&account.registrar).0),
-            auth_username: None,
-        })
-    };
+    let credential = credential_of(&account);
 
     let mut registration = Registration::new(session.endpoint.inner.clone(), credential);
 

@@ -227,16 +227,33 @@ fn dtmf_info(dialog: &PeerDialog, peer_addr: std::net::SocketAddr, digit: char) 
     )
 }
 
+/// The digest challenge the peer answers an INVITE with.
+///
+/// RFC 7616 §3.3: a realm, a nonce, the algorithm and the quality of
+/// protection. A PBX that challenges the INVITE has to be answered
+/// with the account's digest — a stack with no credential treats the
+/// challenge as the final response.
+const PEER_CHALLENGE: &str = concat!(
+    r#"Digest realm="asterisk", nonce="4b2c1f0e9a8d7c6b5a4938271605f4e3", "#,
+    r#"algorithm=MD5, qop="auth""#,
+);
+
+/// What the peer should do.
+#[derive(Debug, Clone, Copy, Default)]
+struct PeerOptions {
+    /// Call the client back as soon as it registers.
+    call_back: bool,
+    /// Send a DTMF digit once the call is up.
+    dtmf: Option<char>,
+    /// Answer the first INVITE with a 401 challenge.
+    challenge_invite: bool,
+}
+
 /// A registrar and call agent on one socket.
 ///
 /// It answers the REGISTER, and it can place a call back to whoever
 /// registered.
-async fn run_peer(
-    socket: UdpSocket,
-    observations: Arc<Mutex<Observations>>,
-    call_back: bool,
-    dtmf: Option<char>,
-) {
+async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, options: PeerOptions) {
     let peer_addr = socket.local_addr().expect("peer addr");
     let mut buf = vec![0u8; 65535];
     let mut client: Option<std::net::SocketAddr> = None;
@@ -278,7 +295,7 @@ async fn run_peer(
 
                 // The dialog is established on the peer's side now, so
                 // the DTMF can follow the ACK.
-                if let (Some(digit), Some(dialog)) = (dtmf, dialog.as_ref()) {
+                if let (Some(digit), Some(dialog)) = (options.dtmf, dialog.as_ref()) {
                     let info = dtmf_info(dialog, peer_addr, digit);
                     socket
                         .send_to(info.as_bytes(), from)
@@ -305,6 +322,22 @@ async fn run_peer(
                     .expect("REGISTER reply");
             }
             "INVITE" => {
+                // The challenge comes first, and only once: the client
+                // has to answer it with the account's digest.
+                if options.challenge_invite && header_value(&text, "Authorization").is_none() {
+                    let message = response(
+                        &text,
+                        "401 Unauthorized",
+                        &[("WWW-Authenticate", PEER_CHALLENGE)],
+                        "",
+                    );
+                    socket
+                        .send_to(message.as_bytes(), from)
+                        .await
+                        .expect("401 reply");
+                    continue;
+                }
+
                 // Ring first, then answer.
                 let ringing = response(&text, "180 Ringing", &[], "");
                 socket.send_to(ringing.as_bytes(), from).await.expect("180");
@@ -355,7 +388,7 @@ async fn run_peer(
                 .lock()
                 .expect("observations lock")
                 .saw_request("INVITE");
-            if method == "REGISTER" && call_back && !already_called {
+            if method == "REGISTER" && options.call_back && !already_called {
                 // The Via and the Contact both name the peer's real
                 // address: our responses to this INVITE go back to it.
                 //
@@ -464,8 +497,11 @@ async fn an_outgoing_call_connects_and_hangs_up() {
     tokio::spawn(run_peer(
         socket,
         observations.clone(),
-        /* call_back = */ false,
-        /* dtmf = */ None,
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+        },
     ));
 
     let handle = tokio::runtime::Handle::current();
@@ -547,8 +583,11 @@ async fn an_incoming_call_rings_before_the_user_answers() {
     tokio::spawn(run_peer(
         socket,
         observations.clone(),
-        /* call_back = */ true,
-        /* dtmf = */ None,
+        PeerOptions {
+            call_back: true,
+            dtmf: None,
+            challenge_invite: false,
+        },
     ));
 
     let handle = tokio::runtime::Handle::current();
@@ -644,8 +683,11 @@ async fn a_ringing_incoming_call_is_declined_when_it_is_hung_up() {
     tokio::spawn(run_peer(
         socket,
         observations.clone(),
-        /* call_back = */ true,
-        /* dtmf = */ None,
+        PeerOptions {
+            call_back: true,
+            dtmf: None,
+            challenge_invite: false,
+        },
     ));
 
     let handle = tokio::runtime::Handle::current();
@@ -702,8 +744,11 @@ async fn a_dtmf_digit_arrives_as_an_event() {
     tokio::spawn(run_peer(
         socket,
         observations.clone(),
-        /* call_back = */ true,
-        /* dtmf = */ Some('5'),
+        PeerOptions {
+            call_back: true,
+            dtmf: Some('5'),
+            challenge_invite: false,
+        },
     ));
 
     let handle = tokio::runtime::Handle::current();
@@ -749,8 +794,11 @@ async fn a_dtmf_digit_is_sent_as_an_info_request() {
     tokio::spawn(run_peer(
         socket,
         observations.clone(),
-        /* call_back = */ false,
-        /* dtmf = */ None,
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+        },
     ));
 
     let handle = tokio::runtime::Handle::current();
@@ -800,5 +848,169 @@ async fn a_dtmf_digit_is_sent_as_an_info_request() {
             .expect("observations lock")
             .saw_request("INFO"),
         "the peer never saw the INFO"
+    );
+}
+
+/// A call placed from a thread that is not inside the runtime.
+///
+/// The UI thread is the one that owns the window, and it is **not**
+/// inside the tokio runtime: `eframe` runs the app on the main thread
+/// while the SIP stack runs on a runtime of its own.
+///
+/// rsipstack drives the INVITE from a task it spawns with
+/// `tokio::spawn`, and `tokio::spawn` panics when the calling thread
+/// has no runtime. Placing a call therefore used to take the whole app
+/// down, before a single byte went out.
+///
+/// This test is deliberately **not** a `#[tokio::test]`: a tokio test
+/// runs inside the runtime, which is exactly the case that never
+/// crashed.
+#[test]
+fn a_call_placed_off_the_runtime_does_not_take_the_app_down() {
+    init_tracing();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let handle = runtime.handle().clone();
+
+    let socket =
+        runtime.block_on(async { UdpSocket::bind("127.0.0.1:0").await.expect("peer socket") });
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    runtime.spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+        },
+    ));
+
+    let mut stack = stack(handle.clone());
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-ui-thread".to_string();
+    stack.registrations.start(&account, 0);
+
+    // The registration has to land before a call can go out.
+    runtime.block_on(async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    });
+
+    // The UI thread: no runtime context. The old code panicked right
+    // here, and the panic took the window down with it.
+    assert!(
+        tokio::runtime::Handle::try_current().is_err(),
+        "the test has to run off the runtime, or it proves nothing"
+    );
+    stack
+        .calls
+        .place_call(&account.id, "100")
+        .expect("the call was placed");
+
+    // And the call really connects.
+    let mut seen = Vec::new();
+    let answered = runtime.block_on(async {
+        wait_for(
+            &mut seen,
+            &mut stack.calls,
+            CallEventType::CallAnswered,
+            Duration::from_secs(5),
+        )
+        .await
+    });
+    assert!(answered.is_some(), "the call was never answered");
+
+    assert!(
+        observations
+            .lock()
+            .expect("observations lock")
+            .saw_request("INVITE"),
+        "the peer never saw the INVITE"
+    );
+}
+
+/// A challenged INVITE is answered with the account's digest.
+///
+/// A PBX that challenges the INVITE with 401 or 407 has to be
+/// answered with the credential of §5.8. A stack that has no
+/// credential treats the challenge as the final response, and the call
+/// dies before it ever rings.
+#[tokio::test]
+async fn a_challenged_invite_is_answered_with_the_account_digest() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: true,
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-loopback-auth".to_string();
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut seen = Vec::new();
+    stack
+        .calls
+        .place_call(&account.id, "100")
+        .expect("the call was placed");
+
+    let answered = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallAnswered,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(answered.is_some(), "the call was never answered");
+
+    // The peer got the INVITE twice: once bare, once with the digest.
+    let observations = observations.lock().expect("observations lock");
+    let invites: Vec<&String> = observations
+        .raw
+        .iter()
+        .filter(|message| message.starts_with("INVITE "))
+        .collect();
+    assert!(
+        invites
+            .iter()
+            .any(|message| !message.contains("Authorization")),
+        "the peer never saw the bare INVITE it had to challenge"
+    );
+
+    let authorised = invites
+        .iter()
+        .find(|message| message.contains("Authorization:"))
+        .expect("the INVITE was never retried with the digest");
+    let value = header_value(authorised, "Authorization").expect("the authorization header");
+
+    // The digest is a real digest: the peer can verify it with the
+    // account's password, which is the whole point of the challenge.
+    let parsed = rsipstack::sip::headers::typed::Authorization::parse(&value)
+        .expect("the authorization header parses");
+    assert_eq!(parsed.username, "104");
+    assert_eq!(parsed.realm, "asterisk");
+    assert!(
+        rsipstack::dialog::authenticate::verify_digest(
+            &parsed,
+            "secret",
+            &rsipstack::sip::Method::Invite,
+            &value,
+        ),
+        "the digest does not verify against the account's password"
     );
 }
