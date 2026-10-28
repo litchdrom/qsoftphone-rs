@@ -520,6 +520,28 @@ async fn an_outgoing_call_connects_and_hangs_up() {
         .place_call(&account.id, "100")
         .expect("the call was placed");
 
+    // The event carries the callee's **URI**, the way the C++'s
+    // `CallEvent` does — the history row keeps the URI and derives
+    // the number from it (§5.3).
+    let initiated = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::OutgoingCallInitiated,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the outgoing call was never reported");
+    assert!(
+        initiated.callee.starts_with("sip:"),
+        "the callee is not a URI: {}",
+        initiated.callee
+    );
+    assert!(
+        initiated.callee.contains("100"),
+        "the callee is not the number that was dialled: {}",
+        initiated.callee
+    );
+
     // The peer's 180 Ringing is reported as an event of its own.
     let ringing = wait_for(
         &mut seen,
@@ -616,6 +638,24 @@ async fn an_incoming_call_rings_before_the_user_answers() {
         incoming.call_id.starts_with("peer-incoming-call@"),
         "unexpected call id {}",
         incoming.call_id
+    );
+    // The event carries the peer's **URI**, the way the C++'s
+    // `CallEvent` does — the history row keeps the URI and derives
+    // the number from it (§5.3).
+    assert!(
+        incoming.caller.starts_with("sip:"),
+        "the caller is not a URI: {}",
+        incoming.caller
+    );
+    assert!(
+        incoming.caller.contains("peer"),
+        "the caller is not the peer's URI: {}",
+        incoming.caller
+    );
+    assert!(
+        incoming.callee.starts_with("sip:"),
+        "the callee is not a URI: {}",
+        incoming.callee
     );
 
     // §5.4: the 180 Ringing went out before the user answered. The

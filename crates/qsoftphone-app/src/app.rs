@@ -1330,11 +1330,16 @@ mod tests {
     use super::*;
     use qsoftphone_core::model::call_event::CallEvent;
     use qsoftphone_core::storage::Db;
+    use qsoftphone_core::storage::history::HistoryStore;
 
     /// An app with one account, and the bus its call events arrive on.
     fn build_app(handle: tokio::runtime::Handle) -> (QSoftphoneApp, CallBus) {
+        build_app_with(Db::open_in_memory().expect("db"), handle)
+    }
+
+    /// An app with one account, over a given database.
+    fn build_app_with(db: Db, handle: tokio::runtime::Handle) -> (QSoftphoneApp, CallBus) {
         let paths = AppPaths::under(std::env::temp_dir().join("qsoftphone-app-ui-test"));
-        let db = Db::open_in_memory().expect("db");
         let sessions = SessionRegistry::new();
         let (bus, receiver) = CallBus::new();
 
@@ -1694,6 +1699,35 @@ mod tests {
         app.view = View::History;
         let output = frame(&mut app, &ctx);
         assert!(!output.shapes.is_empty(), "the frame drew nothing");
+    }
+
+    #[tokio::test]
+    async fn the_history_loads_the_rows_that_were_already_there() {
+        // The window opens on a database that already has calls in it
+        // — from yesterday, or from before the app was closed.
+        let db = Db::open_in_memory().expect("db");
+        let store = HistoryStore::new(&db);
+        store
+            .record(&CallRecord::from_outgoing(
+                "acct-ui-1",
+                "call-old",
+                "sip:6666@sip.example.com",
+                "Alice",
+                1_000,
+                61_000,
+                200,
+                "Normal",
+                true,
+            ))
+            .expect("the row was stored");
+
+        let (mut app, _bus) = build_app_with(db, tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        wait_for_history(&mut app, &ctx, 1).await;
+
+        assert_eq!(app.history_rows.len(), 1, "the old call is not there");
+        assert_eq!(app.history_rows[0].remote_number, "6666");
+        assert_eq!(app.history_rows[0].remote_name, "Alice");
     }
 
     #[tokio::test]
