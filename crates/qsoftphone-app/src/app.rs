@@ -22,6 +22,7 @@ use qsoftphone_core::model::history::{
 use qsoftphone_core::paths::AppPaths;
 use qsoftphone_core::sip::uri::sip_uri_user_part;
 use qsoftphone_core::storage::{AccountStore, Db};
+use qsoftphone_media::Codec;
 use qsoftphone_sip::{
     CallBus, CallManager, RegistrationManager, RegistrationState, SessionRegistry,
 };
@@ -225,13 +226,18 @@ impl QSoftphoneApp {
         // runtime (§6).
         let db = Arc::new(db);
         let history = HistoryService::new(runtime.clone(), db.clone());
+        let mut calls =
+            CallManager::new(runtime.clone(), sessions.clone(), bus.clone(), call_events);
+        // The media settings are shared with the registrar: the codec
+        // the user picks has to reach the offer that is built.
+        calls.set_media_config(media_config_of(&config));
         let mut app = Self {
             paths,
             db,
             config,
             _runtime: runtime.clone(),
             registrations: RegistrationManager::new(runtime.clone(), sessions.clone(), bus.clone()),
-            calls: CallManager::new(runtime, sessions, bus, call_events),
+            calls,
             history,
             history_rows: Vec::new(),
             history_query: String::new(),
@@ -599,6 +605,47 @@ impl QSoftphoneApp {
         }
     }
 
+    /// Mute or unmute the microphone of a call.
+    fn set_mic_muted(&mut self, call: &CallView, muted: bool) {
+        if let Err(e) = self
+            .calls
+            .set_mic_muted(&call.account_id, &call.call_id, muted)
+        {
+            self.status = format!("Could not change the microphone: {e}");
+        }
+    }
+
+    /// Mute or unmute the speaker of a call.
+    fn set_speaker_muted(&mut self, call: &CallView, muted: bool) {
+        if let Err(e) = self
+            .calls
+            .set_speaker_muted(&call.account_id, &call.call_id, muted)
+        {
+            self.status = format!("Could not change the speaker: {e}");
+        }
+    }
+
+    /// The codec the next call offers.
+    ///
+    /// The C++ let the user pick a codec, and the pick was kept in
+    /// the settings file. It is kept here too: the codec is a
+    /// property of the softphone, not of one account.
+    fn set_codec(&mut self, codec: &str) {
+        let mut codecs = self.config.media.codecs.clone();
+        codecs.retain(|c| c != codec);
+        codecs.insert(0, codec.to_string());
+        self.config.media.codecs = codecs;
+
+        // The registrar and the call layer share the settings, so the
+        // pick has to be pushed into both.
+        let media = media_config_of(&self.config);
+        self.calls.set_media_config(media);
+
+        if let Err(e) = self.config.save(&self.paths.config_file()) {
+            tracing::warn!(error = %e, "could not persist the codec choice");
+        }
+    }
+
     /// Remember the selected account in the settings file.
     fn persist_active_account(&mut self) {
         let id = self
@@ -912,6 +959,31 @@ impl QSoftphoneApp {
             ui.weak("Register the account before it can call.");
         }
 
+        // The codec the next call offers. The C++ had this in the
+        // settings; it is here because it is a property of the next
+        // call, and the call page is where the call is made from.
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Codec").strong().size(11.0));
+            let current = self
+                .config
+                .media
+                .codecs
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "PCMU".to_string());
+            egui::ComboBox::from_id_salt("codec")
+                .selected_text(current.clone())
+                .width(90.0)
+                .show_ui(ui, |ui| {
+                    for codec in ["PCMU", "PCMA"] {
+                        if ui.selectable_label(current == codec, codec).clicked() {
+                            self.set_codec(codec);
+                        }
+                    }
+                });
+            ui.weak("the codec the next call offers");
+        });
+
         ui.add_space(6.0);
         ui.label(egui::RichText::new("CALLS").strong().size(11.0));
         ui.separator();
@@ -966,16 +1038,37 @@ impl QSoftphoneApp {
         // The keypad belongs to the call the user is looking at, and
         // only while it is up.
         if active && call.state == "connected" {
-            // Say plainly that the call is signalling only. The SDP
-            // names a placeholder port, because the RTP stack is M4 —
-            // a call that is "connected" here is connected in SIP, not
-            // in audio, and saying so saves the user from looking for
-            // a sound card that was never opened.
+            // What the media is doing. The call is connected in SIP;
+            // whether it carries a voice is a separate question, and
+            // the answer belongs on the screen.
+            let status = self.calls.media_status(&call.account_id, &call.call_id);
+            let (summary, mic_muted, speaker_muted) = match &status {
+                Some(status) => (status.summary(), status.mic_muted, status.speaker_muted),
+                None => ("Media: not negotiated.".to_string(), false, false),
+            };
             ui.label(
-                egui::RichText::new("Media: not connected — the RTP stack lands in M4.")
+                egui::RichText::new(summary)
                     .small()
                     .color(egui::Color32::GRAY),
             );
+
+            // The mute buttons. A muted microphone still sends RTP —
+            // it sends silence — because the peer has to see the
+            // stream keep going or it tears the call down.
+            ui.horizontal(|ui| {
+                let mic = if mic_muted { "Unmute mic" } else { "Mute mic" };
+                if ui.button(mic).clicked() {
+                    self.set_mic_muted(&call, !mic_muted);
+                }
+                let speaker = if speaker_muted {
+                    "Unmute speaker"
+                } else {
+                    "Mute speaker"
+                };
+                if ui.button(speaker).clicked() {
+                    self.set_speaker_muted(&call, !speaker_muted);
+                }
+            });
 
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("DTMF").strong().size(11.0));
@@ -1325,6 +1418,36 @@ impl eframe::App for QSoftphoneApp {
     }
 }
 
+/// The media settings, read out of the settings file.
+///
+/// The settings file keeps the codecs as names — it is a plain JSON
+/// document the user may edit by hand — and the media plane wants
+/// them as its own type.
+fn media_config_of(config: &AppConfig) -> qsoftphone_media::MediaConfig {
+    let codecs: Vec<Codec> = config
+        .media
+        .codecs
+        .iter()
+        .filter_map(|name| Codec::from_name(name))
+        .collect();
+
+    // An empty or unusable list is not a reason to have no codec: the
+    // defaults speak both.
+    let codecs = if codecs.is_empty() {
+        Codec::ALL.to_vec()
+    } else {
+        codecs
+    };
+
+    qsoftphone_media::MediaConfig {
+        codecs,
+        microphone: Some(config.media.microphone.clone()).filter(|n| !n.trim().is_empty()),
+        speaker: Some(config.media.speaker.clone()).filter(|n| !n.trim().is_empty()),
+        microphone_gain: config.audio.microphone_volume,
+        speaker_gain: config.audio.speaker_volume,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1380,20 +1503,27 @@ mod tests {
     }
 
     /// Run one frame of the UI, headlessly.
+    ///
+    /// The window is given a size: without one, egui lays the
+    /// central panel out with no height at all, and everything below
+    /// the first row is culled.
     fn frame(app: &mut QSoftphoneApp, ctx: &egui::Context) -> egui::FullOutput {
-        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
-        // The font atlas the frame produced is of no use here, and
-        // epaint panics when an unapplied delta is dropped.
-        output.textures_delta.clear();
-        output
+        frame_with(app, ctx, egui::RawInput::default())
     }
 
     /// Run one frame of the UI with a given input.
     fn frame_with(
         app: &mut QSoftphoneApp,
         ctx: &egui::Context,
-        input: egui::RawInput,
+        mut input: egui::RawInput,
     ) -> egui::FullOutput {
+        // The window is the size the app opens at: without a screen
+        // rect, egui lays the central panel out with no height at
+        // all, and everything below the first row is culled.
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1100.0, 700.0),
+        ));
         let mut output = ctx.run_ui(input, |ui| app.draw(ui));
         output.textures_delta.clear();
         output
@@ -1755,5 +1885,93 @@ mod tests {
         // The account is not registered, so the call cannot be placed
         // — but the target is the dialled number, not the PBX.
         assert_eq!(app.dial_number, "6666");
+    }
+
+    /// The text on the screen.
+    ///
+    /// The shapes carry the text that was laid out, so this is what
+    /// the user can read.
+    fn screen_text(output: &egui::FullOutput) -> String {
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            if let egui::epaint::Shape::Text(text_shape) = &clipped.shape {
+                text.push_str(&text_shape.galley.job.text);
+                text.push('\n');
+            }
+        }
+        text
+    }
+
+    #[tokio::test]
+    async fn the_call_page_offers_the_codecs() {
+        // M4: the codec the next call offers is picked on the call
+        // page, the way the C++ had it in the settings.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(text.contains("Codec"), "no codec picker:\n{text}");
+        // The picker shows the codec that is selected. The other one
+        // is in the drop-down, which is only drawn when it is open.
+        assert!(text.contains("PCMU"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn the_whole_call_page_fits_the_window() {
+        // The dialer, the codec picker and the calls list all have to
+        // be on the screen at the size the app opens at. A row that
+        // is culled is a button the user cannot press.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+
+        assert!(text.contains("Number"), "the dialer is cut off:\n{text}");
+        assert!(text.contains("Call"), "the call button is cut off:\n{text}");
+        assert!(
+            text.contains("Codec"),
+            "the codec picker is cut off:\n{text}"
+        );
+        assert!(text.contains("CALLS"), "the call list is cut off:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn the_codec_choice_moves_to_the_front_and_is_kept() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        assert_eq!(app.config.media.codecs, vec!["PCMU", "PCMA"]);
+
+        app.set_codec("PCMA");
+
+        // The one the user picked is the one the offer asks for.
+        assert_eq!(app.config.media.codecs, vec!["PCMA", "PCMU"]);
+        // And the call layer was told, because the registrar and the
+        // call layer share the settings.
+        let media = app.calls.media_config();
+        assert_eq!(media.codecs, vec![Codec::Pcma, Codec::Pcmu]);
+    }
+
+    #[tokio::test]
+    async fn a_connected_call_says_what_the_media_is_doing() {
+        // M4: the call page says what the media is doing, and offers
+        // the two mute buttons.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        let mut event = CallEvent::new(CallEventType::CallAnswered);
+        event.user = "104".to_string();
+        event.call_id = "call-media".to_string();
+        event.call_direction = Some(Direction::Outgoing);
+        event.call_state = "connected".to_string();
+        event.callee = "sip:6666@sip.example.com".to_string();
+        bus.publish("acct-ui-1", event);
+        frame(&mut app, &ctx);
+
+        app.active_call_id = Some("call-media".to_string());
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+
+        assert!(text.contains("Media:"), "no media line:\n{text}");
+        assert!(text.contains("Mute mic"), "no microphone button:\n{text}");
+        assert!(text.contains("Mute speaker"), "no speaker button:\n{text}");
     }
 }

@@ -21,6 +21,7 @@ pub struct AppConfig {
     pub version: u32,
     pub logging: LoggingConfig,
     pub audio: AudioConfig,
+    pub media: MediaConfig,
     pub network: NetworkConfig,
     pub ui: UiConfig,
     /// The account the UI should select at startup.
@@ -33,6 +34,7 @@ impl Default for AppConfig {
             version: 1,
             logging: LoggingConfig::default(),
             audio: AudioConfig::default(),
+            media: MediaConfig::default(),
             network: NetworkConfig::default(),
             ui: UiConfig::default(),
             active_account_id: None,
@@ -74,6 +76,36 @@ impl Default for AudioConfig {
             ringtone_volume: 0.9,
             ringback_volume: 0.7,
             ringtone_file: String::new(),
+        }
+    }
+}
+
+/// The media settings.
+///
+/// The C++ kept the codec priorities in the `media` section of the
+/// config file, under `audio`. They are global there, and they are
+/// global here: the codecs are what the *softphone* speaks, not what
+/// one account speaks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MediaConfig {
+    /// The codecs to offer, in preference order — `PCMU`, `PCMA`.
+    ///
+    /// The first one is the one the peer is asked for; the peer may
+    /// answer with another one of these, and then that one is used.
+    pub codecs: Vec<String>,
+    /// The microphone to use. Empty = the system default.
+    pub microphone: String,
+    /// The speaker to use. Empty = the system default.
+    pub speaker: String,
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        Self {
+            codecs: vec!["PCMU".to_string(), "PCMA".to_string()],
+            microphone: String::new(),
+            speaker: String::new(),
         }
     }
 }

@@ -9,6 +9,7 @@ description = "The SIP layer for qsoftphone-rs: transport, registration and RFC 
 
 [dependencies]
 qsoftphone-core.workspace = true
+qsoftphone-media.workspace = true
 rsipstack.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 qsoftphone-core.workspace = true
+qsoftphone-media.workspace = true
 qsoftphone-sip.workspace = true
 
 serde.workspace = true

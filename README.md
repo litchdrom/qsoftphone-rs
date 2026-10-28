@@ -57,6 +57,11 @@ qsoftphone-rs/
     │   ├── paths.rs               per-OS config / data / log dirs
     │   ├── sip/                   pure SIP functions (uri, identity, refer)
     │   └── storage/               SQLite: accounts, contacts, history
+    ├── qsoftphone-media/          the media plane: RTP, G.711, the sound card
+    │   ├── audio.rs               the microphone, the speaker, the resampling
+    │   ├── codec.rs               G.711, computed rather than tabulated
+    │   ├── lib.rs                 the session: socket, negotiation, threads
+    │   └── rtp.rs                 the UDP socket and the packets on it
     ├── qsoftphone-sip/            the SIP layer: transport, registration, calls
     │   ├── call.rs                placing, answering and ending calls
     │   ├── digest.rs              RFC 7616 interop with rsipstack
@@ -137,6 +142,13 @@ time of a call, and the C++ shows local time, so the `time` crate's
 only, because that is where the local offset can change under a running
 program. The Windows tree is **unchanged**: 304 package names before,
 304 after. `time-macros` was already in the tree.
+
+**M4 added no third-party package at all.** The Windows tree went from
+304 package names to 305 and the Linux tree from 384 to 385, and the
+one package in each is `qsoftphone-media` — this workspace's own crate.
+The third-party count is 301 on Windows and 381 on Linux, unchanged.
+`bytes` is named directly by the media crate, but `rtc-rtp` already
+depended on it.
 
 **What was trimmed.** `rsipstack` is built with `default-features = false`
 and only `platform-tokio`, `std` and `rustls` enabled:
@@ -569,6 +581,9 @@ The call panel says so too, under the call that is up — "Media: not
 connected — the RTP stack lands in M4" — so that a connected call is
 not mistaken for a call with audio.
 
+*(M4 replaced all of it: the port is bound, the RTP runs, and the UI
+says what the media is doing.)*
+
 ### DTMF is RFC 4733 over `INFO`
 
 RFC 2833 puts the digits in the RTP stream, which needs the media
@@ -741,6 +756,161 @@ two paths for when there is.
 
 ---
 
+## M4 — Media
+
+### What happens
+
+A call now carries a voice.
+
+**Outgoing.** The media session binds a UDP port *before* the INVITE is
+built, and the SDP names that port. The peer's `200 OK` carries its own
+answer; the codec it chose and the address its RTP comes from are read
+out of it. When the call is confirmed the microphone opens and the RTP
+starts.
+
+**Incoming.** The `200 OK` answers the peer's offer: the same codec the
+offer listed, on the peer's own payload type, on our bound port. The
+peer's RTP address comes from its offer. When the call is confirmed the
+microphone opens and the RTP starts.
+
+**Muting** either side does not stop the RTP. A muted microphone sends
+the codec's silence code, so the RTP clock keeps moving and the peer
+does not decide the stream has died and hang up. A muted speaker drops
+what arrives, locally.
+
+### The crate
+
+`qsoftphone-media` is new, and it is the only crate that touches a
+sound card.
+
+```text
+crates/qsoftphone-media/
+├── codec.rs       G.711 µ-law and A-law, computed rather than tabulated
+├── rtp.rs         the UDP socket and the RTP packets on it
+├── audio.rs       the microphone, the speaker, and the resampling
+└── lib.rs         the session: the socket, the negotiation, the threads
+```
+
+### `rtc` is used for the packets, not for the whole stack
+
+The brief pins `rtc` — "Sans-I/O WebRTC: RTP packets, codecs, SRTP. We
+supply the transport." That is exactly how it is used here:
+`rtc::rtp` supplies the packet format, the sequence numbers, the
+timestamp and the G.711 payloader, and this crate supplies the UDP
+socket.
+
+The rest of `rtc` — ICE, DTLS, SRTP, SCTP — is **not** used. A SIP
+phone has no use for a data channel, and its media is plain RTP: the
+signalling already agreed the address and the codec. `rtc-sdp` is not
+used either: the SDP that a SIP phone exchanges is not the SDP that
+WebRTC exchanges, and the `rtc-sdp` model is built around ICE
+candidates, DTLS fingerprints and media midpoints, none of which
+belong in an offer to a PBX. The SDP stays in `qsoftphone-sip::sdp`,
+where it already was, and it grew a parser for the peer's answer.
+
+### G.711 is computed, not tabulated
+
+The classic G.711 implementations carry two 256-entry lookup tables per
+variant. They are generated here from the algorithm instead, which is
+fewer lines and — more importantly — cannot disagree with the decoder.
+
+The tests are exact, not approximate: **every one of the 256 µ-law bytes
+and every one of the 256 A-law bytes survives a round trip** through
+the encoder and the decoder, and the decoded curve is monotonic. (One
+µ-law code is the exception: `0x7F` is the other spelling of zero, and
+the encoder always writes `0xFF` for zero.)
+
+### The sound card does not run at 8 kHz
+
+G.711 is 8 kHz, always. A sound card is 44.1 or 48 kHz, almost always,
+and it will not open at 8 kHz. So the audio is converted twice on every
+call: 48 kHz down to 8 kHz on the way in, and 8 kHz up to 48 kHz on the
+way out.
+
+The down direction gets a crude low-pass for free: when the ratio is a
+whole number — 48 kHz to 8 kHz is six to one — the samples of each
+group are **averaged** rather than picked, which keeps the aliasing out
+of the voice band. The up direction is a linear interpolation, because
+there is nothing to alias.
+
+The state carries across buffers, so a stream that arrives in pieces
+comes out the same as one that did not. There is a test for exactly
+that.
+
+### The mute keeps the clock running
+
+A muted microphone still sends RTP. It sends the codec's silence code —
+`0xFF` in µ-law, `0xD5` in A-law — so the sequence numbers and the
+timestamps keep advancing.
+
+This is not a nicety. A peer that stops seeing RTP tears the call
+down, and the symptom is a call that dies a second after the user
+hits the mute button. The loopback test proves the clock keeps moving:
+five muted frames arrive as five frames.
+
+### The codec is picked, and it is remembered
+
+The codec the next call offers is a **combo box on the call page**, and
+it is kept in the settings file — the `media` section, where the C++
+kept the codec priorities. The C++ let the user set a priority per
+codec and used the order; here the order is the list, and the first
+entry is the one the offer asks for.
+
+The peer has the last word: if it answers with another codec this build
+speaks, that one is used, on the peer's own payload type.
+
+### Two bugs the loopback test found
+
+Both of these are the sort of thing that passes a unit test and fails
+on the wire, and both were found by the end-to-end test rather than by
+reading the code.
+
+**The inbound queue was bounded in the wrong unit.** The bound was
+written as "a hundred frames" and applied as "a hundred samples". A
+160-byte frame was truncated to 100 bytes on arrival, and the peer heard
+a clipped syllable. The bound is now in samples, and it is
+`100 * 160` of them.
+
+**The sending thread could not be stopped.** The sender waits on a
+condition variable for a frame to send, and the wait was written to
+loop until a frame arrived — the timeout was read and thrown away. The
+thread therefore slept in the condvar forever, and `stop()` — which
+joins it — hung with it. The hang showed up as a test binary that never
+exited, which is a much better symptom than a call that never ends.
+
+### The dependency cost: nothing
+
+**M4 added no third-party package at all.** The Windows tree went from
+304 package names to 305, and the Linux tree from 384 to 385, and the
+one package in each is `qsoftphone-media` — this workspace's own
+crate. The third-party count is 301 on Windows and 381 on Linux, the
+same as after M3.
+
+`bytes` is named directly by the media crate, because `rtc-rtp` packs
+the RTP payload into it — but it was already in the tree, so naming it
+costs nothing.
+
+### What is *not* in M4
+
+* **No NAT traversal on the media plane.** The signalling side already
+  learned the public address from the registrar's `received`/`rport`
+  echo, and the SDP advertises the public address. The RTP side does
+  **not** yet: the port the SDP names is the local one, and a NAT that
+  rewrites it will break the call. Symmetric RTP — sending from the
+  port the peer's RTP arrived on — is not implemented either. `rtc` does
+  ship ICE and STUN, and this is where they would be used.
+* **No SRTP.** The RTP is in the clear, as SIP media normally is.
+* **No RFC 2833.** The digits still travel as RFC 4733 over `INFO`.
+  The offer deliberately does not list `telephone-event`.
+* **No ringtone.** The C++ plays a WAV when a call comes in; this build
+  does not yet.
+* **No device picker.** The microphone and the speaker are the system
+  defaults. The settings have the fields for them (`media.microphone`,
+  `media.speaker`) and the media crate reads them, but the UI to pick
+  them is M6.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -769,7 +939,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M1** | Registration: rsipstack transport, digest auth (MD5 + SHA-256), register/unregister, registration state surfaced to the UI | **done** |
 | **M2** | Calling: outbound INVITE, inbound INVITE with automatic 180 Ringing (§5.4), answer, decline, hang up without a forced code (§5.5), DTMF | **done** |
 | **M3** | History: SQLite persistence with the §5.3 semantics, redial using the resolved dialled number (§5.1), searchable list in the UI | **done** |
-| M4 | Media: `rtc` RTP + `cpal` audio — SDP negotiation, send/receive audio, mute, codec selection | next |
+| M4 | Media: `rtc` RTP + `cpal` audio — SDP negotiation, send/receive audio, mute, codec selection | **done** |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
@@ -782,20 +952,25 @@ none of them is lost and none of them disturbs the order above.
 
 | Item | Lands in | Notes |
 |---|---|---|
-| **Codec selection per account** | M4 | M4 already has "codec selection". What is missing is that it is **per account**: one account may only speak PCMU, another only PCMA. `AccountProfile` has no codec field yet, and the account editor has no control for one. |
-| **Media device selection, in the main settings** | M4, the page in M6 | The device list comes from `cpal`, so it cannot exist before the media plane. It is an **app-level** setting, not a per-account one — one microphone and one speaker for the whole window — so it belongs in `AppConfig`'s `AudioConfig`, which already holds the volumes and the ringtone. The picker itself is M4 (it has to open the streams); the settings page it lives on is M6, which has to build that page anyway. |
+| **Codec selection per account** | M6 | M4 has codec selection, and it is **app-level**: the combo box on the call page picks the codec the next call offers, and the choice is kept in the settings file. What is missing is that it should be **per account** — one account may only speak PCMU, another only PCMA. `AccountProfile` has no codec field yet, and the account editor has no control for one. |
+| **Media device selection, in the main settings** | M6 | The device list comes from `cpal`, and M4 opens the streams, so the list *can* be built now. What is missing is the **picker** and the settings page it lives on. It is an **app-level** setting, not a per-account one — one microphone and one speaker for the whole window. The fields are already there (`media.microphone`, `media.speaker`) and the media crate reads them, so picking a device is a matter of writing the name into the settings file. The page itself is M6, which has to build that page anyway. |
 | **Expandable history, with the call time and the SIP code** | **done in M3** | The **data** was already there: the `calls` table has `duration_sec`, `sip_code` and `hangup_cause`. The UI was the missing part, and M3 has it: the history page's row shows the number, the duration, the time and the SIP status code, and expands to the full URI, the cause and the exact timestamps. |
-| **NAT traversal for the media plane** | M4 | The signalling side already does what it can: the public `Contact` is learned from the `received`/`rport` the registrar echoes (RFC 3581), the binding is refreshed before it expires, and Asterisk's OPTIONS keepalive is answered. The **RTP** side has nothing yet. At the very least the SDP has to carry the NAT-mapped port and the stack has to accept the symmetric RTP a NAT sends back from a different source port; beyond that, `rtc` 0.21.1 already ships `ice`, `stun` and `turn` as unconditional dependencies, so full ICE with host/srflx/relay candidates is available without adding a crate. |
-| **Configurable, playable ring tone for incoming calls, in the main settings** | M6 | The config keys are already there: `audio.ringtone_file` (empty = the bundled default) and `audio.ringtone_volume`. What is missing is the **player** — nothing opens a sound card yet — and the **Settings → Audio** page: a file picker, a volume slider and a preview. The C++ reference is `RingtonePlayer`. |
-| **A generated ring tone when a call is ringing and there is no media** | M4 | A **synthesised** tone, not a file: it starts on 180 Ringing when there is no RTP to carry audio, so an incoming call still rings audibly before the media plane exists. It needs a sound card, not RTP — the one item on this list that could be pulled forward. |
+| **NAT traversal for the media plane** | M5 | The signalling side already does what it can: the public `Contact` is learned from the `received`/`rport` the registrar echoes (RFC 3581), the binding is refreshed before it expires, and Asterisk's OPTIONS keepalive is answered. M4 bound a **real** port and the SDP names it — but it is the **local** port, and a NAT that rewrites it will break the call. At the very least the SDP has to carry the NAT-mapped port and the stack has to accept the symmetric RTP a NAT sends back from a different source port; beyond that, `rtc` 0.21.1 already ships `ice`, `stun` and `turn` as unconditional dependencies, so full ICE with host/srflx/relay candidates is available without adding a crate. |
+| **Configurable, playable ring tone for incoming calls, in the main settings** | M6 | The config keys are already there: `audio.ringtone_file` (empty = the bundled default) and `audio.ringtone_volume`. What is missing is the **player** — and the **Settings → Audio** page: a file picker, a volume slider and a preview. The C++ reference is `RingtonePlayer`. M4 opened a sound card, so the player is now possible. |
+| **A generated ring tone when a call is ringing and there is no media** | M5 | A **synthesised** tone, not a file: it starts on 180 Ringing when there is no RTP to carry audio, so an incoming call still rings audibly. It needs a sound card, not RTP — and M4 opened one, so the player is now possible. |
 
-**Why NAT traversal is on this list and not in M2.** The SDP names
-port 4000, and nothing binds it. Against the real Asterisk the call
+**Why NAT traversal is on this list and not in M2.** In M2 the SDP named
+port 4000, and nothing bound it. Against the real Asterisk the call
 comes up — `200 OK` with an SDP, then the ACK — and the PBX starts
 sending RTP (G.711 A-law) at that port immediately, because our offer
 lists PCMU and PCMA and Asterisk picked A-law. The audio has nowhere
-to land. That is the whole of the remaining media gap, and it is M4's
-job, not a NAT problem in the signalling.
+to land. That was the whole of the remaining media gap, and it was
+M4's job, not a NAT problem in the signalling.
+
+M4 bound a real port and the RTP now has somewhere to land. What is
+left is the NAT: the port the SDP names is the local one, and a router
+that rewrites it will still break the call. That is the next thing to
+try against a real PBX from behind a router.
 
 **The two ring tones are not the same thing, and the C++ has both.**
 `RingtonePlayer` — the **inbound** one — plays a **WAV file**:
@@ -825,7 +1000,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 173 tests, all passing.
+* `cargo test --workspace` — 232 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -913,6 +1088,30 @@ player lands.
 * **A database written by the old schema still takes the account's
   UUID.** There are databases on disk with `account_id INTEGER`; the
   test opens one, writes a row and reads it back.
+* **Audio goes from one session to another over a real UDP socket.** Two
+  media sessions, each with a bound port, each pointed at the other: a
+  G.711 frame queued on one comes out of the other's inbound queue,
+  decoded, and within the quantisation error of G.711.
+* **Every G.711 byte survives a round trip.** All 256 µ-law codes and
+  all 256 A-law codes, through the encoder and the decoder, exactly.
+* **A muted microphone still sends, and the peer hears silence.** The
+  RTP clock keeps moving: five muted frames arrive as five frames.
+* **The SDP names a port that is bound.** The media session's port is
+  the one in the offer, and the two sessions in the loopback test are
+  on different ports.
+* **The peer's answer is read correctly.** The codec it chose, the
+  payload type it put that codec on (including a dynamic one), the
+  address and the port it listens on.
+* **The media session can be stopped.** The test stops it and checks
+  that nothing more arrives — and that the process still exits, which
+  is how the sending thread's condvar bug was found.
+* **The whole call page fits the window.** The headless frame is
+  given the size the app opens at, and the test checks that the
+  dialer, the call button, the codec picker and the call list are all
+  on the screen. A row that is culled is a button the user cannot
+  press — and the earlier headless tests never saw the page at all,
+  because without a screen rect egui lays the central panel out with
+  no height and drops everything below the first row.
 
 **Verified against a real Asterisk:**
 
@@ -939,8 +1138,15 @@ player lands.
   Asterisk run above ended in a `404`. The SIP messages on the wire are
   the real ones, but no call has yet been *answered* by a peer this
   repository did not write.
-* **No audio.** The SDP is a placeholder and no RTP has been sent. That
-  is M4.
+* **No audio has been heard by a human.** The RTP path is proved
+  end to end between two sessions in this repository, and the G.711
+  codec is proved against its own tables — but no call has yet been
+  made to Asterisk and listened to. The desktop was locked for most of
+  the M4 build, so the sound card could not be exercised by a person.
+* **The media has not been tested against a NAT.** The SDP advertises
+  the public address, but the RTP port is the local one, and a NAT
+  that rewrites it will break the call. This is the first thing to
+  check when the app is run against a real PBX from behind a router.
 * The GUI has been started and its window photographed, so the layout
   is as it is shown above. It has not been reviewed by a human at
   normal resolution — this machine's desktop was locked for most of

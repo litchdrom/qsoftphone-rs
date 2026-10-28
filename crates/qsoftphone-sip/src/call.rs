@@ -37,6 +37,7 @@ use qsoftphone_core::model::account::Account;
 use qsoftphone_core::model::call_event::{CallEvent, CallEventType, Direction};
 use qsoftphone_core::sip::identity;
 use qsoftphone_core::sip::uri::normalise_sip_target;
+use qsoftphone_media::{MediaConfig, MediaSession, MediaStatus};
 
 use crate::endpoint::split_host_port;
 use crate::sdp;
@@ -141,6 +142,24 @@ impl CallManager {
         }
     }
 
+    /// Set what the media of a call should be.
+    ///
+    /// The codecs are the ones the offer names, in the order they are
+    /// preferred; the first one this build speaks is the one the peer
+    /// is asked for. The devices are named by their system name, and
+    /// an empty name means the system default.
+    ///
+    /// The settings are shared with the registrar, so a codec the user
+    /// picks reaches the offer that the registrar's side builds.
+    pub fn set_media_config(&mut self, config: MediaConfig) {
+        self.sessions.set_media_config(config);
+    }
+
+    /// What the media of a call should be.
+    pub fn media_config(&self) -> MediaConfig {
+        self.sessions.media_config()
+    }
+
     /// The session registry, for the registrar to publish into.
     pub fn sessions(&self) -> SessionRegistry {
         self.sessions.clone()
@@ -188,6 +207,11 @@ impl CallManager {
 
         let (state_sender, state_receiver) = session.dialog_layer.new_dialog_state_channel();
 
+        // The media comes first: the SDP has to name the port the
+        // RTP socket is bound to, and the socket is what binds it.
+        let media_config = self.sessions.media_config();
+        let media = MediaSession::new(&media_config).map_err(|e| CallError::Sip(e.to_string()))?;
+
         let option = InviteOption {
             caller,
             callee,
@@ -195,8 +219,9 @@ impl CallManager {
             content_type: Some("application/sdp".to_string()),
             offer: Some(sdp::offer_sdp(
                 &media_address(&session),
-                sdp::PLACEHOLDER_MEDIA_PORT,
+                media.local_port(),
                 1,
+                &media_config.codecs,
             )),
             // §5.8: a PBX that challenges the INVITE with 401/407 has
             // to be answered with the account's digest. Without a
@@ -217,6 +242,7 @@ impl CallManager {
 
         let call_id = dialog.id().call_id.clone();
         session.remember(&call_id, dialog);
+        session.remember_media(&call_id, media);
 
         let mut event = CallEvent::new(CallEventType::OutgoingCallInitiated);
         event.user = account.user.clone();
@@ -238,6 +264,7 @@ impl CallManager {
             account.user.clone(),
             state_receiver,
             self.bus.clone(),
+            media_config,
         ));
 
         Ok(call_id)
@@ -251,6 +278,9 @@ impl CallManager {
     /// fixed body: RFC 3264 §6 says the answer may only name media
     /// formats the offer listed, and a peer that offered only G.711
     /// A-law would hang up on a fixed G.711 µ-law answer.
+    ///
+    /// The port in it is the one the RTP socket is bound to, so the
+    /// peer's audio arrives somewhere.
     pub fn answer(&self, account_id: &str, call_id: &str) -> Result<(), CallError> {
         let session = self
             .sessions
@@ -266,14 +296,30 @@ impl CallManager {
             .cloned()
             .ok_or_else(|| CallError::Sip("the endpoint has no local address".to_string()))?;
 
+        // The media comes first: the answer has to name the port the
+        // RTP socket is bound to.
+        let media_config = self.sessions.media_config();
+        let media = MediaSession::new(&media_config).map_err(|e| CallError::Sip(e.to_string()))?;
+
         let headers = vec![Header::ContentType("application/sdp".into())];
         let offer = dialog.initial_request().body.clone();
         let body = sdp::answer_sdp(
             &offer,
             &media_address(&session),
-            sdp::PLACEHOLDER_MEDIA_PORT,
+            media.local_port(),
             1,
+            &media_config.codecs,
         );
+
+        // The peer said where its RTP comes from. It is in the offer,
+        // and the answer only confirms the codec.
+        if let Some((address, port)) = sdp::media_endpoint(&offer) {
+            if let Err(e) = media.set_remote(&address, port) {
+                warn!(call_id = %call_id, error = %e, "the peer's media address did not resolve");
+            }
+        }
+
+        session.remember_media(call_id, media);
 
         dialog
             .accept_with_public_contact(
@@ -367,6 +413,49 @@ impl CallManager {
         });
         Ok(())
     }
+
+    /// Mute or unmute the microphone of a call.
+    ///
+    /// The flag is an atomic, so this is safe to call from the
+    /// interface thread — §6 forbids blocking there, and this does
+    /// not block.
+    pub fn set_mic_muted(
+        &self,
+        account_id: &str,
+        call_id: &str,
+        muted: bool,
+    ) -> Result<(), CallError> {
+        let media = self.media_of(account_id, call_id)?;
+        media.set_mic_muted(muted);
+        Ok(())
+    }
+
+    /// Mute or unmute the speaker of a call.
+    pub fn set_speaker_muted(
+        &self,
+        account_id: &str,
+        call_id: &str,
+        muted: bool,
+    ) -> Result<(), CallError> {
+        let media = self.media_of(account_id, call_id)?;
+        media.set_speaker_muted(muted);
+        Ok(())
+    }
+
+    /// What the media of a call is doing.
+    pub fn media_status(&self, account_id: &str, call_id: &str) -> Option<MediaStatus> {
+        let session = self.sessions.get(account_id)?;
+        session.media(call_id).map(|media| media.status())
+    }
+
+    /// The media of a call, if it has any.
+    fn media_of(&self, account_id: &str, call_id: &str) -> Result<MediaSession, CallError> {
+        let session = self
+            .sessions
+            .get(account_id)
+            .ok_or(CallError::NotRegistered)?;
+        session.media(call_id).ok_or(CallError::NoSuchCall)
+    }
 }
 
 /// Handle an incoming INVITE.
@@ -439,6 +528,7 @@ pub async fn handle_incoming_invite(
         account.user.clone(),
         state_receiver,
         bus,
+        session.media_config(),
     ));
 
     Ok(())
@@ -479,6 +569,7 @@ async fn watch_dialog(
     user: String,
     mut states: UnboundedReceiver<DialogState>,
     bus: CallBus,
+    media_config: MediaConfig,
 ) {
     let account_id = session.account.id.clone();
 
@@ -502,7 +593,39 @@ async fn watch_dialog(
                     bus.publish(&account_id, event);
                 }
             }
-            DialogState::Confirmed(_, _) => {
+            DialogState::Confirmed(_, response) => {
+                // The peer's answer is where its RTP comes from and
+                // which codec it chose. For an incoming call the offer
+                // already said, and the answer confirmed the codec.
+                if direction == Direction::Outgoing {
+                    if let Some(media) = session.media(&call_id) {
+                        match sdp::parse_answer(&response.body, &media_config.codecs) {
+                            Some(answer) => {
+                                media.negotiate(answer.codec, answer.payload_type);
+                                if let Err(e) = media.set_remote(&answer.address, answer.port) {
+                                    warn!(
+                                        call_id = %call_id,
+                                        error = %e,
+                                        "the peer's media address did not resolve"
+                                    );
+                                }
+                            }
+                            None => {
+                                warn!(
+                                    call_id = %call_id,
+                                    "the peer answered with media this build does not speak"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // The audio starts here, on the runtime — never on the
+                // interface thread (§6).
+                if let Some(media) = session.media(&call_id) {
+                    media.start(&media_config);
+                }
+
                 let mut event = CallEvent::new(CallEventType::CallAnswered);
                 event.user = user.clone();
                 event.call_id = call_id.clone();
@@ -524,6 +647,10 @@ async fn watch_dialog(
                 handle.respond(StatusCode::OK, None, None).await.ok();
             }
             DialogState::Terminated(id, reason) => {
+                // The media goes first: the sound card is closed and
+                // the RTP threads stop before the call is forgotten.
+                session.forget_media(&call_id);
+
                 let (code, cause) = terminated_code(&reason);
                 let mut event = CallEvent::new(CallEventType::CallEnded);
                 event.user = user.clone();

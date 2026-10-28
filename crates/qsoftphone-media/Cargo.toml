@@ -1,0 +1,16 @@
+[package]
+name = "qsoftphone-media"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The media plane of the softphone: RTP, G.711 and the sound card."
+
+[dependencies]
+# `bytes` is what `rtc-rtp` packs the RTP payload into. It is already in
+# the tree — `rtc-rtp` depends on it — so naming it here adds no package.
+bytes = "1.12"
+cpal = { workspace = true }
+rtc = { workspace = true }
+tracing = { workspace = true }

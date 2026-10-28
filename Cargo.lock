@@ -3400,6 +3400,7 @@ dependencies = [
  "eframe",
  "egui",
  "qsoftphone-core",
+ "qsoftphone-media",
  "qsoftphone-sip",
  "rtc",
  "serde",
@@ -3423,11 +3424,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "qsoftphone-media"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "cpal",
+ "rtc",
+ "tracing",
+]
+
+[[package]]
 name = "qsoftphone-sip"
 version = "0.1.0"
 dependencies = [
  "md-5 0.11.0",
  "qsoftphone-core",
+ "qsoftphone-media",
  "rsipstack",
  "serde",
  "serde_json",

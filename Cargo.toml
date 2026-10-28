@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/qsoftphone-core",
+    "crates/qsoftphone-media",
     "crates/qsoftphone-sip",
     "crates/qsoftphone-app",
 ]
@@ -31,6 +32,7 @@ repository = "https://github.com/litchdrom/qsoftphone-rs"
 # ---------------------------------------------------------------------------
 [workspace.dependencies]
 qsoftphone-core = { path = "crates/qsoftphone-core" }
+qsoftphone-media = { path = "crates/qsoftphone-media" }
 qsoftphone-sip = { path = "crates/qsoftphone-sip" }
 
 serde = { version = "1", features = ["derive"] }

@@ -273,7 +273,12 @@ async fn run_registration_inner(
 
     // The session: the endpoint plus the dialog layer. It is
     // published so the call layer can place a call from this account.
-    let session = AccountSession::new(account.clone(), endpoint, public_address);
+    let session = AccountSession::new(
+        account.clone(),
+        endpoint,
+        public_address,
+        sessions.media_config_handle(),
+    );
     sessions.insert(&account.id, session.clone());
 
     // Answer what the registrar sends us, and take the calls that

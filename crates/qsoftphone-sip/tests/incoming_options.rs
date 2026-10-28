@@ -14,7 +14,7 @@ use std::time::Duration;
 use qsoftphone_core::model::account::Account;
 use qsoftphone_sip::endpoint::build_endpoint;
 use qsoftphone_sip::incoming::serve;
-use qsoftphone_sip::{AccountSession, CallBus, PublicAddress};
+use qsoftphone_sip::{AccountSession, CallBus, PublicAddress, SessionRegistry};
 use rsipstack::platform::CancellationToken;
 use rsipstack::sip::Transport;
 use rsipstack::transaction::Endpoint;
@@ -57,12 +57,14 @@ fn serve_incoming(endpoint: &Endpoint, token: &CancellationToken) {
     let incoming = endpoint.incoming_transactions().expect("incoming channel");
 
     let account = Account::new("Office", "example.com", "104", "pw", "udp");
+    let registry = SessionRegistry::new();
     let session = AccountSession::new(
         account,
         Endpoint {
             inner: endpoint.inner.clone(),
         },
         PublicAddress::default(),
+        registry.media_config_handle(),
     );
     let (bus, _receiver) = CallBus::new();
 

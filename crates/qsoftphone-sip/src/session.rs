@@ -10,13 +10,14 @@
 //! and it is what an incoming INVITE arrives on.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use rsipstack::dialog::dialog_layer::DialogLayer;
 use rsipstack::dialog::invite_dialog::InviteDialog;
 use rsipstack::transaction::endpoint::Endpoint;
 
 use qsoftphone_core::model::account::Account;
+use qsoftphone_media::{MediaConfig, MediaSession};
 
 use crate::inspector::PublicAddress;
 
@@ -36,11 +37,29 @@ pub struct AccountSession {
     pub public_address: PublicAddress,
     /// The dialogs we can still act on, keyed by SIP Call-ID.
     dialogs: Mutex<HashMap<String, InviteDialog>>,
+    /// The media of the calls that are up, keyed by SIP Call-ID.
+    ///
+    /// The session is a handle: it is cheap to clone, and the mute
+    /// flags are atomics. That is what lets the interface read the
+    /// status of a call while the call is still being set up on
+    /// another thread.
+    media: Mutex<HashMap<String, MediaSession>>,
+    /// What the media of a call should be.
+    ///
+    /// The settings are global, as they were in the C++: the `media`
+    /// section of the config file held the codec priorities for the
+    /// whole application, not for one account.
+    media_config: Arc<RwLock<MediaConfig>>,
 }
 
 impl AccountSession {
     /// A session for an account and the endpoint it owns.
-    pub fn new(account: Account, endpoint: Endpoint, public_address: PublicAddress) -> Arc<Self> {
+    pub fn new(
+        account: Account,
+        endpoint: Endpoint,
+        public_address: PublicAddress,
+        media_config: Arc<RwLock<MediaConfig>>,
+    ) -> Arc<Self> {
         let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
         Arc::new(Self {
             account,
@@ -48,7 +67,14 @@ impl AccountSession {
             dialog_layer,
             public_address,
             dialogs: Mutex::new(HashMap::new()),
+            media: Mutex::new(HashMap::new()),
+            media_config,
         })
+    }
+
+    /// What the media of a call should be.
+    pub fn media_config(&self) -> MediaConfig {
+        self.media_config.read().expect("media settings").clone()
     }
 
     /// Remember a dialog so the UI can act on it later.
@@ -82,6 +108,33 @@ impl AccountSession {
             .cloned()
             .collect()
     }
+
+    /// Remember the media of a call.
+    ///
+    /// The session is created before the offer is built: the SDP has
+    /// to name a port that is really bound, and the socket is what
+    /// binds it.
+    pub fn remember_media(&self, call_id: &str, media: MediaSession) {
+        self.media
+            .lock()
+            .expect("media lock")
+            .insert(call_id.to_string(), media);
+    }
+
+    /// The media of a call, if it is still up.
+    pub fn media(&self, call_id: &str) -> Option<MediaSession> {
+        self.media.lock().expect("media lock").get(call_id).cloned()
+    }
+
+    /// Forget the media of a call that has ended.
+    ///
+    /// The session drops the sound card and stops the RTP threads on
+    /// the way out.
+    pub fn forget_media(&self, call_id: &str) {
+        if let Some(media) = self.media.lock().expect("media lock").remove(call_id) {
+            media.stop();
+        }
+    }
 }
 
 /// The live sessions, keyed by account id.
@@ -91,12 +144,33 @@ impl AccountSession {
 #[derive(Clone, Default)]
 pub struct SessionRegistry {
     inner: Arc<Mutex<HashMap<String, Arc<AccountSession>>>>,
+    /// What the media of a call should be.
+    media_config: Arc<RwLock<MediaConfig>>,
 }
 
 impl SessionRegistry {
     /// A new, empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The media settings, read.
+    pub fn media_config(&self) -> MediaConfig {
+        self.media_config.read().expect("media settings").clone()
+    }
+
+    /// The media settings, set.
+    ///
+    /// The registrar and the call layer both read them, so they are
+    /// shared: a codec the user picks has to reach the offer the
+    /// registrar's side builds.
+    pub fn set_media_config(&self, config: MediaConfig) {
+        *self.media_config.write().expect("media settings") = config;
+    }
+
+    /// The shared handle to the media settings.
+    pub fn media_config_handle(&self) -> Arc<RwLock<MediaConfig>> {
+        self.media_config.clone()
     }
 
     /// Publish a session under its account id.
@@ -154,9 +228,14 @@ mod tests {
             .await
             .expect("endpoint");
         let account = Account::new("Office", "example.com", "104", "pw", "udp");
-        let session = AccountSession::new(account, endpoint, PublicAddress::default());
-
         let registry = SessionRegistry::new();
+        let session = AccountSession::new(
+            account,
+            endpoint,
+            PublicAddress::default(),
+            registry.media_config_handle(),
+        );
+
         registry.insert("acct-1", session.clone());
 
         assert_eq!(registry.len(), 1);
