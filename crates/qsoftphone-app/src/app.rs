@@ -9,21 +9,31 @@
 //! panel types are unified into `egui::Panel`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use eframe::egui;
 use qsoftphone_core::config::AppConfig;
-use qsoftphone_core::model::account::Account;
+use qsoftphone_core::model::account::{Account, now_ms};
 use qsoftphone_core::model::call_event::{CallEventType, Direction};
+use qsoftphone_core::model::history::{
+    CallRecord, CallResult, Direction as HistoryDirection, LocalTime, classify_result,
+    format_duration, history_direction,
+};
 use qsoftphone_core::paths::AppPaths;
+use qsoftphone_core::sip::uri::sip_uri_user_part;
 use qsoftphone_core::storage::{AccountStore, Db};
 use qsoftphone_sip::{
     CallBus, CallManager, RegistrationManager, RegistrationState, SessionRegistry,
 };
 
+use crate::history::{HistoryService, HistoryUpdate};
+
 /// The application state.
 pub struct QSoftphoneApp {
     paths: AppPaths,
-    db: Db,
+    /// The database, shared with the history worker (§6: the history
+    /// is read and written on the runtime, never on the UI thread).
+    db: Arc<Db>,
     config: AppConfig,
     /// Handle to the tokio runtime the SIP stack runs on. Kept so
     /// the runtime is not dropped while the window is open.
@@ -32,6 +42,16 @@ pub struct QSoftphoneApp {
     registrations: RegistrationManager,
     /// The calls, and the state each one is in.
     calls: CallManager,
+    /// The history, and the rows it last answered with.
+    history: HistoryService,
+    /// The history rows the UI shows.
+    history_rows: Vec<CallRecord>,
+    /// What the history search box holds.
+    history_query: String,
+    /// The direction the history is filtered by; `None` is all of them.
+    history_direction: Option<HistoryDirection>,
+    /// The history row that is expanded.
+    history_expanded: Option<i64>,
     /// What the UI shows about each call, keyed by SIP Call-ID.
     call_views: HashMap<String, CallView>,
     /// The calls in the order they arrived.
@@ -68,14 +88,15 @@ pub struct QSoftphoneApp {
 
 /// Which page the middle panel shows.
 ///
-/// Two pages, and the one that matters is the first: a softphone is
-/// for calling, so the dialer is what the window opens on. The account
-/// settings are there when they are wanted and out of the way when
-/// they are not.
+/// Three pages, and the one that matters is the first: a softphone is
+/// for calling, so the dialer is what the window opens on. The history
+/// is a page away, and so are the account settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     /// The dialer and the calls.
     Call,
+    /// The call history.
+    History,
     /// The account settings.
     Account,
 }
@@ -90,8 +111,13 @@ struct CallView {
     /// Which way the call was going.
     direction: Option<Direction>,
     /// The peer: the caller for an incoming call, the callee for an
-    /// outgoing one.
+    /// outgoing one — the user-part, the way the list shows it.
     peer: String,
+    /// The peer's full URI, as the stack saw it.
+    ///
+    /// The history row keeps the URI and derives the number from it
+    /// (§5.3), so the URI has to survive the call.
+    peer_uri: String,
     /// The resolved display name of the peer.
     caller_id: String,
     /// The number the remote party actually dialled.
@@ -102,6 +128,25 @@ struct CallView {
     digit: String,
     /// Whether the call is over.
     ended: bool,
+    /// When the call started, epoch milliseconds.
+    started_at: i64,
+    /// When it ended, epoch milliseconds.
+    ended_at: i64,
+    /// Whether the call was answered.
+    answered: bool,
+    /// The final SIP status code.
+    sip_code: i32,
+    /// The final SIP reason phrase.
+    hangup_cause: String,
+}
+
+/// What the history page asked for when a button was pressed.
+#[derive(Debug, Clone)]
+enum HistoryAction {
+    /// Expand or collapse a row.
+    Toggle(i64),
+    /// Redial a call.
+    Redial(CallRecord),
 }
 
 /// The account form.
@@ -176,6 +221,10 @@ impl QSoftphoneApp {
             .as_ref()
             .and_then(|id| accounts.iter().position(|a| &a.id == id))
             .or_else(|| (!accounts.is_empty()).then_some(0));
+        // The history reads and writes the same database, on the
+        // runtime (§6).
+        let db = Arc::new(db);
+        let history = HistoryService::new(runtime.clone(), db.clone());
         let mut app = Self {
             paths,
             db,
@@ -183,6 +232,11 @@ impl QSoftphoneApp {
             _runtime: runtime.clone(),
             registrations: RegistrationManager::new(runtime.clone(), sessions.clone(), bus.clone()),
             calls: CallManager::new(runtime, sessions, bus, call_events),
+            history,
+            history_rows: Vec::new(),
+            history_query: String::new(),
+            history_direction: None,
+            history_expanded: None,
             call_views: HashMap::new(),
             call_order: Vec::new(),
             active_call_id: None,
@@ -201,6 +255,9 @@ impl QSoftphoneApp {
             theme_applied: false,
         };
         app.load_selected();
+        // The history is read on the runtime; the rows arrive on the
+        // channel and are drained at the top of the frame (§3).
+        app.history.query("", None);
         app
     }
 
@@ -229,6 +286,7 @@ impl QSoftphoneApp {
                 .entry(call_id.clone())
                 .or_insert_with(|| CallView {
                     call_id: call_id.clone(),
+                    started_at: now_ms(),
                     ..Default::default()
                 });
             if is_new {
@@ -251,15 +309,36 @@ impl QSoftphoneApp {
             if !event.digit.is_empty() {
                 view.digit = event.digit.clone();
             }
+            if event.sip_code != 0 {
+                view.sip_code = event.sip_code;
+            }
+            if !event.hangup_cause.is_empty() {
+                view.hangup_cause = event.hangup_cause.clone();
+            }
             match event.event_type {
                 CallEventType::IncomingCall => {
-                    view.peer = event.caller.clone();
+                    // The event carries the peer's URI; the list shows
+                    // the user-part of it.
+                    view.peer_uri = event.caller.clone();
+                    view.peer = sip_uri_user_part(&event.caller);
                     // A call is coming in: show the call page, not the
                     // account settings.
                     self.view = View::Call;
                 }
-                CallEventType::OutgoingCallInitiated => view.peer = event.callee.clone(),
-                CallEventType::CallEnded => view.ended = true,
+                CallEventType::OutgoingCallInitiated => {
+                    view.peer_uri = event.callee.clone();
+                    view.peer = sip_uri_user_part(&event.callee);
+                }
+                CallEventType::CallAnswered => view.answered = true,
+                CallEventType::CallEnded => {
+                    view.ended = true;
+                    view.ended_at = now_ms();
+                    // The call is over: it belongs in the history
+                    // (§5.3).
+                    if let Some(record) = Self::history_record(view) {
+                        self.history.record(record);
+                    }
+                }
                 _ => {}
             }
 
@@ -267,6 +346,97 @@ impl QSoftphoneApp {
             if !view.ended && self.active_call_id.is_none() {
                 self.active_call_id = Some(call_id);
             }
+        }
+    }
+
+    /// The history row for a finished call — §5.3.
+    ///
+    /// The remote party is the **caller** for an incoming call and the
+    /// **callee** for an outgoing one; never our own extension. The
+    /// dialled number is kept separately: it is what a redial uses
+    /// (§5.1), and for a DID-forwarded call it is not the remote
+    /// party.
+    fn history_record(view: &CallView) -> Option<CallRecord> {
+        let direction = match view.direction? {
+            Direction::Incoming => HistoryDirection::Incoming,
+            Direction::Outgoing => HistoryDirection::Outgoing,
+        };
+        let mut record = match direction {
+            HistoryDirection::Incoming => CallRecord::from_incoming(
+                view.account_id.clone(),
+                view.call_id.clone(),
+                view.peer_uri.clone(),
+                view.dialed_number.clone(),
+                view.caller_id.clone(),
+                view.started_at,
+                view.ended_at,
+                view.sip_code,
+                view.hangup_cause.clone(),
+                view.answered,
+            ),
+            _ => CallRecord::from_outgoing(
+                view.account_id.clone(),
+                view.call_id.clone(),
+                view.peer_uri.clone(),
+                view.caller_id.clone(),
+                view.started_at,
+                view.ended_at,
+                view.sip_code,
+                view.hangup_cause.clone(),
+                view.answered,
+            ),
+        };
+        // An incoming call that was never answered is a missed call.
+        record.direction = history_direction(record.direction, record.answered, record.sip_code);
+        Some(record)
+    }
+
+    /// Drain the history answers that arrived since the last frame.
+    fn drain_history(&mut self) {
+        for update in self.history.drain() {
+            match update {
+                HistoryUpdate::Rows(rows) => self.history_rows = rows,
+                HistoryUpdate::Failed(error) => {
+                    self.status = format!("The history could not be read: {error}");
+                }
+            }
+        }
+    }
+
+    /// Redial a call from the history — §5.1.
+    ///
+    /// The target is the **dialled** number, not the remote party: for
+    /// a DID-forwarded call the remote party is the PBX that
+    /// forwarded it, and dialling the PBX back is not what the user
+    /// means by "call them back".
+    fn redial(&mut self, record: &CallRecord) {
+        let target = record.redial_target().to_string();
+        if target.is_empty() {
+            self.status = "That call has no number to redial.".to_string();
+            return;
+        }
+        self.place_call_to(&target);
+    }
+
+    /// Place a call to a target.
+    fn place_call_to(&mut self, target: &str) {
+        let Some(account) = self.selected_account().cloned() else {
+            return;
+        };
+        let target = target.trim().to_string();
+        if target.is_empty() {
+            return;
+        }
+        // The dialer shows what is being called, so a redial from the
+        // history is visible too.
+        self.dial_number = target.clone();
+        match self.calls.place_call(&account.id, &target) {
+            Ok(call_id) => {
+                self.active_call_id = Some(call_id);
+                self.view = View::Call;
+                self.status = format!("Calling {target}…");
+            }
+            Err(e) => self.status = format!("Could not place the call: {e}"),
         }
     }
 
@@ -378,21 +548,12 @@ impl QSoftphoneApp {
 
     /// Place a call to the number in the dialer.
     fn place_call(&mut self) {
-        let Some(account) = self.selected_account().cloned() else {
-            return;
-        };
-        let target = self.dial_number.trim().to_string();
-        if target.is_empty() {
+        if self.dial_number.trim().is_empty() {
             self.status = "There is no number to call.".to_string();
             return;
         }
-        match self.calls.place_call(&account.id, &target) {
-            Ok(call_id) => {
-                self.status = format!("Calling {target}…");
-                self.active_call_id = Some(call_id);
-            }
-            Err(e) => self.status = format!("Could not place the call: {e}"),
-        }
+        let target = self.dial_number.trim().to_string();
+        self.place_call_to(&target);
     }
 
     /// Answer the incoming call.
@@ -536,6 +697,7 @@ impl QSoftphoneApp {
         // a channel and are drained here.
         self.drain_registrations();
         self.drain_calls();
+        self.drain_history();
 
         // The header. One line: who we are and whether we are
         // registered. Everything else is a page.
@@ -642,7 +804,7 @@ impl QSoftphoneApp {
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            // Two pages, one line to switch between them.
+            // Three pages, one line to switch between them.
             ui.horizontal(|ui| {
                 if ui
                     .selectable_label(self.view == View::Call, "Call")
@@ -651,13 +813,21 @@ impl QSoftphoneApp {
                     self.view = View::Call;
                 }
                 if ui
+                    .selectable_label(self.view == View::History, "History")
+                    .clicked()
+                {
+                    self.view = View::History;
+                    self.history
+                        .query(&self.history_query, self.history_direction);
+                }
+                if ui
                     .selectable_label(self.view == View::Account, "Account")
                     .clicked()
                 {
                     self.view = View::Account;
                 }
                 ui.separator();
-                ui.label(egui::RichText::new("M2 — calling").small());
+                ui.label(egui::RichText::new("M3 — history").small());
                 ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).small());
             });
             ui.separator();
@@ -673,6 +843,7 @@ impl QSoftphoneApp {
 
             match self.view {
                 View::Call => self.draw_calls(ui),
+                View::History => self.draw_history(ui),
                 View::Account => self.draw_account(ui),
             }
         });
@@ -826,6 +997,197 @@ impl QSoftphoneApp {
                     });
                 }
             });
+        }
+    }
+
+    /// The history page: the searchable list of past calls.
+    ///
+    /// Each row shows the number, how long the call lasted, when it
+    /// happened and the SIP status code. Expanding a row shows the
+    /// full URI, the cause and the exact timestamps, and offers a
+    /// redial (§5.1).
+    fn draw_history(&mut self, ui: &mut egui::Ui) {
+        // The search box and the direction chips.
+        ui.horizontal(|ui| {
+            let mut query = self.history_query.clone();
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut query)
+                    .hint_text("Search the history…")
+                    .desired_width(220.0),
+            );
+            if response.changed() && query != self.history_query {
+                self.history_query = query;
+                self.history
+                    .query(&self.history_query, self.history_direction);
+            }
+            ui.separator();
+            for (label, direction) in [
+                ("All", None),
+                ("Incoming", Some(HistoryDirection::Incoming)),
+                ("Outgoing", Some(HistoryDirection::Outgoing)),
+                ("Missed", Some(HistoryDirection::Missed)),
+            ] {
+                if ui
+                    .selectable_label(self.history_direction == direction, label)
+                    .clicked()
+                {
+                    self.history_direction = direction;
+                    self.history
+                        .query(&self.history_query, self.history_direction);
+                }
+            }
+        });
+        ui.separator();
+
+        if self.history_rows.is_empty() {
+            ui.label(egui::RichText::new("No calls yet.").color(egui::Color32::GRAY));
+            return;
+        }
+
+        let clock = LocalTime::default();
+        // The rows are moved out for the drawing, so that the drawing
+        // does not hold a borrow of the app while the buttons are
+        // acted on.
+        let rows = std::mem::take(&mut self.history_rows);
+        let mut action: Option<HistoryAction> = None;
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for record in &rows {
+                let expanded = self.history_expanded == Some(record.id);
+                let result = classify_result(
+                    record.direction,
+                    record.sip_code,
+                    record.duration_sec,
+                    record.answered,
+                    &record.hangup_cause,
+                );
+
+                ui.horizontal(|ui| {
+                    // Which way the call was going.
+                    let arrow = match record.direction {
+                        HistoryDirection::Outgoing => "→",
+                        _ => "←",
+                    };
+                    ui.label(egui::RichText::new(arrow).color(egui::Color32::GRAY));
+
+                    // The number — never the full URI; that is what
+                    // the expanded row is for.
+                    let number = if record.remote_number.is_empty() {
+                        record.remote_uri.clone()
+                    } else {
+                        record.remote_number.clone()
+                    };
+                    ui.label(egui::RichText::new(number).strong());
+
+                    if !record.remote_name.is_empty() {
+                        ui.label(
+                            egui::RichText::new(&record.remote_name)
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        );
+                    }
+
+                    // How long it lasted.
+                    ui.label(
+                        egui::RichText::new(format_duration(record.duration_sec))
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
+
+                    // When it happened.
+                    ui.label(
+                        egui::RichText::new(clock.time(record.started_at))
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
+
+                    // The SIP status code.
+                    if record.sip_code != 0 {
+                        ui.label(
+                            egui::RichText::new(record.sip_code.to_string())
+                                .small()
+                                .strong(),
+                        );
+                    }
+
+                    // And how it ended.
+                    ui.label(
+                        egui::RichText::new(result.label())
+                            .small()
+                            .color(match result {
+                                CallResult::Completed => egui::Color32::from_rgb(61, 220, 151),
+                                CallResult::Missed => egui::Color32::from_rgb(231, 76, 60),
+                                CallResult::Busy | CallResult::Rejected | CallResult::Failed => {
+                                    egui::Color32::from_rgb(230, 162, 60)
+                                }
+                                _ => egui::Color32::GRAY,
+                            }),
+                    );
+
+                    if ui
+                        .small_button(if expanded { "Hide" } else { "Details" })
+                        .clicked()
+                    {
+                        action = Some(HistoryAction::Toggle(record.id));
+                    }
+                });
+
+                if expanded {
+                    ui.indent("details", |ui| {
+                        if !record.remote_uri.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("URI: {}", record.remote_uri)).small(),
+                            );
+                        }
+                        if !record.dialed_number.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("Dialled: {}", record.dialed_number))
+                                    .small(),
+                            );
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Started: {}",
+                                clock.stamp(record.started_at)
+                            ))
+                            .small(),
+                        );
+                        if record.ended_at > 0 {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Ended: {}",
+                                    clock.stamp(record.ended_at)
+                                ))
+                                .small(),
+                            );
+                        }
+                        if !record.hangup_cause.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("Cause: {}", record.hangup_cause))
+                                    .small(),
+                            );
+                        }
+                        if ui.button("Redial").clicked() {
+                            action = Some(HistoryAction::Redial(record.clone()));
+                        }
+                    });
+                }
+                ui.separator();
+            }
+        });
+
+        self.history_rows = rows;
+
+        match action {
+            Some(HistoryAction::Toggle(id)) => {
+                self.history_expanded = if self.history_expanded == Some(id) {
+                    None
+                } else {
+                    Some(id)
+                };
+            }
+            Some(HistoryAction::Redial(record)) => self.redial(&record),
+            None => {}
         }
     }
 
@@ -998,12 +1360,15 @@ mod tests {
     }
 
     /// An incoming call, as the SIP layer would report it.
+    ///
+    /// The event carries the peer's **URI** — that is the C++'s
+    /// `CallEvent` shape, and the history row needs the full URI.
     fn incoming_event() -> CallEvent {
         let mut event = CallEvent::new(CallEventType::IncomingCall);
         event.call_id = "call-1".to_string();
         event.call_direction = Some(Direction::Incoming);
         event.call_state = "ringing".to_string();
-        event.caller = "6666".to_string();
+        event.caller = "sip:6666@sip.example.com".to_string();
         event.caller_id = "Alice".to_string();
         event.dialed_number = "6666".to_string();
         event
@@ -1249,5 +1614,112 @@ mod tests {
 
         let active = app.active_call().expect("no call is shown");
         assert_eq!(active.call_id, "call-1", "the first call stays active");
+    }
+
+    // -- M3: the history --
+
+    /// Publish a call that starts, is answered and ends.
+    async fn run_a_call(bus: &CallBus, call_id: &str, answered: bool) {
+        let mut incoming = incoming_event();
+        incoming.call_id = call_id.to_string();
+        bus.publish("acct-ui-1", incoming);
+
+        if answered {
+            let mut ok = CallEvent::new(CallEventType::CallAnswered);
+            ok.call_id = call_id.to_string();
+            ok.call_direction = Some(Direction::Incoming);
+            ok.call_state = "connected".to_string();
+            bus.publish("acct-ui-1", ok);
+        }
+
+        let mut ended = CallEvent::new(CallEventType::CallEnded);
+        ended.call_id = call_id.to_string();
+        ended.call_direction = Some(Direction::Incoming);
+        ended.call_state = "ended".to_string();
+        ended.sip_code = if answered { 200 } else { 0 };
+        ended.hangup_cause = "Normal".to_string();
+        bus.publish("acct-ui-1", ended);
+    }
+
+    /// Wait for the history to answer, and drain it.
+    async fn wait_for_history(app: &mut QSoftphoneApp, ctx: &egui::Context, wanted: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.history_rows.len() < wanted && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            frame(app, ctx);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finished_call_lands_in_the_history() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        run_a_call(&bus, "call-1", true).await;
+        frame(&mut app, &ctx);
+        wait_for_history(&mut app, &ctx, 1).await;
+
+        assert_eq!(app.history_rows.len(), 1, "the call was not stored");
+        let row = &app.history_rows[0];
+        // §5.3: the remote party is the caller, never our own
+        // extension.
+        assert_eq!(row.remote_number, "6666");
+        assert_eq!(row.remote_uri, "sip:6666@sip.example.com");
+        assert_eq!(row.direction, HistoryDirection::Incoming);
+        assert!(row.answered);
+        assert_eq!(row.sip_code, 200);
+        assert_eq!(row.dialed_number, "6666");
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_incoming_call_is_stored_as_missed() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        run_a_call(&bus, "call-1", false).await;
+        frame(&mut app, &ctx);
+        wait_for_history(&mut app, &ctx, 1).await;
+
+        assert_eq!(app.history_rows.len(), 1, "the call was not stored");
+        let row = &app.history_rows[0];
+        assert_eq!(row.direction, HistoryDirection::Missed);
+        assert!(!row.answered);
+    }
+
+    #[tokio::test]
+    async fn the_history_page_draws() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.view = View::History;
+        let output = frame(&mut app, &ctx);
+        assert!(!output.shapes.is_empty(), "the frame drew nothing");
+    }
+
+    #[tokio::test]
+    async fn a_redial_uses_the_dialled_number() {
+        // §5.1: the redial dials the number that was dialled, not the
+        // remote party — for a DID-forwarded call the remote party is
+        // the PBX that forwarded it.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let mut record = CallRecord::from_incoming(
+            "acct-ui-1",
+            "call-did",
+            "sip:asterisk@sip.example.com",
+            "6666",
+            "",
+            1_000,
+            2_000,
+            200,
+            "Normal",
+            true,
+        );
+        record.remote_number = "asterisk".to_string();
+
+        app.redial(&record);
+
+        // The account is not registered, so the call cannot be placed
+        // — but the target is the dialled number, not the PBX.
+        assert_eq!(app.dial_number, "6666");
     }
 }

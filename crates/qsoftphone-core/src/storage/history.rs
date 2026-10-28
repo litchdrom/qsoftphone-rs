@@ -93,6 +93,54 @@ impl<'a> HistoryStore<'a> {
         })
     }
 
+    /// The calls that match a search, newest first.
+    ///
+    /// The C++ filters with a case-insensitive substring over the
+    /// remote number, the remote URI, the remote name and the hangup
+    /// cause — and it matches the SIP status code exactly, so "486"
+    /// finds every busy call. The direction filter narrows it
+    /// further.
+    pub fn search(
+        &self,
+        query: &str,
+        direction: Option<Direction>,
+        limit: usize,
+    ) -> Result<Vec<CallRecord>> {
+        let term = query.trim();
+        let pattern = format!("%{}%", escape_like(term));
+        // A query that is a number is also a SIP status code search.
+        let code: Option<i32> = term.parse().ok();
+        let wanted = direction.map(|d| d.as_str().to_string());
+
+        self.db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, account_id, call_id, direction, remote_number, remote_uri,
+                        remote_name, dialed_number, started_at, ended_at, duration_sec,
+                        sip_code,
+                        hangup_cause, answered, recorded
+                 FROM calls
+                 WHERE (?1 = ''
+                        OR remote_number LIKE ?2 ESCAPE '\\'
+                        OR remote_uri    LIKE ?2 ESCAPE '\\'
+                        OR remote_name   LIKE ?2 ESCAPE '\\'
+                        OR hangup_cause  LIKE ?2 ESCAPE '\\'
+                        OR (?3 IS NOT NULL AND sip_code = ?3))
+                   AND (?4 IS NULL OR direction = ?4)
+                 ORDER BY started_at DESC, id DESC
+                 LIMIT ?5",
+            )?;
+            let rows = stmt.query_map(
+                params![term, pattern, code, wanted, limit as i64],
+                row_to_record,
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
     /// Total number of stored calls.
     pub fn total_calls(&self) -> Result<i64> {
         self.db.with_conn(|conn| {
@@ -114,11 +162,35 @@ impl<'a> HistoryStore<'a> {
     }
 }
 
+/// The account id of a row, read leniently.
+///
+/// The column was declared INTEGER in the first schema and holds the
+/// account's UUID. SQLite keeps a UUID as text even in an INTEGER
+/// column, but a row written before the change could still hold a
+/// number — and one unreadable row must not break the whole list.
+fn account_id_of(row: &Row<'_>) -> rusqlite::Result<String> {
+    Ok(match row.get_ref(1)? {
+        rusqlite::types::ValueRef::Text(text) => String::from_utf8_lossy(text).into_owned(),
+        rusqlite::types::ValueRef::Integer(number) => number.to_string(),
+        rusqlite::types::ValueRef::Real(number) => number.to_string(),
+        rusqlite::types::ValueRef::Blob(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        rusqlite::types::ValueRef::Null => String::new(),
+    })
+}
+
+/// Escape the `LIKE` wildcards in a search term, so that a search for
+/// "50%" finds the number 50% and not everything.
+fn escape_like(term: &str) -> String {
+    term.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 fn row_to_record(row: &Row<'_>) -> rusqlite::Result<CallRecord> {
     let direction: String = row.get(3)?;
     Ok(CallRecord {
         id: row.get(0)?,
-        account_id: row.get(1)?,
+        account_id: account_id_of(row)?,
         call_id: row.get(2)?,
         direction: Direction::parse(&direction).unwrap_or_default(),
         remote_number: row.get(4)?,
@@ -145,7 +217,7 @@ mod tests {
         let store = HistoryStore::new(&db);
 
         let record = CallRecord::from_incoming(
-            1,
+            "acct-1",
             "call-1",
             "sip:6666@193.178.169.164",
             "6666",
@@ -175,7 +247,7 @@ mod tests {
 
         store
             .record(&CallRecord::from_incoming(
-                1,
+                "acct-1",
                 "call-did",
                 "sip:asterisk@host",
                 "6666",
@@ -201,7 +273,7 @@ mod tests {
         // The To-URI is our AOR; the caller dialled 6666.
         store
             .record(&CallRecord::from_incoming(
-                1,
+                "acct-1",
                 "call-2",
                 "sip:6666@host",
                 "6666",
@@ -226,7 +298,7 @@ mod tests {
         for i in 0..3 {
             store
                 .record(&CallRecord::from_outgoing(
-                    1,
+                    "acct-1",
                     format!("call-{i}"),
                     "sip:6666@host",
                     "",
@@ -250,7 +322,7 @@ mod tests {
         let store = HistoryStore::new(&db);
         store
             .record(&CallRecord::missed(
-                1,
+                "acct-1",
                 "call-m",
                 "sip:6666@host",
                 "6666",
@@ -260,7 +332,7 @@ mod tests {
             .unwrap();
         store
             .record(&CallRecord::from_outgoing(
-                1,
+                "acct-1",
                 "call-o",
                 "sip:7777@host",
                 "",
@@ -273,5 +345,172 @@ mod tests {
             .unwrap();
         assert_eq!(store.total_calls().unwrap(), 2);
         assert_eq!(store.missed_calls().unwrap(), 1);
+    }
+
+    /// Three rows to search through.
+    fn seeded() -> (Db, Vec<CallRecord>) {
+        let db = Db::open_in_memory().unwrap();
+        let store = HistoryStore::new(&db);
+        let rows = vec![
+            CallRecord::from_incoming(
+                "acct-1",
+                "call-alice",
+                "sip:6666@host",
+                "6666",
+                "Alice",
+                3_000,
+                63_000,
+                200,
+                "Normal",
+                true,
+            ),
+            CallRecord::from_outgoing(
+                "acct-1",
+                "call-bob",
+                "sip:7777@host",
+                "",
+                2_000,
+                2_000,
+                486,
+                "Busy",
+                false,
+            ),
+            CallRecord::missed(
+                "acct-1",
+                "call-carol",
+                "sip:8888@host",
+                "8888",
+                "Carol",
+                1_000,
+            ),
+        ];
+        for row in &rows {
+            store.record(row).unwrap();
+        }
+        (db, rows)
+    }
+
+    #[test]
+    fn an_empty_search_finds_everything() {
+        let (db, _) = seeded();
+        let store = HistoryStore::new(&db);
+        assert_eq!(store.search("", None, 50).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn the_search_matches_the_number_the_uri_and_the_name() {
+        let (db, _) = seeded();
+        let store = HistoryStore::new(&db);
+
+        // The number, case-insensitively.
+        let hits = store.search("ALICE", None, 50).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].call_id, "call-alice");
+
+        // The URI.
+        let hits = store.search("sip:8888", None, 50).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].call_id, "call-carol");
+
+        // A substring of the number.
+        let hits = store.search("777", None, 50).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].call_id, "call-bob");
+
+        // Nothing matches everything.
+        assert!(store.search("nobody", None, 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_numeric_search_also_finds_the_sip_code() {
+        let (db, _) = seeded();
+        let store = HistoryStore::new(&db);
+        // 486 is the busy code of the second call.
+        let hits = store.search("486", None, 50).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].call_id, "call-bob");
+    }
+
+    #[test]
+    fn the_direction_filter_narrows_the_search() {
+        let (db, _) = seeded();
+        let store = HistoryStore::new(&db);
+
+        let missed = store.search("", Some(Direction::Missed), 50).unwrap();
+        assert_eq!(missed.len(), 1);
+        assert_eq!(missed[0].call_id, "call-carol");
+
+        let incoming = store.search("", Some(Direction::Incoming), 50).unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].call_id, "call-alice");
+
+        let outgoing = store.search("", Some(Direction::Outgoing), 50).unwrap();
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].call_id, "call-bob");
+    }
+
+    #[test]
+    fn a_wildcard_in_the_search_is_literal() {
+        let (db, _) = seeded();
+        let store = HistoryStore::new(&db);
+        // "%" must not match everything.
+        assert!(store.search("%", None, 50).unwrap().is_empty());
+        // "_" matches a single character, not any character.
+        assert!(store.search("_", None, 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_database_written_by_the_old_schema_still_takes_a_uuid_account() {
+        // The first schema declared `account_id INTEGER`, and there
+        // are databases on disk with that table already. SQLite keeps
+        // a UUID as text even in an INTEGER column, and the reader
+        // accepts both, so an existing database keeps working.
+        let path = std::env::temp_dir().join("qsoftphone-old-schema-history-test.sqlite");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE calls (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id    INTEGER,
+                    call_id       TEXT,
+                    direction     TEXT,
+                    remote_number TEXT,
+                    remote_uri    TEXT,
+                    remote_name   TEXT,
+                    started_at    INTEGER,
+                    ended_at      INTEGER,
+                    duration_sec  INTEGER,
+                    sip_code      INTEGER,
+                    hangup_cause  TEXT,
+                    answered      INTEGER,
+                    recorded      INTEGER
+                );",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let store = HistoryStore::new(&db);
+        let account = "7b797ac0-0642-46b4-b1ad-f25912da318e";
+        let record = CallRecord::from_incoming(
+            account,
+            "call-1",
+            "sip:6666@host",
+            "6666",
+            "",
+            1_000,
+            2_000,
+            200,
+            "Normal",
+            true,
+        );
+        store.record(&record).unwrap();
+
+        let fetched = store.by_call_id("call-1").unwrap().unwrap();
+        assert_eq!(fetched.account_id, account);
+        assert_eq!(fetched.remote_number, "6666");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -13,6 +13,7 @@
 //! "does it start and exit cleanly" check use.
 
 mod app;
+mod history;
 
 use std::process::ExitCode;
 

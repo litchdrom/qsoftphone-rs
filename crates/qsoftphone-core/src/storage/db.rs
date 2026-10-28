@@ -84,7 +84,7 @@ impl Db {
 
                 CREATE TABLE IF NOT EXISTS calls (
                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                    account_id    INTEGER,
+                    account_id    TEXT,
                     call_id       TEXT,
                     direction     TEXT,
                     remote_number TEXT,

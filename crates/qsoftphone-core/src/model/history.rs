@@ -3,6 +3,9 @@
 //! Port of the C++ `CallRecord` (`src/core/history/CallHistory.h`).
 
 use serde::{Deserialize, Serialize};
+use time::format_description::BorrowedFormatItem;
+use time::macros::format_description;
+use time::{OffsetDateTime, UtcOffset};
 
 use crate::sip::uri::sip_uri_user_part;
 
@@ -42,7 +45,11 @@ impl Direction {
 pub struct CallRecord {
     /// Row id; zero before the row has been inserted.
     pub id: i64,
-    pub account_id: i64,
+    /// The account the call belongs to — the account's UUID.
+    ///
+    /// The C++ stores pjsip's integer account id here. This app has
+    /// no pjsip and its accounts are UUIDs, so the column is text.
+    pub account_id: String,
     /// The SIP call id.
     pub call_id: String,
     pub direction: Direction,
@@ -82,7 +89,7 @@ impl CallRecord {
     /// drift apart.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        account_id: i64,
+        account_id: impl Into<String>,
         call_id: impl Into<String>,
         direction: Direction,
         remote_uri: impl Into<String>,
@@ -102,7 +109,7 @@ impl CallRecord {
         };
         Self {
             id: 0,
-            account_id,
+            account_id: account_id.into(),
             call_id: call_id.into(),
             direction,
             remote_number,
@@ -126,7 +133,7 @@ impl CallRecord {
     /// call is *not* the To-URI.
     #[allow(clippy::too_many_arguments)]
     pub fn from_incoming(
-        account_id: i64,
+        account_id: impl Into<String>,
         call_id: impl Into<String>,
         caller_uri: impl Into<String>,
         dialed_number: impl Into<String>,
@@ -156,7 +163,7 @@ impl CallRecord {
     /// §5.3 — an outgoing call's remote party is the **callee**.
     #[allow(clippy::too_many_arguments)]
     pub fn from_outgoing(
-        account_id: i64,
+        account_id: impl Into<String>,
         call_id: impl Into<String>,
         callee_uri: impl Into<String>,
         remote_name: impl Into<String>,
@@ -187,7 +194,7 @@ impl CallRecord {
     /// A missed call is an incoming call that was never answered, so
     /// the remote party is the caller.
     pub fn missed(
-        account_id: i64,
+        account_id: impl Into<String>,
         call_id: impl Into<String>,
         caller_uri: impl Into<String>,
         dialed_number: impl Into<String>,
@@ -209,6 +216,201 @@ impl CallRecord {
         record.dialed_number = dialed_number.into();
         record
     }
+
+    /// The number a redial must use — §5.1.
+    ///
+    /// The **dialled** number, not the remote number: for a
+    /// DID-forwarded call the remote party is the PBX that forwarded
+    /// it, and dialling the PBX back is not what the user means by
+    /// "call them back". The remote number is the fallback, for a row
+    /// that has no dialled number at all.
+    pub fn redial_target(&self) -> &str {
+        if self.dialed_number.is_empty() {
+            &self.remote_number
+        } else {
+            &self.dialed_number
+        }
+    }
+}
+
+/// The wall-clock time of a call: `03:12`.
+const TIME_FORMAT: &[BorrowedFormatItem<'_>] = format_description!("[hour]:[minute]");
+
+/// When a call happened: `28 Oct 2026, 03:12`.
+const STAMP_FORMAT: &[BorrowedFormatItem<'_>] =
+    format_description!("[day] [month repr:short] [year], [hour]:[minute]");
+
+/// The local time, for the history's timestamps.
+///
+/// The offset is resolved once and reused: asking the operating system
+/// for every row of every frame would be silly. When the system will
+/// not say — a locked-down environment, a container with no timezone —
+/// UTC is used, which is at least unambiguous.
+///
+/// The C++ shows local time (`QDateTime::toString`), so this does too:
+/// a call history three hours out is a bug report waiting to happen.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalTime {
+    offset: UtcOffset,
+}
+
+impl Default for LocalTime {
+    fn default() -> Self {
+        Self {
+            offset: UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC),
+        }
+    }
+}
+
+impl LocalTime {
+    /// The time of day: `03:12`.
+    pub fn time(&self, epoch_ms: i64) -> String {
+        self.at(epoch_ms).format(TIME_FORMAT).unwrap_or_default()
+    }
+
+    /// The date and the time of day: `28 Oct 2026, 03:12`.
+    pub fn stamp(&self, epoch_ms: i64) -> String {
+        self.at(epoch_ms).format(STAMP_FORMAT).unwrap_or_default()
+    }
+
+    fn at(&self, epoch_ms: i64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp_nanos(epoch_ms as i128 * 1_000_000)
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+            .to_offset(self.offset)
+    }
+}
+
+/// How long a call lasted: `0:42`, or `1:02:03` for the long ones.
+///
+/// A call with no duration shows as `—`, the way the C++'s dialer does
+/// for a missed call.
+pub fn format_duration(seconds: i64) -> String {
+    if seconds <= 0 {
+        return "—".to_string();
+    }
+    let (hours, minutes, secs) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{secs:02}")
+    } else {
+        format!("{minutes}:{secs:02}")
+    }
+}
+
+/// How a finished call ended.
+///
+/// The C++ computes this from the record with
+/// `HistoryModel::classifyResult`; the names are the same so the
+/// badge in the history list reads the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallResult {
+    /// The call was answered and lasted.
+    Completed,
+    /// An incoming call that was never answered.
+    Missed,
+    /// The local side hung up before the call was answered.
+    Cancelled,
+    /// The other side was busy.
+    Busy,
+    /// The other side did not answer.
+    NoAnswer,
+    /// The other side refused the call.
+    Rejected,
+    /// Anything else.
+    Failed,
+}
+
+impl CallResult {
+    /// The short label the history list shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            CallResult::Completed => "OK",
+            CallResult::Missed => "Missed",
+            CallResult::Cancelled => "Cancelled",
+            CallResult::Busy => "Busy",
+            CallResult::NoAnswer => "No answer",
+            CallResult::Rejected => "Rejected",
+            CallResult::Failed => "Failed",
+        }
+    }
+}
+
+/// Classify a finished call — the port of the C++'s
+/// `HistoryModel::classifyResult`.
+///
+/// The order matters and is the C++'s: a missed call is missed
+/// whatever else is true of it, an answered call that lasted is
+/// completed, and everything else is read off the SIP status code.
+pub fn classify_result(
+    direction: Direction,
+    sip_code: i32,
+    duration_sec: i64,
+    answered: bool,
+    hangup_cause: &str,
+) -> CallResult {
+    if direction == Direction::Missed {
+        return CallResult::Missed;
+    }
+    if answered && duration_sec > 0 {
+        return CallResult::Completed;
+    }
+    // A local hangup before the answer → cancelled.
+    let cause = hangup_cause.to_ascii_lowercase();
+    if !answered
+        && duration_sec == 0
+        && (cause.contains("user") || cause.contains("local") || sip_code == 0)
+    {
+        return CallResult::Cancelled;
+    }
+    // 4xx / 5xx / 6xx — a failure of some kind.
+    if sip_code >= 400 {
+        if sip_code == 486 {
+            return CallResult::Busy;
+        }
+        if sip_code == 487 {
+            return CallResult::Cancelled;
+        }
+        if sip_code == 408 {
+            return CallResult::NoAnswer;
+        }
+        if sip_code == 480 || sip_code == 486 {
+            return CallResult::Busy;
+        }
+        if sip_code == 401 || sip_code == 403 || sip_code == 407 {
+            return CallResult::Rejected;
+        }
+        if sip_code == 603 {
+            return CallResult::Rejected;
+        }
+        return CallResult::Failed;
+    }
+    // An outgoing call that never connected and never got a code.
+    if direction == Direction::Outgoing && !answered {
+        return CallResult::Failed;
+    }
+    // Completed-ish but no duration — a local hangup right after the
+    // answer.
+    CallResult::Cancelled
+}
+
+/// The direction a finished call is stored under.
+///
+/// An incoming call that was never answered is **missed** — that is
+/// what the "missed" chip in the history list counts, and what the
+/// missed-call badge is for.
+///
+/// A call **we** declined is not missed: the user was there and said
+/// no. The decline leaves a `603` on the call, so that is how the two
+/// are told apart.
+///
+/// The C++ has the capability — `CallHistory::recordMissed` — but
+/// never calls it, so its unanswered incoming calls are stored as
+/// plain "incoming" and classify as "cancelled".
+pub fn history_direction(direction: Direction, answered: bool, sip_code: i32) -> Direction {
+    if direction == Direction::Incoming && !answered && sip_code != 603 {
+        return Direction::Missed;
+    }
+    direction
 }
 
 #[cfg(test)]
@@ -220,7 +422,7 @@ mod tests {
         // §5.3. The PBX forwards sip:6666@host to our AOR
         // sip:104@host. The history row has to show 6666.
         let record = CallRecord::from_incoming(
-            1,
+            "acct-1",
             "call-1",
             "sip:6666@193.178.169.164",
             "6666",
@@ -242,7 +444,7 @@ mod tests {
         // itself as asterisk, but the customer dialled 6666. History
         // stores both, and redial uses the dialled number.
         let record = CallRecord::from_incoming(
-            1,
+            "acct-1",
             "call-did",
             "sip:asterisk@193.178.169.164",
             "6666",
@@ -261,7 +463,7 @@ mod tests {
     #[test]
     fn outgoing_history_stores_the_callee() {
         let record = CallRecord::from_outgoing(
-            1,
+            "acct-1",
             "call-2",
             "sip:6666@193.178.169.164",
             "",
@@ -280,7 +482,8 @@ mod tests {
 
     #[test]
     fn a_missed_call_is_an_incoming_call() {
-        let record = CallRecord::missed(1, "call-3", "sip:6666@host", "6666", "Alice", 1_000);
+        let record =
+            CallRecord::missed("acct-1", "call-3", "sip:6666@host", "6666", "Alice", 1_000);
         assert_eq!(record.direction, Direction::Missed);
         assert_eq!(record.remote_number, "6666");
         assert_eq!(record.dialed_number, "6666");
@@ -289,9 +492,116 @@ mod tests {
     }
 
     #[test]
+    fn redial_uses_the_dialled_number_not_the_remote_party() {
+        // §5.1. A DID-forwarded call: the remote party is the PBX
+        // that forwarded it, and redialing the PBX is not what the
+        // user means by "call them back".
+        let record = CallRecord::from_incoming(
+            "acct-1",
+            "call-did",
+            "sip:asterisk@193.178.169.164",
+            "6666",
+            "",
+            1_000,
+            2_000,
+            200,
+            "Normal",
+            true,
+        );
+        assert_eq!(record.redial_target(), "6666");
+
+        // With no dialled number at all, the remote number is the
+        // fallback.
+        let mut plain = record.clone();
+        plain.dialed_number = String::new();
+        assert_eq!(plain.redial_target(), "asterisk");
+    }
+
+    #[test]
+    fn the_result_classification_follows_the_cpp() {
+        // The port of `HistoryModel::classifyResult`, case by case.
+        assert_eq!(
+            classify_result(Direction::Missed, 0, 0, false, ""),
+            CallResult::Missed
+        );
+        assert_eq!(
+            classify_result(Direction::Incoming, 200, 30, true, "Normal"),
+            CallResult::Completed
+        );
+        assert_eq!(
+            classify_result(Direction::Outgoing, 0, 0, false, "USER"),
+            CallResult::Cancelled
+        );
+        assert_eq!(
+            classify_result(Direction::Outgoing, 0, 0, false, "local"),
+            CallResult::Cancelled
+        );
+        assert_eq!(
+            classify_result(Direction::Outgoing, 486, 0, false, "Busy"),
+            CallResult::Busy
+        );
+        assert_eq!(
+            classify_result(Direction::Outgoing, 480, 0, false, ""),
+            CallResult::Busy
+        );
+        assert_eq!(
+            classify_result(Direction::Outgoing, 487, 0, false, ""),
+            CallResult::Cancelled
+        );
+        assert_eq!(
+            classify_result(Direction::Outgoing, 408, 0, false, ""),
+            CallResult::NoAnswer
+        );
+        for code in [401, 403, 407, 603] {
+            assert_eq!(
+                classify_result(Direction::Outgoing, code, 0, false, ""),
+                CallResult::Rejected,
+                "code {code}"
+            );
+        }
+        assert_eq!(
+            classify_result(Direction::Outgoing, 500, 0, false, ""),
+            CallResult::Failed
+        );
+        assert_eq!(
+            classify_result(Direction::Outgoing, 404, 0, false, ""),
+            CallResult::Failed
+        );
+        // An outgoing call that never connected and never got a code.
+        assert_eq!(
+            classify_result(Direction::Outgoing, 200, 0, false, ""),
+            CallResult::Failed
+        );
+    }
+
+    #[test]
+    fn an_unanswered_incoming_call_is_missed_but_a_decline_is_not() {
+        // The caller rang, nobody picked up → missed.
+        assert_eq!(
+            history_direction(Direction::Incoming, false, 0),
+            Direction::Missed
+        );
+        // We declined it — the user was there and said no.
+        assert_eq!(
+            history_direction(Direction::Incoming, false, 603),
+            Direction::Incoming
+        );
+        // An answered call is never missed.
+        assert_eq!(
+            history_direction(Direction::Incoming, true, 200),
+            Direction::Incoming
+        );
+        // An outgoing call is never missed.
+        assert_eq!(
+            history_direction(Direction::Outgoing, false, 0),
+            Direction::Outgoing
+        );
+    }
+
+    #[test]
     fn the_remote_number_is_never_the_angle_bracket_junk() {
         let record = CallRecord::from_incoming(
-            1,
+            "acct-1",
             "call-4",
             "<sip:6666@host>",
             "6666",
@@ -308,7 +618,7 @@ mod tests {
     #[test]
     fn duration_is_derived_from_the_timestamps() {
         let record = CallRecord::from_incoming(
-            1,
+            "acct-1",
             "call-5",
             "sip:6666@host",
             "6666",

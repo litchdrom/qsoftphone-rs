@@ -40,7 +40,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 rusqlite = { version = "0.41", features = ["bundled"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+# `macros` is for `format_description!`; `local-offset` is for the
+# history's wall-clock timestamps — the C++ shows local time, and a
+# call history three hours out is a bug report waiting to happen.
+# `local-offset` costs one package on Unix (`num_threads`); the
+# Windows tree is unchanged.
+time = { version = "0.3", features = [
+    "formatting",
+    "parsing",
+    "serde",
+    "macros",
+    "local-offset",
+] }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 rsipstack = { version = "0.7", default-features = false, features = [

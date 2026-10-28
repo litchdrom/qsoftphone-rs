@@ -36,7 +36,7 @@ use tracing::warn;
 use qsoftphone_core::model::account::Account;
 use qsoftphone_core::model::call_event::{CallEvent, CallEventType, Direction};
 use qsoftphone_core::sip::identity;
-use qsoftphone_core::sip::uri::{normalise_sip_target, sip_uri_user_part};
+use qsoftphone_core::sip::uri::normalise_sip_target;
 
 use crate::endpoint::split_host_port;
 use crate::sdp;
@@ -223,7 +223,11 @@ impl CallManager {
         event.call_id = call_id.clone();
         event.call_direction = Some(Direction::Outgoing);
         event.caller = account.user.clone();
-        event.callee = sip_uri_user_part(&target_uri);
+        // The C++'s `CallEvent` carries the **URI** of the peer, not
+        // its user-part: `Application.cpp` runs `sipUriUserPart()` over
+        // `ev.callee` to get the number. The history row needs the
+        // full URI (§5.3), and the UI shows the user-part.
+        event.callee = target_uri.clone();
         event.call_state = "initiating".to_string();
         self.bus.publish(account_id, event);
 
@@ -681,8 +685,10 @@ fn fill_identity(
     }
     let allowed = profile.filter_headers(&captured);
 
-    event.caller = sip_uri_user_part(&caller_uri);
-    event.callee = sip_uri_user_part(&callee_uri);
+    // The peer's URI, as the C++'s `CallEvent` carries it — the
+    // history row wants the full URI and derives the number from it.
+    event.caller = caller_uri.clone();
+    event.callee = callee_uri.clone();
     event.headers = allowed.clone();
     event.caller_id = identity::resolve_caller_display_name(
         &profile,

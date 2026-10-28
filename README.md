@@ -100,8 +100,8 @@ The brief asks for a resolved tree under ~250 crates, assuming
 rsipstack would be the bulk at 134.
 
 **Measured, the real number is 305 package names** for the Windows target
-(384 for Linux, which adds X11/Wayland/ALSA). Three of those are this
-workspace's own crates, so 302 and 381 are third-party packages. The gap
+(385 for Linux, which adds X11/Wayland/ALSA). Three of those are this
+workspace's own crates, so 302 and 382 are third-party packages. The gap
 is not bloat — it is two subtrees the brief's estimate did not account
 for:
 
@@ -130,6 +130,13 @@ dependency set rather than a moving target.
 last M1 commit) and for the M2 tree is identical — same package names,
 same versions. The call layer is built on rsipstack's dialog API, which
 was already there.
+
+**M3 added one package, on Linux only.** The history shows the wall-clock
+time of a call, and the C++ shows local time, so the `time` crate's
+`local-offset` feature is enabled. It needs `num_threads` — on Unix
+only, because that is where the local offset can change under a running
+program. The Windows tree is **unchanged**: 304 package names before,
+304 after. `time-macros` was already in the tree.
 
 **What was trimmed.** `rsipstack` is built with `default-features = false`
 and only `platform-tokio`, `std` and `rustls` enabled:
@@ -642,6 +649,79 @@ dialled are resolved when the INVITE arrives:
 
 ---
 
+## M3 — History
+
+### What happens
+
+When a call ends, the app writes one row to the `calls` table, and the
+history page shows it. The page is a search box, a row of direction
+chips and the list. Each row shows the number, how long the call
+lasted, when it happened and the SIP status code; expanding it shows
+the full URI, the cause and the exact timestamps. The expanded row has
+a **Redial** button.
+
+### The semantics are §5.3's
+
+* `remote_number` is the **peer's** user-part — the caller for an
+  incoming call, the callee for an outgoing one. Never our own
+  extension.
+* `remote_uri` is the peer's URI on both sides. The event carries it:
+  the C++'s `CallEvent` has `caller` and `callee` as **URIs**, and
+  `Application.cpp` runs `sipUriUserPart()` over them to get the
+  number. This tree had them as user-parts, which is enough to show a
+  number but not enough for a history row — so they are URIs now, and
+  the UI shows the user-part, exactly as before.
+* `dialed_number` is the resolved dialled number (§5.1), and it is
+  what a redial uses. For a DID-forwarded call the remote party is
+  the PBX that forwarded it, and dialling the PBX back is not what the
+  user means by "call them back".
+
+An incoming call that was never answered is stored as **missed**. The
+C++ has the capability — `CallHistory::recordMissed` — but never calls
+it, so its unanswered incoming calls land as plain "incoming" and
+classify as "cancelled". A call **we** declined is not missed: the
+user was there and said no, and the decline leaves a `603` behind.
+
+### The result badge is the C++'s
+
+`classify_result` is the port of `HistoryModel::classifyResult`, case
+by case: a missed call is missed; an answered call that lasted is
+completed; a local hangup before the answer is cancelled; and the rest
+is read off the SIP status code — 486 is busy, 487 cancelled, 408 no
+answer, 401/403/407/603 rejected, everything else 4xx and 5xx failed.
+
+### The search
+
+The C++ filters with a case-insensitive substring over the remote
+number, the remote URI, the remote name and the hangup cause, and it
+matches the SIP status code exactly — so "486" finds every busy call.
+That is `HistoryStore::search`, and the direction chips narrow it
+further. A `%` or a `_` in the search is a literal, not a wildcard.
+
+### The database work is never on the UI thread
+
+§6 says no blocking in the UI thread, ever, and SQLite is blocking
+I/O. The UI does not touch the database for the history: it sends a
+command over a channel, a task on the runtime does the work on tokio's
+blocking pool, and the answer comes back over another channel and is
+drained at the top of the frame (§3).
+
+The account CRUD still runs on the UI thread. It is M0's code, and it
+is one row on a button press rather than a query per keystroke — but
+it is blocking I/O, and it should move to the same worker. It has not.
+
+### What is *not* in M3
+
+* **No recording.** The `recorded` column is there and always false.
+* **No per-account filter.** Every row in the database is on the page.
+  The account is stored with the row; filtering by it belongs with the
+  rest of the settings, in M6.
+* **No contact matching in the UI.** The rule is ported and tested in
+  core (`Contacts::best_match_for_phone`, the seven-digit suffix of
+  §5.2), but nothing calls it from the history yet.
+
+---
+
 | | Windows | Linux | macOS |
 |---|---|---|---|
 | config | `%APPDATA%\qsoftphone\config.json` | `$XDG_CONFIG_HOME/qsoftphone/config.json` | `~/Library/Application Support/qsoftphone/config.json` |
@@ -653,8 +733,11 @@ the level from the settings file. Every line carries the account id,
 and call lines carry the call id — see
 [Logging (§6)](#logging-6).
 
-SQLite databases live in the data directory: `accounts.sqlite`,
-`history.sqlite`, `contacts.sqlite`.
+SQLite lives in one file in the data directory: `accounts.sqlite`, with
+the `accounts`, `contacts` and `calls` tables. The C++ keeps three
+files (`accounts.sqlite`, `history.sqlite`, `contacts.sqlite`); there
+is no reason for the split here, and `AppPaths` still knows the other
+two paths for when there is.
 
 ---
 
@@ -685,12 +768,12 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M0** | Workspace, pinned dependencies, tracing, config load/save, account CRUD in SQLite, the SIP pure functions with their tests | **done** |
 | **M1** | Registration: rsipstack transport, digest auth (MD5 + SHA-256), register/unregister, registration state surfaced to the UI | **done** |
 | **M2** | Calling: outbound INVITE, inbound INVITE with automatic 180 Ringing (§5.4), answer, decline, hang up without a forced code (§5.5), DTMF | **done** |
-| M3 | History: SQLite persistence with the §5.3 semantics, redial using the resolved dialled number (§5.1), searchable list in the UI | next |
-| M4 | Media: `rtc` RTP + `cpal` audio — SDP negotiation, send/receive audio, mute, codec selection | |
+| **M3** | History: SQLite persistence with the §5.3 semantics, redial using the resolved dialled number (§5.1), searchable list in the UI | **done** |
+| M4 | Media: `rtc` RTP + `cpal` audio — SDP negotiation, send/receive audio, mute, codec selection | next |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
-One milestone at a time; M2 does not start before M1 works end to end.
+One milestone at a time; M3 does not start before M2 works end to end.
 
 ### Backlog — low priority
 
@@ -701,7 +784,7 @@ none of them is lost and none of them disturbs the order above.
 |---|---|---|
 | **Codec selection per account** | M4 | M4 already has "codec selection". What is missing is that it is **per account**: one account may only speak PCMU, another only PCMA. `AccountProfile` has no codec field yet, and the account editor has no control for one. |
 | **Media device selection, in the main settings** | M4, the page in M6 | The device list comes from `cpal`, so it cannot exist before the media plane. It is an **app-level** setting, not a per-account one — one microphone and one speaker for the whole window — so it belongs in `AppConfig`'s `AudioConfig`, which already holds the volumes and the ringtone. The picker itself is M4 (it has to open the streams); the settings page it lives on is M6, which has to build that page anyway. |
-| **Expandable history, with the call time and the SIP code** | M3 | The **data** is already there: the `calls` table has `duration_sec`, `sip_code` and `hangup_cause`, and `HistoryStore` writes and reads all three. What is missing is the **UI** — a row that expands to show how long the call lasted, the final SIP status code and the cause, next to the searchable list M3 already has to build. |
+| **Expandable history, with the call time and the SIP code** | **done in M3** | The **data** was already there: the `calls` table has `duration_sec`, `sip_code` and `hangup_cause`. The UI was the missing part, and M3 has it: the history page's row shows the number, the duration, the time and the SIP status code, and expands to the full URI, the cause and the exact timestamps. |
 | **NAT traversal for the media plane** | M4 | The signalling side already does what it can: the public `Contact` is learned from the `received`/`rport` the registrar echoes (RFC 3581), the binding is refreshed before it expires, and Asterisk's OPTIONS keepalive is answered. The **RTP** side has nothing yet. At the very least the SDP has to carry the NAT-mapped port and the stack has to accept the symmetric RTP a NAT sends back from a different source port; beyond that, `rtc` 0.21.1 already ships `ice`, `stun` and `turn` as unconditional dependencies, so full ICE with host/srflx/relay candidates is available without adding a crate. |
 | **Configurable, playable ring tone for incoming calls, in the main settings** | M6 | The config keys are already there: `audio.ringtone_file` (empty = the bundled default) and `audio.ringtone_volume`. What is missing is the **player** — nothing opens a sound card yet — and the **Settings → Audio** page: a file picker, a volume slider and a preview. The C++ reference is `RingtonePlayer`. |
 | **A generated ring tone when a call is ringing and there is no media** | M4 | A **synthesised** tone, not a file: it starts on 180 Ringing when there is no RTP to carry audio, so an incoming call still rings audibly before the media plane exists. It needs a sound card, not RTP — the one item on this list that could be pulled forward. |
@@ -742,7 +825,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 160 tests, all passing.
+* `cargo test --workspace` — 173 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -811,6 +894,25 @@ player lands.
   `WWW-Authenticate` challenge; the client retries with an
   `Authorization` header, and the test verifies the digest against the
   account's password with rsipstack's own verifier.
+* **A finished call lands in the database.** The test drives the
+  events — the call comes in, it is answered, it ends — and then waits
+  for the history worker to write the row and answer with it. The row
+  is checked against §5.3: the peer is `6666`, the URI is
+  `sip:6666@sip.example.com`, the direction is incoming, the call is
+  answered and the SIP code is `200`.
+* **An unanswered incoming call is stored as missed**, and a call that
+  was answered is not.
+* **A redial dials the dialled number.** The test builds the row the
+  way a DID-forwarded call makes it — the remote party is the PBX, the
+  dialled number is the customer — and asserts that the redial targets
+  `6666` and not `asterisk`.
+* **The search finds what it should.** Case-insensitively over the
+  number, the URI and the name; "486" finds the busy call by its SIP
+  code; the direction chips narrow it; and a `%` in the search is a
+  literal, not a wildcard.
+* **A database written by the old schema still takes the account's
+  UUID.** There are databases on disk with `account_id INTEGER`; the
+  test opens one, writes a row and reads it back.
 
 **Verified against a real Asterisk:**
 
@@ -844,7 +946,7 @@ player lands.
   normal resolution — this machine's desktop was locked for most of
   the build, and the screenshots were taken when it was not.
 * The Linux build has not been compiled or run. The dependency tree is
-  resolved for `x86_64-unknown-linux-gnu` (384 package names) but no
+  resolved for `x86_64-unknown-linux-gnu` (385 package names) but no
   Linux binary was produced.
 * The SIP domain is not applied to the From/To URI — M6, as noted
   above.
