@@ -5,12 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The media plane of the softphone: RTP, G.711 and the sound card."
+description = "The media plane of the softphone: RTP, G.711, G.722 and the sound card."
 
 [dependencies]
 # `bytes` is what `rtc-rtp` packs the RTP payload into. It is already in
 # the tree — `rtc-rtp` depends on it — so naming it here adds no package.
 bytes = "1.12"
 cpal = { workspace = true }
+# The G.722 codec. It is a Rust port of the CMU 1993 implementation — the
+# same code lineage as SpanDSP's g722enc/g722dec and Asterisk's
+# codec_g722.c — and it was checked against the reference vectors that
+# ship with sippy/libg722. It brings `nanoaudio-core` (shared types) and
+# `wide` (the SIMD helpers) with it.
+nanoaudio-g722 = "0.1.1"
 rtc = { workspace = true }
 tracing = { workspace = true }

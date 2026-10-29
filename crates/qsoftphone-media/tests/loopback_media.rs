@@ -6,6 +6,8 @@
 //! * the port in the SDP is the port the socket is bound to;
 //! * a G.711 frame that goes into the outbound queue comes out of
 //!   the peer's inbound queue, decoded;
+//! * the same is true of G.722, which is a different codec with a
+//!   different frame size and a decoder that keeps a state;
 //! * a muted microphone sends silence, and the silence is what the
 //!   peer hears;
 //! * the RTP clock keeps moving while the microphone is muted, so the
@@ -20,7 +22,15 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Two sessions, each pointed at the other.
 fn pair() -> (MediaSession, MediaSession) {
-    let config = MediaConfig::default();
+    pair_with(Codec::Pcmu)
+}
+
+/// Two sessions that speak one codec, each pointed at the other.
+fn pair_with(codec: Codec) -> (MediaSession, MediaSession) {
+    let config = MediaConfig {
+        codecs: vec![codec],
+        ..MediaConfig::default()
+    };
     let caller = MediaSession::new(&config).expect("a session");
     let callee = MediaSession::new(&config).expect("a session");
 
@@ -54,6 +64,12 @@ fn wait_for_samples(session: &MediaSession, wanted: usize) -> Vec<i16> {
     }
 }
 
+/// A frame of silence, in the codec's own encoding.
+fn silence(codec: Codec) -> Vec<u8> {
+    let mut encoder = codec.encoder();
+    encoder.encode_silence()
+}
+
 #[test]
 fn the_port_in_the_sdp_is_the_port_that_is_bound() {
     let (caller, callee) = pair();
@@ -75,7 +91,7 @@ fn a_frame_goes_from_one_session_to_the_other() {
     let pcm: Vec<i16> = (0..160)
         .map(|i| ((i as f32 / 160.0) * 8000.0) as i16)
         .collect();
-    let frame = Codec::Pcmu.encode(&pcm);
+    let frame = Codec::Pcmu.encoder().encode(&pcm);
     caller.audio_state().push_outbound(frame);
 
     let received = wait_for_samples(&callee, 160);
@@ -97,6 +113,40 @@ fn a_frame_goes_from_one_session_to_the_other() {
 }
 
 #[test]
+fn a_wideband_frame_goes_from_one_session_to_the_other() {
+    // The same thing with G.722: 320 samples in, 160 bytes on the
+    // wire, 320 samples out.
+    let (caller, callee) = pair_with(Codec::G722);
+    assert_eq!(caller.codec(), Codec::G722);
+    caller.start_transport();
+    callee.start_transport();
+
+    let pcm: Vec<i16> = (0..320)
+        .map(|i| ((i as f32 / 320.0) * 8000.0) as i16)
+        .collect();
+    let frame = Codec::G722.encoder().encode(&pcm);
+    assert_eq!(frame.len(), 160);
+    caller.audio_state().push_outbound(frame);
+
+    let received = wait_for_samples(&callee, 320);
+    assert!(
+        received.len() >= 320,
+        "the frame did not arrive: {} samples",
+        received.len()
+    );
+
+    // The synthesis filter delays the signal by 22 samples, so the
+    // ramp is compared from there on.
+    for (index, sample) in received.iter().skip(22).take(100).enumerate() {
+        let expected = pcm[index];
+        assert!(
+            (sample - expected).abs() < 1200,
+            "sample {index}: expected {expected}, heard {sample}"
+        );
+    }
+}
+
+#[test]
 fn a_muted_microphone_sends_silence() {
     let (caller, callee) = pair();
     caller.set_mic_muted(true);
@@ -105,8 +155,7 @@ fn a_muted_microphone_sends_silence() {
 
     // The muted microphone still sends: the frame is the codec's
     // silence code.
-    let frame = Codec::Pcmu.silence_frame(160);
-    caller.audio_state().push_outbound(frame);
+    caller.audio_state().push_outbound(silence(Codec::Pcmu));
 
     let received = wait_for_samples(&callee, 160);
     assert!(received.len() >= 160, "{} samples", received.len());
@@ -128,9 +177,7 @@ fn the_rtp_clock_keeps_moving_while_the_microphone_is_muted() {
     callee.start_transport();
 
     for _ in 0..5 {
-        caller
-            .audio_state()
-            .push_outbound(Codec::Pcmu.silence_frame(160));
+        caller.audio_state().push_outbound(silence(Codec::Pcmu));
         std::thread::sleep(Duration::from_millis(20));
     }
 
@@ -149,9 +196,7 @@ fn a_stopped_session_sends_nothing_more() {
     caller.start_transport();
     callee.start_transport();
 
-    caller
-        .audio_state()
-        .push_outbound(Codec::Pcmu.silence_frame(160));
+    caller.audio_state().push_outbound(silence(Codec::Pcmu));
     assert!(wait_for_samples(&callee, 160).len() >= 160);
 
     caller.stop();
@@ -171,9 +216,7 @@ fn a_session_without_a_peer_keeps_the_socket_open() {
     session.start_transport();
 
     // Nothing is sent, because there is nowhere to send it.
-    session
-        .audio_state()
-        .push_outbound(Codec::Pcmu.silence_frame(160));
+    session.audio_state().push_outbound(silence(Codec::Pcmu));
     std::thread::sleep(Duration::from_millis(100));
 
     assert_eq!(session.local_port(), port);

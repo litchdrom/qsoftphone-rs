@@ -2,13 +2,13 @@
 //!
 //! ## The rates do not match
 //!
-//! G.711 is 8 kHz, always. A sound card is 44.1 or 48 kHz, almost
-//! always — and it will not open at 8 kHz, because the format the
-//! driver advertises is the one it wants. So the audio has to be
-//! converted twice on every call:
+//! The codec runs at 8 kHz (G.711) or 16 kHz (G.722). A sound card is
+//! 44.1 or 48 kHz, almost always — and it will not open at 8 kHz,
+//! because the format the driver advertises is the one it wants. So
+//! the audio has to be converted twice on every call:
 //!
-//! * **Capture** — 48 kHz down to 8 kHz, then encoded to G.711.
-//! * **Playback** — G.711 decoded to 8 kHz, then up to 48 kHz.
+//! * **Capture** — 48 kHz down to the codec's rate, then encoded.
+//! * **Playback** — decoded to the codec's rate, then up to 48 kHz.
 //!
 //! Both directions are done by the [`Resampler`] below. The down
 //! direction gets a crude low-pass for free: when the ratio is a
@@ -33,7 +33,7 @@
 //! refusal.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -42,9 +42,6 @@ use cpal::{Device, Host, SampleFormat, Stream, StreamConfig};
 
 use crate::codec::Codec;
 use crate::rtp::FRAME_SAMPLES;
-
-/// The rate G.711 runs at.
-pub const CODEC_RATE: u32 = 8000;
 
 /// How many frames of audio may pile up on the way out.
 ///
@@ -56,14 +53,10 @@ const MAX_OUTBOUND_FRAMES: usize = 20;
 ///
 /// A hundred frames is two seconds. A peer that sends faster than we
 /// play is either ahead of us or flooding us, and either way the
-/// oldest audio is the least useful.
+/// oldest audio is the least useful. The queue holds samples and not
+/// frames, and G.722 has twice as many samples in a frame — so the
+/// bound follows the codec, see [`AudioState::set_frame_samples`].
 const MAX_INBOUND_FRAMES: usize = 100;
-
-/// The same bound, in samples.
-///
-/// The queue holds samples, not frames: a frame is 160 of them, and
-/// the bound has to be in the unit the queue is measured in.
-const MAX_INBOUND_SAMPLES: usize = MAX_INBOUND_FRAMES * FRAME_SAMPLES;
 
 /// What went wrong with the sound card.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,11 +136,11 @@ pub fn devices() -> Vec<DeviceInfo> {
 /// The state the audio threads and the media session share.
 #[derive(Debug)]
 pub struct AudioState {
-    /// The G.711 frames waiting to be sent.
+    /// The encoded frames waiting to be sent.
     outbound: Mutex<VecDeque<Vec<u8>>>,
     /// Woken when a frame is queued, or when the session stops.
     outbound_signal: Condvar,
-    /// The 8 kHz PCM waiting to be played.
+    /// The PCM waiting to be played, at the codec's rate.
     inbound: Mutex<VecDeque<i16>>,
     /// The microphone is muted.
     mic_muted: AtomicBool,
@@ -157,6 +150,12 @@ pub struct AudioState {
     mic_gain: AtomicU32,
     /// The speaker gain, as the bits of an `f32`.
     speaker_gain: AtomicU32,
+    /// How many samples one frame of the codec holds.
+    ///
+    /// G.711 frames are 160 samples and G.722 frames are 320, so the
+    /// bound of the inbound queue — two seconds of audio — is twice as
+    /// many samples for the wideband codec.
+    frame_samples: AtomicUsize,
 }
 
 impl Default for AudioState {
@@ -176,7 +175,26 @@ impl AudioState {
             speaker_muted: AtomicBool::new(false),
             mic_gain: AtomicU32::new(mic_gain.clamp(0.0, 1.0).to_bits()),
             speaker_gain: AtomicU32::new(speaker_gain.clamp(0.0, 1.0).to_bits()),
+            frame_samples: AtomicUsize::new(FRAME_SAMPLES),
         }
+    }
+
+    /// Tell the state how big a frame of the codec is.
+    ///
+    /// The bound of the inbound queue is two seconds of audio, and
+    /// that is a number of *samples* — so it depends on the codec.
+    pub fn set_frame_samples(&self, samples: usize) {
+        self.frame_samples.store(samples.max(1), Ordering::Relaxed);
+    }
+
+    /// How many samples one frame holds.
+    fn frame_samples(&self) -> usize {
+        self.frame_samples.load(Ordering::Relaxed)
+    }
+
+    /// How many samples may wait to be played.
+    fn max_inbound_samples(&self) -> usize {
+        MAX_INBOUND_FRAMES * self.frame_samples()
     }
 
     /// Mute or unmute the microphone.
@@ -275,11 +293,12 @@ impl AudioState {
         self.outbound.lock().expect("outbound lock").len()
     }
 
-    /// Queue 8 kHz PCM for playing.
+    /// Queue PCM for playing.
     pub(crate) fn push_inbound(&self, samples: &[i16]) {
         let mut queue = self.inbound.lock().expect("inbound lock");
+        let limit = self.max_inbound_samples();
         for sample in samples {
-            if queue.len() >= MAX_INBOUND_SAMPLES {
+            if queue.len() >= limit {
                 // The oldest audio is the least useful: a peer that
                 // sends faster than we play is either ahead of us or
                 // flooding us, and either way the old frames are worth
@@ -290,7 +309,7 @@ impl AudioState {
         }
     }
 
-    /// Take the next 8 kHz sample to play, if there is one.
+    /// Take the next sample to play, if there is one.
     pub(crate) fn pop_inbound(&self) -> Option<i16> {
         self.inbound.lock().expect("inbound lock").pop_front()
     }
@@ -472,47 +491,50 @@ impl_sample_conversion! {
           |v| v as f64;
 }
 
-/// The capture side: the device's samples become G.711 frames.
+/// The capture side: the device's samples become encoded frames.
 struct Capture {
     resampler: Resampler,
-    encoder: Encoder,
+    builder: FrameBuilder,
 }
 
-/// The playback side: the G.711 frames become the device's samples.
+/// The playback side: the decoded frames become the device's samples.
 struct Playback {
     resampler: Resampler,
 }
 
-/// Accumulates 8 kHz samples into whole G.711 frames.
-struct Encoder {
-    codec: Codec,
-    buffer: [i16; FRAME_SAMPLES],
+/// Accumulates the codec's samples into whole frames.
+///
+/// The frame is 20 ms of audio, and how many samples that is depends
+/// on the codec: 160 at 8 kHz, 320 at 16 kHz.
+struct FrameBuilder {
+    encoder: crate::codec::Encoder,
+    buffer: Vec<i16>,
     filled: usize,
 }
 
-impl Encoder {
+impl FrameBuilder {
     fn new(codec: Codec) -> Self {
         Self {
-            codec,
-            buffer: [0i16; FRAME_SAMPLES],
+            encoder: codec.encoder(),
+            buffer: vec![0i16; codec.frame_samples()],
             filled: 0,
         }
     }
 
     fn push(&mut self, sample: f32, state: &AudioState) {
+        // A muted microphone still sends: the RTP clock has to keep
+        // moving, or the peer thinks the stream died and tears the
+        // call down. What it sends is silence — and it goes through
+        // the encoder like any other frame, so an encoder that keeps
+        // state (G.722) stays in step with the decoder at the other
+        // end.
+        let sample = if state.mic_muted() { 0.0 } else { sample };
         let scaled = (sample * 32767.0).round().clamp(-32768.0, 32767.0);
         self.buffer[self.filled] = scaled as i16;
         self.filled += 1;
 
-        if self.filled == FRAME_SAMPLES {
-            // A muted microphone still sends: the RTP clock has to
-            // keep moving, or the peer thinks the stream died and
-            // tears the call down. What it sends is silence.
-            let frame = if state.mic_muted() {
-                self.codec.silence_frame(FRAME_SAMPLES)
-            } else {
-                self.codec.encode(&self.buffer)
-            };
+        if self.filled == self.buffer.len() {
+            let frame = self.encoder.encode(&self.buffer);
             state.push_outbound(frame);
             self.filled = 0;
         }
@@ -591,6 +613,117 @@ fn find_device(host: &Host, name: Option<&str>, input: bool) -> Option<Device> {
     })
 }
 
+/// The frequency of the test tone.
+const TONE_HZ: f64 = 440.0;
+
+/// How long the test tone lasts.
+const TONE_SECONDS: f64 = 0.4;
+
+/// Play a short tone through the speaker.
+///
+/// This is the "test sound" of the settings page: it says whether the
+/// speaker works, without anybody having to make a call. The tone is
+/// a sine of 440 Hz, a third of a second long, with a fade at each end
+/// so that it does not click.
+///
+/// It opens a device and waits for it, so it must **not** run on the
+/// interface thread (§6 of the brief).
+pub fn play_test_sound(name: Option<&str>) -> Result<(), AudioError> {
+    let host = cpal::default_host();
+    let device = find_device(&host, name, false)
+        .ok_or_else(|| AudioError::NoDevice("there is no speaker to open".to_string()))?;
+
+    let supported = device
+        .default_output_config()
+        .map_err(|e| AudioError::Backend(e.to_string()))?;
+    let rate = supported.sample_rate();
+    let config: StreamConfig = supported.config();
+    let format = supported.sample_format();
+
+    // The tone, in the device's own rate.
+    let count = (rate as f64 * TONE_SECONDS) as usize;
+    let step = 2.0 * std::f64::consts::PI * TONE_HZ / rate as f64;
+    let mut phase = 0.0f64;
+    let samples: Vec<f32> = (0..count)
+        .map(|i| {
+            let position = i as f64 / count.max(1) as f64;
+            // A fade of a twentieth of the tone at each end.
+            let envelope = (position * 20.0).min(1.0).min((1.0 - position) * 20.0);
+            let value = phase.sin() as f32 * 0.3 * envelope as f32;
+            phase += step;
+            value
+        })
+        .collect();
+
+    let tone = Tone { samples, index: 0 };
+    let stream = match format {
+        SampleFormat::I8 => build_tone_output::<i8>(&device, config, tone),
+        SampleFormat::I16 => build_tone_output::<i16>(&device, config, tone),
+        SampleFormat::I32 => build_tone_output::<i32>(&device, config, tone),
+        SampleFormat::I64 => build_tone_output::<i64>(&device, config, tone),
+        SampleFormat::U8 => build_tone_output::<u8>(&device, config, tone),
+        SampleFormat::U16 => build_tone_output::<u16>(&device, config, tone),
+        SampleFormat::U32 => build_tone_output::<u32>(&device, config, tone),
+        SampleFormat::U64 => build_tone_output::<u64>(&device, config, tone),
+        SampleFormat::F32 => build_tone_output::<f32>(&device, config, tone),
+        SampleFormat::F64 => build_tone_output::<f64>(&device, config, tone),
+        other => {
+            return Err(AudioError::UnsupportedFormat(format!(
+                "{other} is not a format this build can write"
+            )));
+        }
+    }?;
+
+    stream
+        .play()
+        .map_err(|e| AudioError::Backend(e.to_string()))?;
+
+    // The stream has to be kept alive while it plays, and the tone has
+    // to be heard: sleep for its length.
+    std::thread::sleep(Duration::from_secs_f64(TONE_SECONDS));
+
+    Ok(())
+}
+
+/// The tone, and how far into it the playback is.
+struct Tone {
+    samples: Vec<f32>,
+    index: usize,
+}
+
+impl Tone {
+    /// The next sample of the tone — silence once it is over.
+    fn next(&mut self) -> f32 {
+        let value = self.samples.get(self.index).copied().unwrap_or(0.0);
+        self.index += 1;
+        value
+    }
+}
+
+/// Build the output stream that plays the tone, for one sample format.
+fn build_tone_output<T: FromNormalised + cpal::SizedSample>(
+    device: &Device,
+    config: StreamConfig,
+    tone: Tone,
+) -> Result<Stream, AudioError> {
+    let mut tone = tone;
+
+    device
+        .build_output_stream::<T, _, _>(
+            config,
+            move |data: &mut [T], _| {
+                for slot in data.iter_mut() {
+                    *slot = T::from_normalised(tone.next());
+                }
+            },
+            |error| {
+                tracing::warn!(error = %error, "the speaker reported an error");
+            },
+            None,
+        )
+        .map_err(|e| AudioError::Backend(e.to_string()))
+}
+
 /// Open the microphone and start capturing.
 ///
 /// The capture starts immediately: the frames land in the outbound
@@ -616,9 +749,13 @@ pub fn open_microphone(
         .map(|d| d.name().to_string())
         .unwrap_or_else(|_| device.to_string());
 
+    // The queue is measured in frames, and a frame is as big as the
+    // codec's is.
+    state.set_frame_samples(codec.frame_samples());
+
     let capture = Capture {
-        resampler: Resampler::new(rate, CODEC_RATE),
-        encoder: Encoder::new(codec),
+        resampler: Resampler::new(rate, codec.sample_rate()),
+        builder: FrameBuilder::new(codec),
     };
 
     let stream = match format {
@@ -651,7 +788,14 @@ pub fn open_microphone(
 }
 
 /// Open the speaker and start playing.
-pub fn open_speaker(name: Option<&str>, state: Arc<AudioState>) -> Result<Speaker, AudioError> {
+///
+/// `codec` says what the incoming audio is: its rate is what the
+/// playback resamples from.
+pub fn open_speaker(
+    name: Option<&str>,
+    state: Arc<AudioState>,
+    codec: Codec,
+) -> Result<Speaker, AudioError> {
     let host = cpal::default_host();
     let device = find_device(&host, name, false)
         .ok_or_else(|| AudioError::NoDevice("there is no speaker to open".to_string()))?;
@@ -668,7 +812,7 @@ pub fn open_speaker(name: Option<&str>, state: Arc<AudioState>) -> Result<Speake
         .unwrap_or_else(|_| device.to_string());
 
     let playback = Playback {
-        resampler: Resampler::new(CODEC_RATE, rate),
+        resampler: Resampler::new(codec.sample_rate(), rate),
     };
 
     let stream = match format {
@@ -735,12 +879,12 @@ fn build_input<T: DeviceSample + cpal::SizedSample>(
         .map_err(|e| AudioError::Backend(e.to_string()))
 }
 
-/// The capture side: the device's samples become G.711 frames.
+/// The capture side: the device's samples become encoded frames.
 impl Capture {
     fn push(&mut self, mono: f32, state: &AudioState) {
         self.resampler.push(mono);
         while let Some(value) = self.resampler.next_output() {
-            self.encoder.push(value, state);
+            self.builder.push(value, state);
         }
     }
 }
@@ -772,7 +916,7 @@ fn build_output<T: FromNormalised + cpal::SizedSample>(
         .map_err(|e| AudioError::Backend(e.to_string()))
 }
 
-/// The playback side: the G.711 frames become the device's samples.
+/// The playback side: the decoded frames become the device's samples.
 impl Playback {
     /// The next sample for the speaker.
     ///
@@ -936,33 +1080,82 @@ mod tests {
     #[test]
     fn the_inbound_queue_is_bounded() {
         let state = AudioState::default();
-        state.push_inbound(&vec![0i16; MAX_INBOUND_SAMPLES + 500]);
-        assert_eq!(state.inbound_samples(), MAX_INBOUND_SAMPLES);
+        let limit = MAX_INBOUND_FRAMES * 160;
+        state.push_inbound(&vec![0i16; limit + 500]);
+        assert_eq!(state.inbound_samples(), limit);
+    }
+
+    #[test]
+    fn the_inbound_bound_follows_the_codec() {
+        // G.722 frames are twice as big, so two seconds of audio is
+        // twice as many samples.
+        let state = AudioState::default();
+        state.set_frame_samples(Codec::G722.frame_samples());
+        let limit = MAX_INBOUND_FRAMES * 320;
+        state.push_inbound(&vec![0i16; limit + 500]);
+        assert_eq!(state.inbound_samples(), limit);
     }
 
     #[test]
     fn a_muted_microphone_sends_silence() {
         let state = AudioState::default();
-        let mut encoder = Encoder::new(Codec::Pcma);
+        let mut builder = FrameBuilder::new(Codec::Pcma);
         state.set_mic_muted(true);
-        for _ in 0..FRAME_SAMPLES {
-            encoder.push(0.5, &state);
+        for _ in 0..160 {
+            builder.push(0.5, &state);
         }
         let frame = state.pop_outbound().expect("a frame");
-        assert_eq!(frame.len(), FRAME_SAMPLES);
+        assert_eq!(frame.len(), 160);
         assert!(frame.iter().all(|&b| b == 0xD5), "A-law silence");
     }
 
     #[test]
     fn a_loud_microphone_sends_the_voice() {
         let state = AudioState::default();
-        let mut encoder = Encoder::new(Codec::Pcma);
-        for _ in 0..FRAME_SAMPLES {
-            encoder.push(0.5, &state);
+        let mut builder = FrameBuilder::new(Codec::Pcma);
+        for _ in 0..160 {
+            builder.push(0.5, &state);
         }
         let frame = state.pop_outbound().expect("a frame");
-        assert_eq!(frame.len(), FRAME_SAMPLES);
+        assert_eq!(frame.len(), 160);
         assert!(frame.iter().any(|&b| b != 0xD5), "not silence");
+    }
+
+    #[test]
+    fn the_wideband_codec_makes_frames_of_its_own() {
+        // G.722 is 16 kHz: a frame is 320 samples and 160 bytes.
+        let state = AudioState::default();
+        let mut builder = FrameBuilder::new(Codec::G722);
+        for _ in 0..319 {
+            builder.push(0.5, &state);
+        }
+        assert!(state.pop_outbound().is_none(), "the frame is not full yet");
+
+        builder.push(0.5, &state);
+        let frame = state.pop_outbound().expect("a frame");
+        assert_eq!(frame.len(), 160);
+    }
+
+    #[test]
+    fn a_muted_wideband_microphone_sends_silence_too() {
+        // G.722 has no fixed silence code: the silence is what the
+        // encoder makes of a frame of zeros. What matters is that the
+        // frame is there and that it is quiet.
+        let state = AudioState::default();
+        state.set_mic_muted(true);
+        let mut builder = FrameBuilder::new(Codec::G722);
+        for _ in 0..320 {
+            builder.push(0.5, &state);
+        }
+        let frame = state.pop_outbound().expect("a frame");
+        assert_eq!(frame.len(), 160);
+
+        let mut decoder = Codec::G722.decoder();
+        let decoded = decoder.decode(&frame);
+        assert_eq!(decoded.len(), 320);
+        for sample in decoded {
+            assert!(sample.abs() < 64, "silence decoded to {sample}");
+        }
     }
 
     #[test]
@@ -972,7 +1165,7 @@ mod tests {
         state.push_inbound(&[1000, 1000, 1000]);
 
         let mut playback = Playback {
-            resampler: Resampler::new(CODEC_RATE, 48000),
+            resampler: Resampler::new(8000, 48000),
         };
         assert_eq!(playback.next(&state), 0.0);
         // The samples are still consumed: two of the three.

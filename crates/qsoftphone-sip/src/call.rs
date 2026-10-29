@@ -37,7 +37,7 @@ use qsoftphone_core::model::account::Account;
 use qsoftphone_core::model::call_event::{CallEvent, CallEventType, Direction};
 use qsoftphone_core::sip::identity;
 use qsoftphone_core::sip::uri::normalise_sip_target;
-use qsoftphone_media::{MediaConfig, MediaSession, MediaStatus};
+use qsoftphone_media::{Codec, MediaConfig, MediaSession, MediaStatus};
 
 use crate::endpoint::split_host_port;
 use crate::sdp;
@@ -310,6 +310,19 @@ impl CallManager {
             1,
             &media_config.codecs,
         );
+
+        // The answer settled on one of the formats the offer listed —
+        // and the media has to speak that one. Without this the
+        // session would keep the first codec of the list and send it
+        // under the wrong payload type, and the peer would hear
+        // nothing at all.
+        if let Some(format) = sdp::choose_format(&offer, &media_config.codecs) {
+            if let Some(codec) =
+                Codec::from_payload_type(format.payload_type, Some(&format.encoding))
+            {
+                media.negotiate(codec, format.payload_type);
+            }
+        }
 
         // The peer said where its RTP comes from. It is in the offer,
         // and the answer only confirms the codec.

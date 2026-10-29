@@ -89,7 +89,8 @@ impl Default for AudioConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MediaConfig {
-    /// The codecs to offer, in preference order — `PCMU`, `PCMA`.
+    /// The codecs to offer, in preference order — `PCMU`, `PCMA`,
+    /// `G722`.
     ///
     /// The first one is the one the peer is asked for; the peer may
     /// answer with another one of these, and then that one is used.
@@ -103,7 +104,10 @@ pub struct MediaConfig {
 impl Default for MediaConfig {
     fn default() -> Self {
         Self {
-            codecs: vec!["PCMU".to_string(), "PCMA".to_string()],
+            // G.711 first: they are what every peer has. G.722 is
+            // there too, but a PBX has to be told to allow it — and
+            // the user can move it to the front in the settings.
+            codecs: vec!["PCMU".to_string(), "PCMA".to_string(), "G722".to_string()],
             microphone: String::new(),
             speaker: String::new(),
         }

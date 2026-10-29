@@ -2479,6 +2479,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanoaudio-core"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22ff788a8aae291c8eba3697cacac1666b86cdb702bd342b41b4c5d58baeffb5"
+
+[[package]]
+name = "nanoaudio-g722"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a1ab29be09216dcd7e687f519470cc8795db9707410a5fa541f249c5f324c73"
+dependencies = [
+ "nanoaudio-core",
+ "wide",
+]
+
+[[package]]
 name = "ndk"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3429,6 +3445,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "cpal",
+ "nanoaudio-g722",
  "rtc",
  "tracing",
 ]
@@ -4088,6 +4105,15 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "safe_arch"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42c6efa15875e6ecb39ca61fb0b0c1a40b84fac5a5ffe71eef7d1000c8eb3f5f"
+dependencies = [
+ "bytemuck",
+]
 
 [[package]]
 name = "same-file"
@@ -5426,6 +5452,16 @@ dependencies = [
  "raw-window-handle",
  "static_assertions",
  "web-sys",
+]
+
+[[package]]
+name = "wide"
+version = "1.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d920ac99c3c8edce110cb8d07dbb324d6d026011dce85b1e9355b70f0adacc4f"
+dependencies = [
+ "bytemuck",
+ "safe_arch",
 ]
 
 [[package]]

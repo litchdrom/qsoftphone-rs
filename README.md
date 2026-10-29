@@ -9,13 +9,15 @@ identity resolution, the call event contract, the history rules and
 the transfer construction all have to behave identically, including the
 bugs that have already been fixed there.
 
-**Status: M2 complete.** The workspace builds, the test suite passes, the
+**Status: M4.1 complete.** The workspace builds, the test suite passes, the
 app starts and exits cleanly, an account can be registered against a SIP
 registrar with digest authentication (MD5 and SHA-256), and calls can be
 placed and received over that registration — outbound INVITE, inbound
 INVITE with an automatic 180 Ringing, answer, decline, hang up, and DTMF.
-There is no audio yet: the media plane is M4. See
-[Milestones](#milestones).
+A call carries a voice: the RTP runs over a bound UDP port, G.711 and
+G.722 are both spoken, and the mute keeps the clock running. The codecs,
+the sound card and the test sound live on a settings page, and the
+history is in SQLite. See [Milestones](#milestones).
 
 ---
 
@@ -57,7 +59,7 @@ qsoftphone-rs/
     │   ├── paths.rs               per-OS config / data / log dirs
     │   ├── sip/                   pure SIP functions (uri, identity, refer)
     │   └── storage/               SQLite: accounts, contacts, history
-    ├── qsoftphone-media/          the media plane: RTP, G.711, the sound card
+    ├── qsoftphone-media/          the media plane: RTP, G.711, G.722, the sound card
     │   ├── audio.rs               the microphone, the speaker, the resampling
     │   ├── codec.rs               G.711, computed rather than tabulated
     │   ├── lib.rs                 the session: socket, negotiation, threads
@@ -94,6 +96,7 @@ Pinned in the workspace `Cargo.toml`, locked in `Cargo.lock`.
 | `rsipstack` | 0.7.9 | SIP transport, transactions, dialogs |
 | `rtc` | 0.21.1 | RTP / SRTP / ICE / DTLS media plane |
 | `cpal` | 0.18.2 | microphone capture and speaker playback |
+| `nanoaudio-g722` | 0.1.1 | the G.722 wideband codec |
 | `egui` / `eframe` | 0.37.0 | the UI (default wgpu backend) |
 | `rusqlite` | 0.41 | storage, `bundled` — SQLite is compiled in |
 | `tokio` | 1.54.1 | the async runtime the SIP stack runs on |
@@ -104,9 +107,9 @@ Pinned in the workspace `Cargo.toml`, locked in `Cargo.lock`.
 The brief asks for a resolved tree under ~250 crates, assuming
 rsipstack would be the bulk at 134.
 
-**Measured, the real number is 305 package names** for the Windows target
-(385 for Linux, which adds X11/Wayland/ALSA). Three of those are this
-workspace's own crates, so 302 and 382 are third-party packages. The gap
+**Measured, the real number is 310 package names** for the Windows target
+(390 for Linux, which adds X11/Wayland/ALSA). Four of those are this
+workspace's own crates, so 306 and 386 are third-party packages. The gap
 is not bloat — it is two subtrees the brief's estimate did not account
 for:
 
@@ -149,6 +152,14 @@ one package in each is `qsoftphone-media` — this workspace's own crate.
 The third-party count is 301 on Windows and 381 on Linux, unchanged.
 `bytes` is named directly by the media crate, but `rtc-rtp` already
 depended on it.
+
+**M4.1 added four packages: the G.722 codec and what it brings.**
+`nanoaudio-g722` is the codec, `nanoaudio-core` holds the types it
+shares, and `wide` + `safe_arch` are the SIMD helpers it uses on x86.
+The lock file grew by exactly those four — 580 → 584 entries — and the
+per-target tree by the same four: Windows 306 → 310, Linux 386 → 390.
+(The counts in the paragraph above were taken with a command that
+counts one fewer; the delta is the same.)
 
 **What was trimmed.** `rsipstack` is built with `default-features = false`
 and only `platform-tokio`, `std` and `rustls` enabled:
@@ -687,9 +698,14 @@ a **Redial** button.
   number but not enough for a history row — so they are URIs now, and
   the UI shows the user-part, exactly as before.
 * `dialed_number` is the resolved dialled number (§5.1), and it is
-  what a redial uses. For a DID-forwarded call the remote party is
-  the PBX that forwarded it, and dialling the PBX back is not what the
-  user means by "call them back".
+  what a redial uses — for an **outgoing** call. For a DID-forwarded
+  call the remote party is the PBX that forwarded it, and dialling the
+  PBX back is not what the user means by "call them back".
+
+  *(M4.1 made the redial direction-aware: an incoming call is called
+  back on the **caller**, because the dialled number of an incoming
+  call is usually our own extension. See
+  [M4.1](#m41--codecs-the-sound-card-and-the-redial).)*
 
 An incoming call that was never answered is stored as **missed**. The
 C++ has the capability — `CallHistory::recordMissed` — but never calls
@@ -785,9 +801,10 @@ sound card.
 
 ```text
 crates/qsoftphone-media/
-├── codec.rs       G.711 µ-law and A-law, computed rather than tabulated
+├── codec.rs       G.711 µ-law and A-law, computed rather than tabulated;
+│                  and G.722, which keeps a state
 ├── rtp.rs         the UDP socket and the RTP packets on it
-├── audio.rs       the microphone, the speaker, and the resampling
+├── audio.rs       the microphone, the speaker, the resampling, the tone
 └── lib.rs         the session: the socket, the negotiation, the threads
 ```
 
@@ -850,11 +867,15 @@ five muted frames arrive as five frames.
 
 ### The codec is picked, and it is remembered
 
-The codec the next call offers is a **combo box on the call page**, and
-it is kept in the settings file — the `media` section, where the C++
-kept the codec priorities. The C++ let the user set a priority per
-codec and used the order; here the order is the list, and the first
-entry is the one the offer asks for.
+The codec the next call offers is picked by the user, and it is kept in
+the settings file — the `media` section, where the C++ kept the codec
+priorities. The C++ let the user set a priority per codec and used the
+order; here the order is the list, and the first entry is the one the
+offer asks for.
+
+*(M4.1 moved the picker off the call page and onto the settings page,
+and turned it into a list with an order — see
+[M4.1](#m41--codecs-the-sound-card-and-the-redial).)*
 
 The peer has the last word: if it answers with another codec this build
 speaks, that one is used, on the peer's own payload type.
@@ -909,6 +930,184 @@ costs nothing.
   `media.speaker`) and the media crate reads them, but the UI to pick
   them is M6.
 
+*(M4.1 built the picker and put it on the settings page.)*
+
+---
+
+## M4.1 — Codecs, the sound card and the redial
+
+Four things the user asked for, in one milestone, because they are
+one thing: **the things that are not about one call.**
+
+### The codec picker is off the call page
+
+It was a combo box in the middle of the dialer, with two entries, and
+it chose the codec the *next* call would offer. It is now a **list on
+the settings page**, with an order:
+
+```text
+CODECS
+  PCMU   G.711 µ-law, 8 kHz              [▲] [▼] [×]
+  PCMA   G.711 A-law, 8 kHz              [▲] [▼] [×]
+  G722   G.722, 16 kHz wideband          [▲] [▼] [×]
+```
+
+The order is the offer's order, and the list is kept in the settings
+file — the `media` section, where the C++ kept its codec priorities.
+It is **app-level**, like the C++'s: the codecs are what the softphone
+speaks, not what one account speaks. (Per-account codecs are still on
+the backlog; one account may only speak PCMU and another only PCMA.)
+
+The peer still has the last word: if it answers with another codec this
+build speaks, that one is used, on the peer's own payload type.
+
+### G.722 — the wideband codec
+
+**G.722 is 16 kHz of speech in 64 kbit/s**, and it is not a companded
+codec like G.711: the signal is split into two sub-bands by a
+quadrature mirror filter and each is coded with ADPCM. Two things
+about it surprise everybody, and both are in RFC 3551 §4.5.2:
+
+* the RTP clock rate is **8000 Hz**, not 16000 — the original
+  recommendation had a historical error in it and the payload type kept
+  the wrong number so that the two ends would agree;
+* so the payload is **160 bytes** per 20 ms frame, exactly like G.711,
+  and the RTP timestamp advances by 160, exactly like G.711.
+
+**The RTP layer did not change at all.** The payloader is opaque bytes
+(`rtc::rtp` even ships a `G722Payloader` alias of the G.711 one) and
+the clock is the same 8 kHz. What changed is the codec: the frame is
+320 samples instead of 160, the samples are 16 kHz instead of 8 kHz,
+and the encoder and the decoder **keep a state** — an ADPCM decoder
+that starts late, or out of step, produces noise.
+
+So the media crate grew a per-codec description:
+
+| | sample rate | RTP clock | frame samples | frame bytes | rtpmap |
+|---|---|---|---|---|---|
+| PCMU | 8000 | 8000 | 160 | 160 | `PCMU/8000` |
+| PCMA | 8000 | 8000 | 160 | 160 | `PCMA/8000` |
+| G722 | **16000** | 8000 | **320** | 160 | `G722/8000` |
+
+And the encoders became objects instead of functions:
+
+```rust
+let mut encoder = Codec::G722.encoder();   // it remembers the signal
+let frame = encoder.encode(&pcm);          // 320 samples in, 160 bytes out
+let mut decoder = Codec::G722.decoder();   // and so does this
+let samples = decoder.decode(&frame);      // 160 bytes in, 320 samples out
+```
+
+A muted microphone still sends — silence — and the silence goes
+**through the encoder** like any other frame, so an encoder that keeps
+a state stays in step with the decoder at the other end. G.722 has no
+fixed silence code: the silence is whatever the encoder makes of a
+frame of zeros.
+
+### The codec was checked against the reference vectors
+
+This is the part that matters. A G.722 codec that is self-consistent
+but **not** the same as the one on the other end is worse than no codec
+at all: the call connects, and the peer hears noise.
+
+`nanoaudio-g722` is a Rust port of the CMU 1993 implementation — the
+same code lineage as SpanDSP's `g722enc`/`g722dec`, and therefore the
+same code Asterisk's `codec_g722.c` runs. It was checked against the
+reference vectors that ship with `sippy/libg722`:
+
+| vector | what it is | result |
+|---|---|---|
+| `pcminb.dat` → `pcminb.g722.out` | encode the reference PCM | SHA-256 **matches** |
+| `pcminb.g722.out` → `pcminb.raw.16k.out` | decode it again | SHA-256 **matches** |
+| `test.g722` → `test.raw.16k.out` | decode the reference stream | SHA-256 **matches** |
+| `fullscale.g722` → `fullscale.raw.out` | decode a full-scale stream | SHA-256 **matches** |
+
+Byte for byte, against the published digests. The round trip is good
+too: 41–60 dB of signal-to-noise on a tone, once the 22-sample group
+delay of the synthesis filter is taken into account.
+
+Two other implementations were measured against it and **did not** match
+byte for byte — one of them is a careful transcription of the ITU Blue
+Book, and it disagrees with the CMU code on the first octet. That is
+why the reference vectors, and not a round-trip test, decided it.
+
+### The sound card and the test sound
+
+The **Settings** page also holds the microphone and the speaker
+pickers, and a **Test sound** button: a third of a second of 440 Hz
+through the speaker, with a fade at each end so that it does not click.
+It says whether the speaker works without anybody having to make a
+call.
+
+Both are **not** on the interface thread (§3). Reading the sound card's
+devices opens the host and asks it what it has, and playing the tone
+opens the device and waits for it; both happen on the runtime, and the
+answer comes back over a channel and is drained at the top of the
+frame.
+
+The device names are persisted the way the C++ persisted them — the
+friendly name — and an empty name means the system default.
+
+### The redial calls the caller back
+
+The bug the user reported: **a call from 6661 to 104 redialled 104**.
+
+The dialled number of an incoming call is the number the caller dialled
+to reach us, and when there is no DID in front of us that is *our own
+extension*. Dialling it calls ourselves.
+
+So the redial target is now the **peer**, and it is direction-aware:
+
+* **outgoing** — the number that was dialled. For a DID-forwarded call
+  the remote party is the PBX that forwarded it, and dialling the PBX
+  back is not what the user means by "call them back" (§5.1).
+* **incoming** — the **caller**, unless the resolved dialled number is
+  something else than our own extension. That exception is the DID
+  case: a PBX that forwards `sip:6666@host` to our AOR and puts the
+  customer in a header, where the dialled number is 6666 and the peer
+  is `asterisk`.
+
+The C++ settled the same thing after the user clarified it: the history
+shows the peer, and redial dials the peer.
+
+The redial also goes out on **the account the call was on**, not on
+whichever account happens to be selected now.
+
+### The dependency cost: four packages
+
+| package | what it is |
+|---|---|
+| `nanoaudio-g722` | the G.722 codec — MIT, pure Rust |
+| `nanoaudio-core` | the types it shares — MIT |
+| `wide` | the SIMD helpers it uses on x86 — MIT/Apache-2.0 |
+| `safe_arch` | `wide`'s helper for the same |
+
+The lock file grew by exactly those four: 580 → 584 entries. The
+per-target tree grew by the same four — Windows 306 → 310, Linux 386 →
+390 (`cargo tree --workspace --prefix none --edges normal --target …`,
+unique names; the counts in the M4 section were taken with a command
+that counts one fewer).
+
+That is the price of not writing the codec ourselves, and it was worth
+paying: the alternative was a hand-ported ADPCM encoder whose only
+proof would have been its own round trip.
+
+### What is *not* in M4.1
+
+* **No Opus.** It needs a pure-Rust encoder (`opus-rs`, which brings
+  `fearless_simd` and `libm` with it), the RFC 7587 RTP framing, and a
+  **third-party `codec_opus` module on the PBX** — Asterisk does not
+  ship one. It is the next codec, and it is a bigger job than G.722
+  was.
+* **No ILBC.** It is a third codec with the same shape of problem:
+  `codec_ilbc` ships with Asterisk, but there is no pure-Rust ILBC in
+  the tree to use.
+* **No codec per account.** The list is app-level; the backlog item
+  stands.
+* **No ringtone.** The C++ plays a WAV when a call comes in, and
+  synthesises a ringback tone for an outgoing one. The test sound is
+  neither.
+
 ---
 
 ## Policy decisions
@@ -940,6 +1139,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M2** | Calling: outbound INVITE, inbound INVITE with automatic 180 Ringing (§5.4), answer, decline, hang up without a forced code (§5.5), DTMF | **done** |
 | **M3** | History: SQLite persistence with the §5.3 semantics, redial using the resolved dialled number (§5.1), searchable list in the UI | **done** |
 | M4 | Media: `rtc` RTP + `cpal` audio — SDP negotiation, send/receive audio, mute, codec selection | **done** |
+| **M4.1** | Codecs & the sound card: G.722 (wideband), the codec list on a settings page, the device pickers, the test sound, the redial of an incoming call | **done** |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
@@ -952,8 +1152,9 @@ none of them is lost and none of them disturbs the order above.
 
 | Item | Lands in | Notes |
 |---|---|---|
-| **Codec selection per account** | M6 | M4 has codec selection, and it is **app-level**: the combo box on the call page picks the codec the next call offers, and the choice is kept in the settings file. What is missing is that it should be **per account** — one account may only speak PCMU, another only PCMA. `AccountProfile` has no codec field yet, and the account editor has no control for one. |
-| **Media device selection, in the main settings** | M6 | The device list comes from `cpal`, and M4 opens the streams, so the list *can* be built now. What is missing is the **picker** and the settings page it lives on. It is an **app-level** setting, not a per-account one — one microphone and one speaker for the whole window. The fields are already there (`media.microphone`, `media.speaker`) and the media crate reads them, so picking a device is a matter of writing the name into the settings file. The page itself is M6, which has to build that page anyway. |
+| **Codec selection per account** | M6 | The codec list is now on the settings page and is **app-level**: the order is the offer's order, and it is kept in the settings file. What is still missing is that it should be **per account** — one account may only speak PCMU, another only PCMA. `AccountProfile` has no codec field yet, and the account editor has no control for one. |
+| **Media device selection, in the main settings** | **done in M4.1** | The picker is on the settings page: the microphone and the speaker, with "System default" and the devices of the machine. The device list is read on the runtime, not on the interface thread, and the name is persisted in the settings file — the fields were already there (`media.microphone`, `media.speaker`) and the media crate reads them. |
+| **Opus, as a third codec** | M6 | The next codec after G.722. It needs a pure-Rust encoder (`opus-rs`, which brings `fearless_simd` and `libm` with it), the RFC 7587 RTP framing, and — the hard part — a **third-party `codec_opus` module on the PBX**: Asterisk does not ship one, so the PBX has to be built with it before a single Opus call is possible. |
 | **Expandable history, with the call time and the SIP code** | **done in M3** | The **data** was already there: the `calls` table has `duration_sec`, `sip_code` and `hangup_cause`. The UI was the missing part, and M3 has it: the history page's row shows the number, the duration, the time and the SIP status code, and expands to the full URI, the cause and the exact timestamps. |
 | **NAT traversal for the media plane** | M5 | The signalling side already does what it can: the public `Contact` is learned from the `received`/`rport` the registrar echoes (RFC 3581), the binding is refreshed before it expires, and Asterisk's OPTIONS keepalive is answered. M4 bound a **real** port and the SDP names it — but it is the **local** port, and a NAT that rewrites it will break the call. At the very least the SDP has to carry the NAT-mapped port and the stack has to accept the symmetric RTP a NAT sends back from a different source port; beyond that, `rtc` 0.21.1 already ships `ice`, `stun` and `turn` as unconditional dependencies, so full ICE with host/srflx/relay candidates is available without adding a crate. |
 | **Configurable, playable ring tone for incoming calls, in the main settings** | M6 | The config keys are already there: `audio.ringtone_file` (empty = the bundled default) and `audio.ringtone_volume`. What is missing is the **player** — and the **Settings → Audio** page: a file picker, a volume slider and a preview. The C++ reference is `RingtonePlayer`. M4 opened a sound card, so the player is now possible. |
@@ -1000,7 +1201,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 232 tests, all passing.
+* `cargo test --workspace` — 251 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -1080,7 +1281,8 @@ player lands.
 * **A redial dials the dialled number.** The test builds the row the
   way a DID-forwarded call makes it — the remote party is the PBX, the
   dialled number is the customer — and asserts that the redial targets
-  `6666` and not `asterisk`.
+  `6666` and not `asterisk`. (M4.1 added the incoming case: a call
+  from 6661 to 104 is called back on 6661.)
 * **The search finds what it should.** Case-insensitively over the
   number, the URI and the name; "486" finds the busy call by its SIP
   code; the direction chips narrow it; and a `%` in the search is a
@@ -1107,11 +1309,39 @@ player lands.
   is how the sending thread's condvar bug was found.
 * **The whole call page fits the window.** The headless frame is
   given the size the app opens at, and the test checks that the
-  dialer, the call button, the codec picker and the call list are all
-  on the screen. A row that is culled is a button the user cannot
-  press — and the earlier headless tests never saw the page at all,
-  because without a screen rect egui lays the central panel out with
-  no height and drops everything below the first row.
+  dialer, the call button and the call list are all on the screen. A
+  row that is culled is a button the user cannot press — and the
+  earlier headless tests never saw the page at all, because without a
+  screen rect egui lays the central panel out with no height and drops
+  everything below the first row.
+* **The codec picker is not on the call page.** The headless frame of
+  the call page does not contain the word "Codec" any more.
+* **The settings page holds the codecs and the sound card.** The
+  headless frame contains the codec list — including G.722 — the
+  microphone and the speaker pickers, and the test sound button.
+* **The codecs can be reordered, taken out and put back.** The order
+  reaches the call layer, and the last codec cannot be turned off: a
+  call with no codec has no media at all.
+* **G.722 is byte-exact with the reference implementation.** Encoding
+  the reference PCM and decoding the reference stream — the vectors
+  that ship with `sippy/libg722`, the code lineage Asterisk's
+  `codec_g722.c` runs — both reproduce the published SHA-256 digests.
+  See [M4.1](#m41--codecs-the-sound-card-and-the-redial).
+* **A G.722 frame goes from one session to the other** over a real UDP
+  socket: 320 samples in, 160 bytes on the wire, 320 samples out on
+  the other side.
+* **The G.722 round trip keeps the speech.** 41–60 dB of
+  signal-to-noise on a tone, once the 22-sample group delay of the
+  synthesis filter is accounted for.
+* **A muted wideband microphone sends silence too.** G.722 has no
+  fixed silence code, so the silence is whatever the encoder makes of
+  a frame of zeros — and it is quiet.
+* **An incoming call redials the caller.** A call from 6661 to 104 is
+  called back on 6661, and an outgoing call is still called back on
+  the number that was dialled.
+* **The test sound is played off the interface thread.** The button
+  starts the work on the runtime, and the answer comes back on a
+  channel — whether the tone played or the machine has no speaker.
 
 **Verified against a real Asterisk:**
 
@@ -1143,6 +1373,14 @@ player lands.
   codec is proved against its own tables — but no call has yet been
   made to Asterisk and listened to. The desktop was locked for most of
   the M4 build, so the sound card could not be exercised by a person.
+* **G.722 has not been talked to a PBX.** The codec is proved
+  byte-exact against the reference implementation Asterisk uses — the
+  published SHA-256 digests of the `sippy/libg722` vectors both match
+  — but no call has yet been made with `allow=g722` on the PJSIP
+  endpoint and listened to. That is the one thing left to try.
+* **The test sound has not been heard either.** It is played on the
+  runtime and the result comes back, but a locked desktop has no
+  speaker to play it on.
 * **The media has not been tested against a NAT.** The SDP advertises
   the public address, but the RTP port is the local one, and a NAT
   that rewrites it will break the call. This is the first thing to

@@ -1,8 +1,14 @@
-//! The media plane: RTP, G.711 and the sound card.
+//! The media plane: RTP, G.711, G.722 and the sound card.
 //!
 //! M4 gave the softphone a voice. Before it, a call connected and
 //! carried no sound at all: the SDP named a port that nothing was
 //! bound to, and the peer sent its RTP into the void.
+//!
+//! M5 added the wideband codec: G.722 is 16 kHz of speech in 64
+//! kbit/s, and it needs a codec that keeps a state, a frame that is
+//! twice as big, and an RTP clock that does not move — RFC 3551
+//! §4.5.2 keeps G.722 on the 8 kHz clock of the original
+//! recommendation, so the RTP layer itself did not change at all.
 //!
 //! ## The shape of it
 //!
@@ -48,7 +54,7 @@ pub mod audio;
 pub mod codec;
 pub mod rtp;
 
-pub use audio::{AudioError, AudioState, DeviceInfo, devices};
+pub use audio::{AudioError, AudioState, DeviceInfo, devices, play_test_sound};
 pub use codec::Codec;
 pub use rtp::RtpSocket;
 
@@ -340,8 +346,11 @@ impl MediaSession {
             }
         };
 
-        let speaker = match audio::open_speaker(config.speaker.as_deref(), self.inner.state.clone())
-        {
+        let speaker = match audio::open_speaker(
+            config.speaker.as_deref(),
+            self.inner.state.clone(),
+            self.codec(),
+        ) {
             Ok(speaker) => {
                 *self.inner.speaker_name.lock().expect("speaker lock") =
                     Some(speaker.name().to_string());
@@ -558,6 +567,9 @@ fn receiver_loop(
     }
 
     let mut buffer = [0u8; 2048];
+    // The decoder is stateful for G.722: it has to see every frame in
+    // order, from the first one, or the sound is noise.
+    let mut decoder = codec.decoder();
     while !stop.load(Ordering::Relaxed) {
         match rtp::receive(&socket, &mut buffer) {
             Ok(Some((_from, packet))) => {
@@ -567,7 +579,7 @@ fn receiver_loop(
                 if packet.payload_type != payload_type {
                     continue;
                 }
-                let pcm = codec.decode(&packet.payload);
+                let pcm = decoder.decode(&packet.payload);
                 state.push_inbound(&pcm);
             }
             Ok(None) => {
@@ -617,9 +629,9 @@ mod tests {
     }
 
     #[test]
-    fn the_default_config_offers_both_codecs() {
+    fn the_default_config_offers_every_codec() {
         let config = MediaConfig::default();
-        assert_eq!(config.codecs, vec![Codec::Pcmu, Codec::Pcma]);
+        assert_eq!(config.codecs, vec![Codec::Pcmu, Codec::Pcma, Codec::G722]);
     }
 
     #[test]

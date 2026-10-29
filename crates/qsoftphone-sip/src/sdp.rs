@@ -36,9 +36,6 @@ use qsoftphone_media::Codec;
 /// The `Content-Type` of a DTMF relay body.
 pub const DTMF_RELAY_CONTENT_TYPE: &str = "application/dtmf-relay";
 
-/// The clock rate of every codec this build speaks.
-const CLOCK_RATE: u32 = 8000;
-
 /// The static payload types, for an offer that omits the rtpmap.
 const STATIC_FORMATS: &[(u8, &str, u32)] = &[
     (0, "PCMU", 8000),
@@ -48,6 +45,12 @@ const STATIC_FORMATS: &[(u8, &str, u32)] = &[
     (9, "G722", 8000),
     (18, "G729", 8000),
 ];
+
+/// The clock rate assumed when a peer does not say.
+///
+/// Every codec this build speaks runs on an 8 kHz RTP clock, G.722
+/// included — RFC 3551 §4.5.2.
+const DEFAULT_CLOCK_RATE: u32 = 8000;
 
 /// One media format from an SDP.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +97,10 @@ pub struct Answer {
 ///
 /// `address` is the `c=` line — the host the peer should send RTP to.
 /// `port` is the port the media socket is bound to.
+///
+/// The rtpmap of each codec comes from the codec itself, so G.722 is
+/// named `G722/8000` — the 8 kHz clock of RFC 3551 §4.5.2, not the
+/// 16 kHz of the audio.
 pub fn offer_sdp(address: &str, port: u16, session_id: u64, codecs: &[Codec]) -> Vec<u8> {
     let payload_types: Vec<String> = codecs
         .iter()
@@ -103,9 +110,9 @@ pub fn offer_sdp(address: &str, port: u16, session_id: u64, codecs: &[Codec]) ->
         .iter()
         .map(|codec| {
             format!(
-                "a=rtpmap:{} {}/{CLOCK_RATE}\r\n",
+                "a=rtpmap:{} {}\r\n",
                 codec.static_payload_type(),
-                codec.name()
+                codec.rtpmap()
             )
         })
         .collect();
@@ -229,7 +236,7 @@ pub fn parse_media(body: &[u8]) -> Option<MediaDescription> {
             let clock_rate = fields
                 .next()
                 .and_then(|rate| rate.parse::<u32>().ok())
-                .unwrap_or(CLOCK_RATE);
+                .unwrap_or(DEFAULT_CLOCK_RATE);
             rtpmaps.push((payload_type, encoding, clock_rate));
         }
     }
@@ -252,7 +259,7 @@ pub fn parse_media(body: &[u8]) -> Option<MediaDescription> {
                         .iter()
                         .find(|(pt, _, _)| *pt == payload_type)
                         .map(|(_, encoding, clock_rate)| (*encoding, *clock_rate))
-                        .unwrap_or(("unknown", CLOCK_RATE));
+                        .unwrap_or(("unknown", DEFAULT_CLOCK_RATE));
                     MediaFormat {
                         payload_type,
                         encoding: encoding.to_string(),
@@ -441,13 +448,23 @@ a=rtpmap:0 PCMU/8000\r\n";
         assert!(sdp.starts_with("v=0\r\n"), "{sdp}");
         assert!(sdp.contains("o=- 7 7 IN IP4 10.0.0.5\r\n"), "{sdp}");
         assert!(sdp.contains("c=IN IP4 10.0.0.5\r\n"), "{sdp}");
-        assert!(sdp.contains("m=audio 41234 RTP/AVP 0 8\r\n"), "{sdp}");
+        assert!(sdp.contains("m=audio 41234 RTP/AVP 0 8 9\r\n"), "{sdp}");
         assert!(sdp.contains("a=rtpmap:0 PCMU/8000\r\n"), "{sdp}");
         assert!(sdp.contains("a=rtpmap:8 PCMA/8000\r\n"), "{sdp}");
         assert!(sdp.ends_with("\r\n"), "{sdp}");
         // Every line has to end with CRLF, or some parsers reject the
         // whole body.
         assert!(!sdp.contains("\n\r"), "{sdp}");
+    }
+
+    #[test]
+    fn the_offer_names_g722_with_the_eight_kilohertz_clock() {
+        // The audio is 16 kHz, but the RTP clock is 8 kHz — RFC 3551
+        // §4.5.2. A peer that is told 16000 will not understand us.
+        let sdp = String::from_utf8(offer_sdp("10.0.0.5", 41234, 7, &[Codec::G722])).unwrap();
+        assert!(sdp.contains("m=audio 41234 RTP/AVP 9\r\n"), "{sdp}");
+        assert!(sdp.contains("a=rtpmap:9 G722/8000\r\n"), "{sdp}");
+        assert!(!sdp.contains("16000"), "{sdp}");
     }
 
     #[test]
@@ -533,14 +550,56 @@ o=- 1 1 IN IP4 10.0.0.1\r\n\
 s=-\r\n\
 c=IN IP4 10.0.0.1\r\n\
 t=0 0\r\n\
-m=audio 4000 RTP/AVP 9\r\n\
-a=rtpmap:9 G722/8000\r\n";
+m=audio 4000 RTP/AVP 18\r\n\
+a=rtpmap:18 G729/8000\r\n";
         assert!(choose_format(offer.as_bytes(), &codecs()).is_none());
 
         let answer =
             String::from_utf8(answer_sdp(offer.as_bytes(), "10.0.0.5", 4000, 1, &codecs()))
                 .unwrap();
         assert!(answer.contains("m=audio 0 RTP/AVP 0\r\n"), "{answer}");
+    }
+
+    #[test]
+    fn the_answer_to_a_g722_offer_is_g722() {
+        // The wideband codec, on its static payload type.
+        let offer = "v=0\r\n\
+o=- 1 1 IN IP4 10.0.0.1\r\n\
+s=-\r\n\
+c=IN IP4 10.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 4000 RTP/AVP 9\r\n\
+a=rtpmap:9 G722/8000\r\n";
+        let format = choose_format(offer.as_bytes(), &codecs()).expect("a format");
+        assert_eq!(format.payload_type, 9);
+        assert_eq!(format.encoding, "G722");
+
+        let answer =
+            String::from_utf8(answer_sdp(offer.as_bytes(), "10.0.0.5", 4000, 1, &codecs()))
+                .unwrap();
+        assert!(answer.contains("m=audio 4000 RTP/AVP 9\r\n"), "{answer}");
+        assert!(answer.contains("a=rtpmap:9 G722/8000\r\n"), "{answer}");
+    }
+
+    #[test]
+    fn a_g722_on_a_dynamic_payload_type_is_echoed_back() {
+        // A peer may put G.722 on 96. The answer has to use the same
+        // number — the codec name alone is not enough.
+        let offer = "v=0\r\n\
+o=- 1 1 IN IP4 10.0.0.1\r\n\
+s=-\r\n\
+c=IN IP4 10.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 4000 RTP/AVP 96\r\n\
+a=rtpmap:96 G722/8000\r\n";
+        let format = choose_format(offer.as_bytes(), &codecs()).expect("a format");
+        assert_eq!(format.payload_type, 96);
+
+        let answer =
+            String::from_utf8(answer_sdp(offer.as_bytes(), "10.0.0.5", 4000, 1, &codecs()))
+                .unwrap();
+        assert!(answer.contains("m=audio 4000 RTP/AVP 96\r\n"), "{answer}");
+        assert!(answer.contains("a=rtpmap:96 G722/8000\r\n"), "{answer}");
     }
 
     #[test]
@@ -663,9 +722,26 @@ o=- 1 1 IN IP4 10.0.0.1\r\n\
 s=-\r\n\
 c=IN IP4 10.0.0.1\r\n\
 t=0 0\r\n\
+m=audio 5000 RTP/AVP 18\r\n\
+a=rtpmap:18 G729/8000\r\n";
+        assert!(parse_answer(answer.as_bytes(), &codecs()).is_none());
+    }
+
+    #[test]
+    fn an_answer_in_g722_is_an_answer() {
+        // G.722 is one of ours now, so an answer that names it is
+        // understood — with the payload type the peer put it on.
+        let answer = "v=0\r\n\
+o=- 1 1 IN IP4 10.0.0.1\r\n\
+s=-\r\n\
+c=IN IP4 10.0.0.1\r\n\
+t=0 0\r\n\
 m=audio 5000 RTP/AVP 9\r\n\
 a=rtpmap:9 G722/8000\r\n";
-        assert!(parse_answer(answer.as_bytes(), &codecs()).is_none());
+        let parsed = parse_answer(answer.as_bytes(), &codecs()).expect("an answer");
+        assert_eq!(parsed.codec, Codec::G722);
+        assert_eq!(parsed.payload_type, 9);
+        assert_eq!(parsed.port, 5000);
     }
 
     #[test]

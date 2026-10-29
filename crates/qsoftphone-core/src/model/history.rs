@@ -64,12 +64,14 @@ pub struct CallRecord {
     pub remote_name: String,
     /// The number the remote party actually dialled (§5.1).
     ///
-    /// This is what redial must use. It is *not* necessarily the
-    /// same as `remote_number`: when a PBX does DID routing it
-    /// forwards `sip:6666@host` to our AOR `sip:104@host`, so the
-    /// peer may identify itself as `asterisk@host` while the number
-    /// the customer dialled was 6666. Storing the To-URI instead
-    /// would make redial call our own extension back.
+    /// For an incoming call this is resolved from the account's
+    /// dialled-number header, then the Request-URI, then the To-URI —
+    /// and the To-URI is usually our own extension, which is useless
+    /// for a redial. It is not necessarily the same as
+    /// `remote_number`: when a PBX does DID routing it forwards
+    /// `sip:6666@host` to our AOR `sip:104@host`, so the peer may
+    /// identify itself as `asterisk@host` while the number the customer
+    /// dialled was 6666.
     pub dialed_number: String,
     /// Epoch milliseconds.
     pub started_at: i64,
@@ -219,16 +221,38 @@ impl CallRecord {
 
     /// The number a redial must use — §5.1.
     ///
-    /// The **dialled** number, not the remote number: for a
-    /// DID-forwarded call the remote party is the PBX that forwarded
-    /// it, and dialling the PBX back is not what the user means by
+    /// `our_number` is the extension of the account the call was on.
+    ///
+    /// For an **outgoing** call it is the **dialled** number: when a PBX
+    /// does DID routing, the remote party may be the PBX that forwarded
+    /// the call, and dialling the PBX back is not what the user means by
     /// "call them back". The remote number is the fallback, for a row
     /// that has no dialled number at all.
-    pub fn redial_target(&self) -> &str {
-        if self.dialed_number.is_empty() {
-            &self.remote_number
-        } else {
-            &self.dialed_number
+    ///
+    /// For an **incoming** call the resolved dialled number is what the
+    /// caller dialled to reach us — but that is usually *our own*
+    /// extension, and dialling it would call ourselves. So when the
+    /// dialled number is our own number the caller is the target
+    /// instead: a call from 6661 to 104 has to be called back on 6661.
+    ///
+    /// The C++ settled the same way: the history shows the peer, and
+    /// redial dials the peer.
+    pub fn redial_target(&self, our_number: &str) -> &str {
+        match self.direction {
+            Direction::Outgoing => {
+                if self.dialed_number.is_empty() {
+                    &self.remote_number
+                } else {
+                    &self.dialed_number
+                }
+            }
+            Direction::Incoming | Direction::Missed => {
+                if self.dialed_number.is_empty() || self.dialed_number == our_number {
+                    &self.remote_number
+                } else {
+                    &self.dialed_number
+                }
+            }
         }
     }
 }
@@ -508,13 +532,59 @@ mod tests {
             "Normal",
             true,
         );
-        assert_eq!(record.redial_target(), "6666");
+        assert_eq!(record.redial_target("104"), "6666");
 
         // With no dialled number at all, the remote number is the
         // fallback.
         let mut plain = record.clone();
         plain.dialed_number = String::new();
-        assert_eq!(plain.redial_target(), "asterisk");
+        assert_eq!(plain.redial_target("104"), "asterisk");
+    }
+
+    #[test]
+    fn an_incoming_call_redials_the_caller_not_our_own_extension() {
+        // The bug the user reported: a call from 6661 to 104 has a
+        // dialled number of 104 — our own extension — and the redial
+        // called us instead of the caller.
+        let record = CallRecord::from_incoming(
+            "acct-1",
+            "call-in",
+            "sip:6661@193.178.169.164",
+            "104",
+            "Alice",
+            1_000,
+            2_000,
+            200,
+            "Normal",
+            true,
+        );
+        assert_eq!(record.remote_number, "6661");
+        assert_eq!(record.dialed_number, "104");
+        assert_eq!(record.redial_target("104"), "6661");
+
+        // A missed call is an incoming call: the caller is called back.
+        let missed =
+            CallRecord::missed("acct-1", "call-in", "sip:6661@host", "104", "Alice", 1_000);
+        assert_eq!(missed.redial_target("104"), "6661");
+    }
+
+    #[test]
+    fn an_outgoing_call_redials_the_number_that_was_dialled() {
+        // The other half of §5.1: what we dialled is what we dial
+        // again, even when the peer that answered is the PBX.
+        let mut record = CallRecord::from_outgoing(
+            "acct-1",
+            "call-out",
+            "sip:104@193.178.169.164",
+            "Alice",
+            1_000,
+            2_000,
+            200,
+            "Normal",
+            true,
+        );
+        record.dialed_number = "6666".to_string();
+        assert_eq!(record.redial_target("104"), "6666");
     }
 
     #[test]

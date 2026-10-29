@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender};
 
 use eframe::egui;
 use qsoftphone_core::config::AppConfig;
@@ -22,7 +23,7 @@ use qsoftphone_core::model::history::{
 use qsoftphone_core::paths::AppPaths;
 use qsoftphone_core::sip::uri::sip_uri_user_part;
 use qsoftphone_core::storage::{AccountStore, Db};
-use qsoftphone_media::Codec;
+use qsoftphone_media::{Codec, DeviceInfo};
 use qsoftphone_sip::{
     CallBus, CallManager, RegistrationManager, RegistrationState, SessionRegistry,
 };
@@ -37,8 +38,11 @@ pub struct QSoftphoneApp {
     db: Arc<Db>,
     config: AppConfig,
     /// Handle to the tokio runtime the SIP stack runs on. Kept so
-    /// the runtime is not dropped while the window is open.
-    _runtime: tokio::runtime::Handle,
+    /// the runtime is not dropped while the window is open, and used
+    /// for the work that must not happen on the interface thread
+    /// (§3): reading the sound card's devices and playing the test
+    /// sound.
+    runtime: tokio::runtime::Handle,
     /// The registrations, and the state each one is in.
     registrations: RegistrationManager,
     /// The calls, and the state each one is in.
@@ -85,13 +89,47 @@ pub struct QSoftphoneApp {
     status: String,
     /// The theme is applied once, on the first frame.
     theme_applied: bool,
+    /// The audio devices of this machine.
+    ///
+    /// They are read on the runtime (§3): opening a device is a slow
+    /// operation, and the interface thread must not wait for it.
+    devices: Vec<DeviceInfo>,
+    /// Whether the devices have been read yet.
+    devices_loaded: bool,
+    /// What the test sound is doing.
+    sound_test: SoundTest,
+    /// The results of the background media work.
+    media_updates: Receiver<MediaUpdate>,
+    /// The way back to the runtime that does the work.
+    media_updates_tx: Sender<MediaUpdate>,
+}
+
+/// What the background media work has to say.
+enum MediaUpdate {
+    /// The sound card's devices.
+    Devices(Vec<DeviceInfo>),
+    /// The test sound has finished — or could not be played.
+    SoundTest(Result<(), String>),
+}
+
+/// What the test sound is doing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SoundTest {
+    /// Nothing has been asked for.
+    Idle,
+    /// The tone is playing.
+    Playing,
+    /// The tone has been played.
+    Done,
+    /// The tone could not be played.
+    Failed(String),
 }
 
 /// Which page the middle panel shows.
 ///
-/// Three pages, and the one that matters is the first: a softphone is
-/// for calling, so the dialer is what the window opens on. The history
-/// is a page away, and so are the account settings.
+/// The dialer is what the window opens on: a softphone is for calling.
+/// The history is a page away, and so are the settings — the codecs,
+/// the sound card and the test sound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     /// The dialer and the calls.
@@ -100,6 +138,8 @@ enum View {
     History,
     /// The account settings.
     Account,
+    /// The sound and the codecs.
+    Settings,
 }
 
 /// What the UI shows about one call.
@@ -231,11 +271,12 @@ impl QSoftphoneApp {
         // The media settings are shared with the registrar: the codec
         // the user picks has to reach the offer that is built.
         calls.set_media_config(media_config_of(&config));
+        let (media_updates_tx, media_updates) = std::sync::mpsc::channel();
         let mut app = Self {
             paths,
             db,
             config,
-            _runtime: runtime.clone(),
+            runtime: runtime.clone(),
             registrations: RegistrationManager::new(runtime.clone(), sessions.clone(), bus.clone()),
             calls,
             history,
@@ -259,6 +300,11 @@ impl QSoftphoneApp {
             editing_id: None,
             status: "Ready.".to_string(),
             theme_applied: false,
+            devices: Vec::new(),
+            devices_loaded: false,
+            sound_test: SoundTest::Idle,
+            media_updates,
+            media_updates_tx,
         };
         app.load_selected();
         // The history is read on the runtime; the rows arrive on the
@@ -411,17 +457,27 @@ impl QSoftphoneApp {
 
     /// Redial a call from the history — §5.1.
     ///
-    /// The target is the **dialled** number, not the remote party: for
-    /// a DID-forwarded call the remote party is the PBX that
-    /// forwarded it, and dialling the PBX back is not what the user
-    /// means by "call them back".
+    /// The target is the **peer**: the caller for an incoming call, the
+    /// number that was dialled for an outgoing one. The call goes out on
+    /// the account the call was on, not on whichever account happens to
+    /// be selected now.
     fn redial(&mut self, record: &CallRecord) {
-        let target = record.redial_target().to_string();
+        let account = self
+            .accounts
+            .iter()
+            .find(|account| account.id == record.account_id)
+            .or_else(|| self.selected_account())
+            .cloned();
+        let Some(account) = account else {
+            self.status = "There is no account to redial on.".to_string();
+            return;
+        };
+        let target = record.redial_target(&account.user).to_string();
         if target.is_empty() {
             self.status = "That call has no number to redial.".to_string();
             return;
         }
-        self.place_call_to(&target);
+        self.place_call_on(&account, &target);
     }
 
     /// Place a call to a target.
@@ -429,6 +485,11 @@ impl QSoftphoneApp {
         let Some(account) = self.selected_account().cloned() else {
             return;
         };
+        self.place_call_on(&account, target);
+    }
+
+    /// Place a call to a target, on a given account.
+    fn place_call_on(&mut self, account: &Account, target: &str) {
         let target = target.trim().to_string();
         if target.is_empty() {
             return;
@@ -625,15 +686,18 @@ impl QSoftphoneApp {
         }
     }
 
-    /// The codec the next call offers.
+    /// The codecs the offer lists, in the order they are preferred.
     ///
-    /// The C++ let the user pick a codec, and the pick was kept in
-    /// the settings file. It is kept here too: the codec is a
-    /// property of the softphone, not of one account.
-    fn set_codec(&mut self, codec: &str) {
-        let mut codecs = self.config.media.codecs.clone();
-        codecs.retain(|c| c != codec);
-        codecs.insert(0, codec.to_string());
+    /// The C++ let the user pick a codec per call, and the pick was
+    /// kept in the settings file. It is kept here too: the codec is a
+    /// property of the softphone, not of one account, and a call page
+    /// is no place for a list of them.
+    fn set_codecs(&mut self, codecs: Vec<String>) {
+        if codecs.is_empty() {
+            // A call with no codec has no media at all.
+            self.status = "At least one codec has to stay on.".to_string();
+            return;
+        }
         self.config.media.codecs = codecs;
 
         // The registrar and the call layer share the settings, so the
@@ -643,6 +707,152 @@ impl QSoftphoneApp {
 
         if let Err(e) = self.config.save(&self.paths.config_file()) {
             tracing::warn!(error = %e, "could not persist the codec choice");
+        }
+    }
+
+    /// The codecs the offer lists, in order.
+    fn enabled_codecs(&self) -> Vec<Codec> {
+        self.config
+            .media
+            .codecs
+            .iter()
+            .filter_map(|name| Codec::from_name(name))
+            .collect()
+    }
+
+    /// Take a codec out of the offer.
+    fn remove_codec(&mut self, codec: Codec) {
+        let mut codecs = self.enabled_codecs();
+        codecs.retain(|c| *c != codec);
+        let names: Vec<String> = codecs.iter().map(|c| c.name().to_string()).collect();
+        self.set_codecs(names);
+    }
+
+    /// Put a codec back into the offer, at the end.
+    fn add_codec(&mut self, codec: Codec) {
+        let mut codecs = self.enabled_codecs();
+        if codecs.contains(&codec) {
+            return;
+        }
+        codecs.push(codec);
+        let names: Vec<String> = codecs.iter().map(|c| c.name().to_string()).collect();
+        self.set_codecs(names);
+    }
+
+    /// Move a codec up or down in the offer.
+    fn move_codec(&mut self, codec: Codec, up: bool) {
+        let mut codecs = self.enabled_codecs();
+        let Some(index) = codecs.iter().position(|c| *c == codec) else {
+            return;
+        };
+        let other = if up {
+            index.checked_sub(1)
+        } else {
+            index.checked_add(1)
+        };
+        let Some(other) = other else {
+            return;
+        };
+        if other >= codecs.len() {
+            return;
+        }
+        codecs.swap(index, other);
+        let names: Vec<String> = codecs.iter().map(|c| c.name().to_string()).collect();
+        self.set_codecs(names);
+    }
+
+    /// The codecs that are not in the offer.
+    fn disabled_codecs(&self) -> Vec<Codec> {
+        let enabled = self.enabled_codecs();
+        Codec::ALL
+            .iter()
+            .copied()
+            .filter(|codec| !enabled.contains(codec))
+            .collect()
+    }
+
+    /// Set the microphone — and persist it.
+    fn set_microphone(&mut self, name: String) {
+        self.config.media.microphone = name;
+        self.push_media_config();
+    }
+
+    /// Set the speaker — and persist it.
+    fn set_speaker(&mut self, name: String) {
+        self.config.media.speaker = name;
+        self.push_media_config();
+    }
+
+    /// Push the media settings into the call layer and into the
+    /// settings file.
+    fn push_media_config(&mut self) {
+        let media = media_config_of(&self.config);
+        self.calls.set_media_config(media);
+        if let Err(e) = self.config.save(&self.paths.config_file()) {
+            tracing::warn!(error = %e, "could not persist the sound settings");
+        }
+    }
+
+    /// Read the sound card's devices.
+    ///
+    /// This opens the host and asks it what it has, which takes a
+    /// moment — so it happens on the runtime and not on the interface
+    /// thread (§3). The devices arrive on a channel and are drained
+    /// at the top of the frame.
+    fn load_devices(&mut self) {
+        if self.devices_loaded {
+            return;
+        }
+        self.devices_loaded = true;
+
+        let sender = self.media_updates_tx.clone();
+        self.runtime.spawn_blocking(move || {
+            let devices = qsoftphone_media::devices();
+            let _ = sender.send(MediaUpdate::Devices(devices));
+        });
+    }
+
+    /// Play the test sound through the speaker.
+    ///
+    /// The tone is a third of a second long, and playing it means
+    /// opening the device — so it happens on the runtime (§3).
+    fn play_test_sound(&mut self) {
+        if self.sound_test == SoundTest::Playing {
+            return;
+        }
+        let speaker = self.config.media.speaker.clone();
+        let speaker = if speaker.trim().is_empty() {
+            None
+        } else {
+            Some(speaker)
+        };
+
+        self.sound_test = SoundTest::Playing;
+        let sender = self.media_updates_tx.clone();
+        self.runtime.spawn_blocking(move || {
+            let outcome =
+                qsoftphone_media::play_test_sound(speaker.as_deref()).map_err(|e| e.to_string());
+            let _ = sender.send(MediaUpdate::SoundTest(outcome));
+        });
+    }
+
+    /// Drain what the background media work has to say.
+    fn drain_media(&mut self) {
+        while let Ok(update) = self.media_updates.try_recv() {
+            match update {
+                MediaUpdate::Devices(devices) => {
+                    self.devices = devices;
+                    self.devices_loaded = true;
+                }
+                MediaUpdate::SoundTest(Ok(())) => {
+                    self.sound_test = SoundTest::Done;
+                    self.status = "The test sound has been played.".to_string();
+                }
+                MediaUpdate::SoundTest(Err(error)) => {
+                    self.sound_test = SoundTest::Failed(error.clone());
+                    self.status = format!("The test sound could not be played: {error}");
+                }
+            }
         }
     }
 
@@ -745,6 +955,7 @@ impl QSoftphoneApp {
         self.drain_registrations();
         self.drain_calls();
         self.drain_history();
+        self.drain_media();
 
         // The header. One line: who we are and whether we are
         // registered. Everything else is a page.
@@ -873,8 +1084,14 @@ impl QSoftphoneApp {
                 {
                     self.view = View::Account;
                 }
+                if ui
+                    .selectable_label(self.view == View::Settings, "Settings")
+                    .clicked()
+                {
+                    self.view = View::Settings;
+                }
                 ui.separator();
-                ui.label(egui::RichText::new("M3 — history").small());
+                ui.label(egui::RichText::new("M5 — settings").small());
                 ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).small());
             });
             ui.separator();
@@ -892,6 +1109,7 @@ impl QSoftphoneApp {
                 View::Call => self.draw_calls(ui),
                 View::History => self.draw_history(ui),
                 View::Account => self.draw_account(ui),
+                View::Settings => self.draw_settings(ui),
             }
         });
 
@@ -958,31 +1176,6 @@ impl QSoftphoneApp {
         if !registered {
             ui.weak("Register the account before it can call.");
         }
-
-        // The codec the next call offers. The C++ had this in the
-        // settings; it is here because it is a property of the next
-        // call, and the call page is where the call is made from.
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Codec").strong().size(11.0));
-            let current = self
-                .config
-                .media
-                .codecs
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "PCMU".to_string());
-            egui::ComboBox::from_id_salt("codec")
-                .selected_text(current.clone())
-                .width(90.0)
-                .show_ui(ui, |ui| {
-                    for codec in ["PCMU", "PCMA"] {
-                        if ui.selectable_label(current == codec, codec).clicked() {
-                            self.set_codec(codec);
-                        }
-                    }
-                });
-            ui.weak("the codec the next call offers");
-        });
 
         ui.add_space(6.0);
         ui.label(egui::RichText::new("CALLS").strong().size(11.0));
@@ -1410,6 +1603,166 @@ impl QSoftphoneApp {
             ui.monospace(format!("logs    {}", self.paths.log_dir().display()));
         });
     }
+
+    /// The settings page: the codecs, the sound card and the test
+    /// sound.
+    ///
+    /// These are the things that are not about one call. The call page
+    /// had a codec picker, and it was in the wrong place: a codec is
+    /// what the softphone speaks, not what one call is — and a list of
+    /// three of them in the middle of the dialer is noise.
+    fn draw_settings(&mut self, ui: &mut egui::Ui) {
+        // The devices are read on the runtime (§3); ask for them the
+        // first time this page is shown.
+        self.load_devices();
+
+        ui.label(egui::RichText::new("CODECS").strong().size(11.0));
+        ui.separator();
+        ui.weak("The offer names these, in this order. The peer picks one of them.");
+        ui.add_space(4.0);
+
+        let enabled = self.enabled_codecs();
+        for codec in enabled.iter() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(codec.name()).strong());
+                ui.weak(codec_note(*codec));
+                if ui.small_button("▲").clicked() {
+                    self.move_codec(*codec, true);
+                }
+                if ui.small_button("▼").clicked() {
+                    self.move_codec(*codec, false);
+                }
+                if ui.small_button("×").clicked() {
+                    self.remove_codec(*codec);
+                }
+            });
+        }
+
+        let disabled = self.disabled_codecs();
+        if !disabled.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label("Add a codec:");
+                let mut choice = disabled[0];
+                egui::ComboBox::from_id_salt("add_codec")
+                    .selected_text(choice.name())
+                    .width(100.0)
+                    .show_ui(ui, |ui| {
+                        for codec in disabled.iter() {
+                            if ui
+                                .selectable_label(choice == *codec, codec.name())
+                                .clicked()
+                            {
+                                choice = *codec;
+                            }
+                        }
+                    });
+                if ui.button("Add").clicked() {
+                    self.add_codec(choice);
+                }
+            });
+        }
+
+        ui.add_space(4.0);
+        ui.weak("A PBX has to be told to allow G.722: allow=g722 on the PJSIP endpoint.");
+        ui.add_space(10.0);
+
+        ui.label(egui::RichText::new("SOUND CARD").strong().size(11.0));
+        ui.separator();
+
+        let inputs: Vec<String> = self
+            .devices
+            .iter()
+            .filter(|device| device.is_input)
+            .map(|device| device.name.clone())
+            .collect();
+        let outputs: Vec<String> = self
+            .devices
+            .iter()
+            .filter(|device| device.is_output)
+            .map(|device| device.name.clone())
+            .collect();
+
+        ui.horizontal(|ui| {
+            ui.label("Microphone");
+            let current = self.config.media.microphone.clone();
+            egui::ComboBox::from_id_salt("microphone")
+                .selected_text(device_label(&current))
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(current.is_empty(), "System default")
+                        .clicked()
+                    {
+                        self.set_microphone(String::new());
+                    }
+                    for name in inputs.iter() {
+                        if ui.selectable_label(current == *name, name).clicked() {
+                            self.set_microphone(name.clone());
+                        }
+                    }
+                });
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Speaker");
+            let current = self.config.media.speaker.clone();
+            egui::ComboBox::from_id_salt("speaker")
+                .selected_text(device_label(&current))
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(current.is_empty(), "System default")
+                        .clicked()
+                    {
+                        self.set_speaker(String::new());
+                    }
+                    for name in outputs.iter() {
+                        if ui.selectable_label(current == *name, name).clicked() {
+                            self.set_speaker(name.clone());
+                        }
+                    }
+                });
+        });
+
+        if self.devices.is_empty() && self.devices_loaded {
+            ui.weak("This machine has no sound card that could be found.");
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let label = match &self.sound_test {
+                SoundTest::Playing => "Playing…",
+                SoundTest::Failed(_) => "Test sound again",
+                _ => "Test sound",
+            };
+            let playing = self.sound_test == SoundTest::Playing;
+            if ui.add_enabled(!playing, egui::Button::new(label)).clicked() {
+                self.play_test_sound();
+            }
+            if let SoundTest::Failed(why) = &self.sound_test {
+                ui.weak(why.clone());
+            }
+        });
+        ui.weak("A short tone through the speaker, to see that it works.");
+    }
+}
+
+/// What the codec is, for the settings page.
+fn codec_note(codec: Codec) -> &'static str {
+    match codec {
+        Codec::Pcmu => "G.711 µ-law, 8 kHz",
+        Codec::Pcma => "G.711 A-law, 8 kHz",
+        Codec::G722 => "G.722, 16 kHz wideband",
+    }
+}
+
+/// What the device picker shows for a device name.
+fn device_label(name: &str) -> String {
+    if name.trim().is_empty() {
+        "System default".to_string()
+    } else {
+        name.to_string()
+    }
 }
 
 impl eframe::App for QSoftphoneApp {
@@ -1432,7 +1785,7 @@ fn media_config_of(config: &AppConfig) -> qsoftphone_media::MediaConfig {
         .collect();
 
     // An empty or unusable list is not a reason to have no codec: the
-    // defaults speak both.
+    // defaults speak all three.
     let codecs = if codecs.is_empty() {
         Codec::ALL.to_vec()
     } else {
@@ -1862,15 +2215,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_redial_uses_the_dialled_number() {
-        // §5.1: the redial dials the number that was dialled, not the
-        // remote party — for a DID-forwarded call the remote party is
+        // §5.1: for an outgoing call the redial dials the number that
+        // was dialled — for a DID-forwarded call the remote party is
         // the PBX that forwarded it.
         let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
-        let mut record = CallRecord::from_incoming(
+        let mut record = CallRecord::from_outgoing(
             "acct-ui-1",
             "call-did",
             "sip:asterisk@sip.example.com",
-            "6666",
             "",
             1_000,
             2_000,
@@ -1879,12 +2231,65 @@ mod tests {
             true,
         );
         record.remote_number = "asterisk".to_string();
+        record.dialed_number = "6666".to_string();
 
         app.redial(&record);
 
         // The account is not registered, so the call cannot be placed
         // — but the target is the dialled number, not the PBX.
         assert_eq!(app.dial_number, "6666");
+    }
+
+    #[tokio::test]
+    async fn a_redial_of_an_incoming_call_calls_the_caller_back() {
+        // The bug the user reported: a call from 6661 to 104 has a
+        // dialled number of 104 — our own extension — and the redial
+        // called us instead of the caller.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let record = CallRecord::from_incoming(
+            "acct-ui-1",
+            "call-in",
+            "sip:6661@sip.example.com",
+            "104",
+            "",
+            1_000,
+            2_000,
+            200,
+            "Normal",
+            true,
+        );
+        assert_eq!(record.remote_number, "6661");
+
+        app.redial(&record);
+
+        assert_eq!(app.dial_number, "6661");
+    }
+
+    #[tokio::test]
+    async fn the_test_sound_is_played_off_the_interface_thread() {
+        // The button opens the speaker and waits for the tone, so it
+        // cannot run on the interface thread (§3). The work happens on
+        // the runtime and the answer comes back on a channel.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        app.view = View::Settings;
+
+        app.play_test_sound();
+        assert_eq!(app.sound_test, SoundTest::Playing);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.sound_test == SoundTest::Playing && std::time::Instant::now() < deadline {
+            frame(&mut app, &ctx);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // The tone was played, or the machine has no speaker to play
+        // it on — both are answers, and neither is a hang.
+        assert_ne!(
+            app.sound_test,
+            SoundTest::Playing,
+            "the test sound never finished"
+        );
     }
 
     /// The text on the screen.
@@ -1903,24 +2308,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_call_page_offers_the_codecs() {
-        // M4: the codec the next call offers is picked on the call
-        // page, the way the C++ had it in the settings.
+    async fn the_call_page_offers_no_codec_picker() {
+        // M5: the codec picker is off the call page. It was in the
+        // middle of the dialer, and a call page is no place for a
+        // list of three codecs.
         let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
         let ctx = egui::Context::default();
         let output = frame(&mut app, &ctx);
         let text = screen_text(&output);
-        assert!(text.contains("Codec"), "no codec picker:\n{text}");
-        // The picker shows the codec that is selected. The other one
-        // is in the drop-down, which is only drawn when it is open.
-        assert!(text.contains("PCMU"), "{text}");
+        assert!(!text.contains("Codec"), "the codec picker is back:\n{text}");
     }
 
     #[tokio::test]
     async fn the_whole_call_page_fits_the_window() {
-        // The dialer, the codec picker and the calls list all have to
-        // be on the screen at the size the app opens at. A row that
-        // is culled is a button the user cannot press.
+        // The dialer and the calls list all have to be on the screen
+        // at the size the app opens at. A row that is culled is a
+        // button the user cannot press.
         let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
         let ctx = egui::Context::default();
         let output = frame(&mut app, &ctx);
@@ -1928,26 +2331,84 @@ mod tests {
 
         assert!(text.contains("Number"), "the dialer is cut off:\n{text}");
         assert!(text.contains("Call"), "the call button is cut off:\n{text}");
-        assert!(
-            text.contains("Codec"),
-            "the codec picker is cut off:\n{text}"
-        );
         assert!(text.contains("CALLS"), "the call list is cut off:\n{text}");
+        // The codec picker is not on the call page any more: it is in
+        // the settings, where the rest of the media lives.
+        assert!(
+            !text.contains("Codec"),
+            "the codec picker is back on the call page:\n{text}"
+        );
     }
 
     #[tokio::test]
-    async fn the_codec_choice_moves_to_the_front_and_is_kept() {
+    async fn the_settings_page_holds_the_codecs_and_the_sound_card() {
         let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
-        assert_eq!(app.config.media.codecs, vec!["PCMU", "PCMA"]);
+        let ctx = egui::Context::default();
+        app.view = View::Settings;
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
 
-        app.set_codec("PCMA");
+        assert!(text.contains("CODECS"), "the codecs are cut off:\n{text}");
+        assert!(text.contains("PCMU"), "the codecs are cut off:\n{text}");
+        assert!(text.contains("G722"), "the codecs are cut off:\n{text}");
+        assert!(
+            text.contains("SOUND CARD"),
+            "the sound card is cut off:\n{text}"
+        );
+        assert!(
+            text.contains("Microphone"),
+            "the microphone picker is cut off:\n{text}"
+        );
+        assert!(
+            text.contains("Speaker"),
+            "the speaker picker is cut off:\n{text}"
+        );
+        assert!(
+            text.contains("Test sound"),
+            "the test sound is cut off:\n{text}"
+        );
+    }
 
-        // The one the user picked is the one the offer asks for.
-        assert_eq!(app.config.media.codecs, vec!["PCMA", "PCMU"]);
+    #[tokio::test]
+    async fn the_codecs_can_be_reordered_removed_and_added() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        assert_eq!(
+            app.config.media.codecs,
+            vec!["PCMU", "PCMA", "G722"],
+            "the wideband codec is there by default"
+        );
+
+        // G.722 to the front — that is what a user with a PBX that
+        // allows G.722 wants.
+        app.move_codec(Codec::G722, true);
+        app.move_codec(Codec::G722, true);
+        assert_eq!(app.config.media.codecs, vec!["G722", "PCMU", "PCMA"]);
+
         // And the call layer was told, because the registrar and the
         // call layer share the settings.
         let media = app.calls.media_config();
-        assert_eq!(media.codecs, vec![Codec::Pcma, Codec::Pcmu]);
+        assert_eq!(media.codecs, vec![Codec::G722, Codec::Pcmu, Codec::Pcma]);
+
+        // Out it goes, and back in again.
+        app.remove_codec(Codec::G722);
+        assert_eq!(app.config.media.codecs, vec!["PCMU", "PCMA"]);
+        assert!(!app.enabled_codecs().contains(&Codec::G722));
+
+        app.add_codec(Codec::G722);
+        assert_eq!(app.config.media.codecs, vec!["PCMU", "PCMA", "G722"]);
+    }
+
+    #[tokio::test]
+    async fn the_last_codec_cannot_be_turned_off() {
+        // A call with no codec has no media at all.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        app.remove_codec(Codec::Pcmu);
+        app.remove_codec(Codec::Pcma);
+        app.remove_codec(Codec::G722);
+        assert!(
+            !app.config.media.codecs.is_empty(),
+            "a codec has to stay on"
+        );
     }
 
     #[tokio::test]
