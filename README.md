@@ -9,7 +9,7 @@ identity resolution, the call event contract, the history rules and
 the transfer construction all have to behave identically, including the
 bugs that have already been fixed there.
 
-**Status: M4.1 complete.** The workspace builds, the test suite passes, the
+**Status: M4.2 complete.** The workspace builds, the test suite passes, the
 app starts and exits cleanly, an account can be registered against a SIP
 registrar with digest authentication (MD5 and SHA-256), and calls can be
 placed and received over that registration — outbound INVITE, inbound
@@ -17,7 +17,9 @@ INVITE with an automatic 180 Ringing, answer, decline, hang up, and DTMF.
 A call carries a voice: the RTP runs over a bound UDP port, G.711 and
 G.722 are both spoken, and the mute keeps the clock running. The codecs,
 the sound card and the test sound live on a settings page, and the
-history is in SQLite. See [Milestones](#milestones).
+history is in SQLite. The sound itself is continuous now: the playout
+waits for a jitter buffer to fill, a lost frame is concealed, and the
+playout follows the peer's clock. See [Milestones](#milestones).
 
 ---
 
@@ -1110,6 +1112,158 @@ proof would have been its own round trip.
 
 ---
 
+## M4.2 — The jitter buffer
+
+### The bug
+
+A call connected and the sound was broken — a "dithering" that came and
+went, for G.711 and for G.722 alike. **Both codecs being wrong the
+same way was the clue**: a codec fault does not look like that, and
+G.711 and G.722 share no code at all below the RTP layer.
+
+The fault was above the codecs: **there was no jitter buffer**.
+
+RTP is UDP. The peer sends a frame every 20 ms, and the sound card
+takes what it is given, ten milliseconds at a time. Without a buffer
+the speaker plays the ten milliseconds that have arrived and then goes
+silent until the next packet — so every twenty milliseconds the sound
+stopped and started again. The queue hovered between nothing and one
+frame, and that is exactly what was reported.
+
+The C++ never had the problem: pjmedia (pjsip 2.14) has a jitter buffer
+in it, and the RTP goes through that. This build had the RTP and the
+sound card, and nothing between them.
+
+### What is in it now
+
+Three things, and the first is the one that fixes the sound.
+
+* **The playout waits for the buffer to fill.** The speaker stays
+  silent until four frames — 80 ms — are waiting to be played, and then
+  plays them steadily. That is the jitter delay: the time the audio
+  spends in the machine so that a packet which arrives late does not
+  leave a hole in it.
+* **A jitter buffer** (`media::jitter`) holds the frames that arrived,
+  in sequence order, so a packet that took a detour is put back in its
+  place and a packet that never arrives is noticed.
+* **A lost frame is concealed** rather than dropped, because a decoder
+  that skips a frame falls out of step with the encoder at the other
+  end — and for G.722, which is ADPCM and keeps a state, that is noise
+  for the rest of the call.
+
+### Late is not lost
+
+The distinction is the whole of a jitter buffer. A frame that has not
+arrived yet may be on its way; a frame that has been given up on never
+will be. So the buffer does not decide by itself — it hands out the
+frame it is waiting for, and the playout comes back with "I have run
+out of patience" when the audio it has left runs out.
+
+* A frame that arrives **late but in time** is used. The playout waits
+  for it as long as it has slack.
+* A frame that **never arrives** — while the peer keeps sending — is
+  concealed, and the decoder takes its step so that it stays in step
+  with the encoder at the other end.
+* A frame that never arrives **because the peer stopped sending** is
+  not concealed at all. It is not a lost frame, it is the end of the
+  stream, and inventing audio for it would be wrong. The playout goes
+  silent, which is what silence is.
+
+The rule is tested both ways: a peer that stops sending produces
+nothing more, and a peer that skips a frame gets a concealment and
+stays in step.
+
+### The concealment, and why the obvious G.722 answer is wrong
+
+G.711 has a silence code — 0xFF for µ-law, 0xD5 for A-law — and the
+concealment is that code. G.722 has no silence code, and the two
+obvious candidates are both traps. This was measured, not guessed:
+
+| What is fed to the decoder | What happens |
+|---|---|
+| a frame of zeros | the high band's code 0 means "a large negative change" **and** carries the largest magnitude index, so the step size grows while it is fed — the sound is at full scale within a frame or two |
+| the last frame, repeated | the step size follows the magnitude of the code, so a loud frame makes it grow with every repetition — measured peak 32,767 |
+| **0xC0, repeated** | "no change" to both bands, with the *smallest* magnitude index there is, so both step sizes shrink: the decoder converges, the peak stays bounded, and the real frames bring the step sizes back |
+
+The table is the codec's own — `LOW_MAGNITUDES`, `HIGH_MAGNITUDES` and
+the level tables in `nanoaudio-g722` — and the numbers are the ones the
+tests measure.
+
+What a lost G.722 frame costs is honest: the decoder's estimate of the
+signal is one frame out of date, and it catches up over the next few
+frames (measured on a ramp: 13.8 dB, then 22.0 dB, then 31.7 dB of
+signal-to-noise over the three frames that follow). G.722 is a
+closed-loop codec, and a closed-loop codec cannot be resynchronised for
+free. What it can do is stay bounded, and it does.
+
+### The two clocks
+
+The peer's packets are timestamped with *its* clock and the sound card
+runs on *ours*, and the two drift against each other by a few hundred
+parts per million — the difference between two independent sound cards.
+Left alone, the buffer slowly empties and the sound breaks up again,
+minutes into a long call, which is the worst possible time for it.
+
+So the playout follows the peer: it plays very slightly faster or
+slower, by at most half a percent, according to how the buffer's level
+is trending. Half a percent is a sixth of a semitone and nobody hears
+it. The correction is slow, and it follows the *average* level rather
+than the level of the moment, so one late packet does not throw the
+rate about.
+
+### What the C++ does, and what this does not
+
+The C++ goes through pjmedia's jitter buffer (`pjmedia_jbuf`), and it
+is worth being precise about that one, because this build borrowed the
+ideas and not the code:
+
+* it is **frame-indexed** — a frame goes in at its own sequence
+  number, so a frame that arrives out of order goes to its own slot;
+* it has a **prefetch**: while the buffer is still filling up to the
+  prefetch count it hands out "nothing yet", which is the same idea as
+  this build's priming;
+* the **prefetch is adaptive**: the buffer measures the burst level —
+  the jitter it actually sees — and moves the prefetch with it, so the
+  delay follows the network;
+* a frame that never arrived is **reported as missing**, and the
+  transport runs the concealment for it;
+* when the buffer grows — which is what a difference in clocks does —
+  it **discards** frames to shorten the latency again.
+
+This build is fixed-depth (four frames) rather than adaptive, it is
+level-driven rather than clock-driven, it conceals a lost frame in the
+codec itself rather than in the transport, and it follows the peer's
+clock by playing very slightly faster or slower instead of by
+discarding frames.
+
+80 ms is a deliberate choice. ITU-T G.114 puts the one-way delay of a
+telephone call under 150 ms, and a hole in the audio is worse than
+delay. Making the depth adaptive, the way pjmedia does, is the obvious
+next step — it would take the delay down to a few frames on a clean
+network without giving up the margin on a bad one.
+
+### The dependency cost: nothing
+
+No new crate. The jitter buffer is a `VecDeque` and a sequence-number
+comparison; the rate correction is a multiplier on the resampler's step.
+
+### What is *not* in M4.2
+
+* **No RTCP.** The receiver does not hear the peer's reports, so it
+  does not know the peer's idea of the jitter, and it does not send
+  ours. The buffer's depth is fixed at four frames rather than
+  negotiated.
+* **No comfort noise.** A lost frame is concealed with the codec's
+  own "no change", not with synthesised noise. On a link with real
+  loss — a lossy mobile connection, say — a proper comfort-noise
+  generator would sound better than silence.
+* **No forward error correction.** Asterisk can be configured with
+  FEC for G.722; this build does not ask for it and cannot use it.
+* **No DTMF in the media plane.** RFC 4733 still goes out as SIP
+  `INFO`, exactly as in M2.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -1140,6 +1294,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M3** | History: SQLite persistence with the §5.3 semantics, redial using the resolved dialled number (§5.1), searchable list in the UI | **done** |
 | M4 | Media: `rtc` RTP + `cpal` audio — SDP negotiation, send/receive audio, mute, codec selection | **done** |
 | **M4.1** | Codecs & the sound card: G.722 (wideband), the codec list on a settings page, the device pickers, the test sound, the redial of an incoming call | **done** |
+| **M4.2** | The jitter buffer: the playout waits for the buffer to fill, a lost frame is concealed, and the playout follows the peer's clock | **done** |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
@@ -1201,7 +1356,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 251 tests, all passing.
+* `cargo test --workspace` — 269 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -1342,6 +1497,34 @@ player lands.
 * **The test sound is played off the interface thread.** The button
   starts the work on the runtime, and the answer comes back on a
   channel — whether the tone played or the machine has no speaker.
+* **The playout is continuous.** The peer sends a frame every 20 ms and
+  the card takes 10 ms at a time; the test plays ten frames that way
+  and checks that the sound never stops for more than the resampler's
+  first sample. The test fails with the priming removed — the playout
+  starts after 0 samples — so it is the buffer, not the test, that
+  makes the sound whole.
+* **The playout waits for the buffer to fill** before it starts, and
+  it does not stop again when the buffer runs low.
+* **The jitter buffer puts a late frame back in its place**, notices a
+  frame that never arrives, throws away a frame that is too late to be
+  of use, and does not grow without bound.
+* **A late frame is waited for, not concealed.** The playout keeps the
+  slack in the buffer while there is slack, and a frame that turns up
+  late is decoded like any other.
+* **A lost frame is concealed, and a peer that stops sending is not.**
+  The first is tested with a frame that never arrives while the peer
+  keeps sending; the second with a peer that sends one frame and then
+  stops, which produces no audio at all.
+* **A lost frame does not derail the G.722 decoder.** The signal-to-
+  noise on the frames after the loss climbs from 13.8 dB to 31.7 dB as
+  the decoder catches up.
+* **The G.722 concealment cannot run away.** A frame of zeros and a
+  repeated loud frame both reach full scale; the byte this build uses
+  stays bounded over eight consecutive concealments.
+* **The playout follows the peer's clock.** A simulation of a peer
+  that is 0.125 % slow — what two independent sound cards do to each
+  other — runs for two minutes with no underrun, and a peer that is
+  that fast does not make the delay run away either.
 
 **Verified against a real Asterisk:**
 
@@ -1369,10 +1552,12 @@ player lands.
   the real ones, but no call has yet been *answered* by a peer this
   repository did not write.
 * **No audio has been heard by a human.** The RTP path is proved
-  end to end between two sessions in this repository, and the G.711
-  codec is proved against its own tables — but no call has yet been
-  made to Asterisk and listened to. The desktop was locked for most of
-  the M4 build, so the sound card could not be exercised by a person.
+  end to end between two sessions in this repository, the G.711 codec
+  is proved against its own tables, and the jitter buffer is proved in
+  simulation — but no call has yet been made to Asterisk and listened
+  to. The desktop was locked for most of the M4 build, so the sound
+  card could not be exercised by a person. **The dithering that M4.2
+  fixes has not been heard fixed.**
 * **G.722 has not been talked to a PBX.** The codec is proved
   byte-exact against the reference implementation Asterisk uses — the
   published SHA-256 digests of the `sippy/libg722` vectors both match

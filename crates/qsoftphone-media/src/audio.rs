@@ -58,6 +58,43 @@ const MAX_OUTBOUND_FRAMES: usize = 20;
 /// bound follows the codec, see [`AudioState::set_frame_samples`].
 const MAX_INBOUND_FRAMES: usize = 100;
 
+/// How many frames of audio have to be waiting before the playout
+/// starts.
+///
+/// This is the jitter delay: the audio waits in the machine for this
+/// long before it reaches the speaker, so that a late packet does not
+/// leave a hole in it. Four frames are 80 ms — the same range as
+/// Asterisk's own jitter buffer.
+///
+/// It is a trade: the deeper the buffer, the more jitter it absorbs,
+/// and the longer the delay. 80 ms of delay in a call is not
+/// noticeable; a hole in the audio is.
+const PLAYOUT_FRAMES: usize = 4;
+
+/// How much the playout rate may be trimmed to follow the peer's clock.
+///
+/// The peer's clock and ours are two different clocks — its sound card
+/// and ours — and they drift against each other by a few hundred parts
+/// per million. The playout makes up the difference by playing very
+/// slightly faster or slower. Half a percent is a sixth of a semitone,
+/// which nobody hears; more than that would be.
+const MAX_RATE_TRIM: f64 = 0.005;
+
+/// How hard the correction pulls.
+///
+/// The correction is proportional to how far the buffer is from its
+/// target, so it settles with the buffer sitting a little below the
+/// target — a fraction of a percent of it, which is a handful of
+/// samples out of several hundred.
+const RATE_GAIN: f64 = 0.05;
+
+/// How quickly the average level follows the real one.
+///
+/// A fiftieth of the way per callback is about half a second of
+/// memory: enough to smooth out a late packet, slow enough that the
+/// correction does not chase the jitter.
+const LEVEL_SMOOTHING: f64 = 0.02;
+
 /// What went wrong with the sound card.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioError {
@@ -188,8 +225,20 @@ impl AudioState {
     }
 
     /// How many samples one frame holds.
-    fn frame_samples(&self) -> usize {
+    pub fn frame_samples(&self) -> usize {
         self.frame_samples.load(Ordering::Relaxed)
+    }
+
+    /// How many samples have to be waiting before the playout starts.
+    ///
+    /// This is the jitter delay: the audio waits here before it goes
+    /// to the speaker, so that a late packet does not leave a hole in
+    /// it. Without it the speaker plays the ten milliseconds that have
+    /// arrived and then goes silent until the next packet — and a call
+    /// that breaks up every twenty milliseconds sounds like it is
+    /// under water.
+    pub fn playout_target_samples(&self) -> usize {
+        PLAYOUT_FRAMES * self.frame_samples()
     }
 
     /// How many samples may wait to be played.
@@ -338,6 +387,14 @@ impl AudioState {
 pub struct Resampler {
     /// The input samples per output sample.
     step: f64,
+    /// What the step is multiplied by.
+    ///
+    /// One is the nominal rate. A number below one makes the
+    /// resampler consume its input more slowly: the audio is played a
+    /// little slower, and the pitch with it. That is how the playout
+    /// follows a peer whose clock runs slow — see
+    /// [`Playback::begin`].
+    rate: f64,
     /// The position of the next output, in input samples.
     position: f64,
     /// The input samples not yet consumed.
@@ -381,12 +438,22 @@ impl Resampler {
 
         Self {
             step,
+            rate: 1.0,
             position: 0.0,
             pending: VecDeque::new(),
             base: 0,
             output: VecDeque::new(),
             group,
         }
+    }
+
+    /// Change the rate the input is consumed at.
+    ///
+    /// One is the nominal rate. Below one the input lasts longer — the
+    /// audio is stretched, and the pitch with it — and above one it is
+    /// shortened. The playout uses this to follow the peer's clock.
+    pub fn set_rate(&mut self, rate: f64) {
+        self.rate = rate.clamp(0.5, 2.0);
     }
 
     /// Feed one input sample.
@@ -416,7 +483,7 @@ impl Resampler {
             let first = self.pending[offset];
             let second = self.pending[offset + 1];
             self.output.push_back(first + (second - first) * fraction);
-            self.position += self.step;
+            self.position += self.step * self.rate;
         }
 
         // Drop what no output will read any more.
@@ -500,6 +567,15 @@ struct Capture {
 /// The playback side: the decoded frames become the device's samples.
 struct Playback {
     resampler: Resampler,
+    /// Whether enough audio has arrived to start playing.
+    primed: bool,
+    /// The average number of samples waiting to be played.
+    ///
+    /// The level of the buffer says how the two clocks differ — the
+    /// peer's and ours — and the average is what the correction is
+    /// worked out from, so that a single late packet does not throw
+    /// the rate about.
+    average_level: f64,
 }
 
 /// Accumulates the codec's samples into whole frames.
@@ -811,9 +887,7 @@ pub fn open_speaker(
         .map(|d| d.name().to_string())
         .unwrap_or_else(|_| device.to_string());
 
-    let playback = Playback {
-        resampler: Resampler::new(codec.sample_rate(), rate),
-    };
+    let playback = Playback::new(codec.sample_rate(), rate);
 
     let stream = match format {
         SampleFormat::I8 => build_output::<i8>(&device, config, state.clone(), playback),
@@ -903,6 +977,7 @@ fn build_output<T: FromNormalised + cpal::SizedSample>(
         .build_output_stream::<T, _, _>(
             config,
             move |data: &mut [T], _| {
+                playback.begin(&state);
                 for slot in data.iter_mut() {
                     let value = playback.next(&state);
                     *slot = T::from_normalised(value);
@@ -918,11 +993,68 @@ fn build_output<T: FromNormalised + cpal::SizedSample>(
 
 /// The playback side: the decoded frames become the device's samples.
 impl Playback {
+    /// A playback that turns the codec's rate into the device's.
+    fn new(codec_rate: u32, device_rate: u32) -> Self {
+        Self {
+            resampler: Resampler::new(codec_rate, device_rate),
+            primed: false,
+            average_level: 0.0,
+        }
+    }
+
+    /// Get ready for a callback's worth of samples.
+    ///
+    /// The playout starts when the buffer holds enough audio to cover
+    /// the jitter. Before that the speaker is silent: playing what has
+    /// arrived as it arrives is what makes a call sound like it keeps
+    /// breaking up.
+    ///
+    /// This is called once per callback, not once per sample: the
+    /// check reads a counter, and a counter read per sample would be
+    /// 48 thousand locks a second.
+    fn begin(&mut self, state: &AudioState) {
+        let target = state.playout_target_samples() as f64;
+        let level = state.inbound_samples() as f64;
+
+        if !self.primed {
+            if level < target {
+                // Not enough audio yet: the speaker stays silent.
+                return;
+            }
+            self.primed = true;
+        }
+
+        // The two clocks.
+        //
+        // The peer's packets are timestamped with *its* clock and our
+        // sound card runs on *ours*, and the two drift against each
+        // other by a few hundred parts per million — the difference
+        // between two independent sound cards. The buffer's level says
+        // which way: if it is going down, the peer is slower than we
+        // are, and the playout has to slow down with it. Left alone,
+        // the buffer empties and the sound breaks up again — minutes
+        // into a long call, which is the worst time for it.
+        //
+        // The correction is small and slow on purpose. It changes the
+        // pitch by a fraction of a percent, and it follows the average
+        // level rather than the level of the moment, so that one late
+        // packet does not throw the rate about.
+        self.average_level += (level - self.average_level) * LEVEL_SMOOTHING;
+        let error = (target - self.average_level) / target;
+        let trim = (error * RATE_GAIN).clamp(-MAX_RATE_TRIM, MAX_RATE_TRIM);
+        self.resampler.set_rate(1.0 - trim);
+    }
+
     /// The next sample for the speaker.
     ///
     /// A muted speaker still consumes what arrives, so the queue does
     /// not grow without bound while the mute is on.
     fn next(&mut self, state: &AudioState) -> f32 {
+        if !self.primed {
+            // Not enough audio yet: silence, and nothing is consumed.
+            return 0.0;
+        }
+
         let muted = state.speaker_muted();
         let gain = state.speaker_gain();
 
@@ -1166,10 +1298,204 @@ mod tests {
 
         let mut playback = Playback {
             resampler: Resampler::new(8000, 48000),
+            primed: true,
+            average_level: 0.0,
         };
         assert_eq!(playback.next(&state), 0.0);
         // The samples are still consumed: two of the three.
         assert_eq!(state.inbound_samples(), 1);
+    }
+
+    #[test]
+    fn the_playout_is_continuous_when_the_frames_arrive_one_by_one() {
+        // This is the bug that made a call sound like it was breaking
+        // up: the speaker played the ten milliseconds that had arrived
+        // and then went silent until the next packet — so every
+        // twenty milliseconds the sound stopped and started again.
+        //
+        // The peer sends a frame every 20 ms and the card plays 10 ms
+        // at a time; the simulation does both.
+        let state = AudioState::default();
+        let mut playback = Playback::new(8000, 48000);
+
+        // A loud tone, so that silence is unmistakable.
+        let frame: Vec<i16> = vec![8000; 160];
+        let mut played: Vec<f32> = Vec::new();
+        let mut started_at = None;
+
+        for _ in 0..10 {
+            state.push_inbound(&frame);
+            playback.begin(&state);
+            // 20 ms of device samples at 48 kHz.
+            for _ in 0..960 {
+                if playback.primed && started_at.is_none() {
+                    started_at = Some(played.len());
+                }
+                played.push(playback.next(&state));
+            }
+        }
+
+        // The playout waited for the buffer to fill.
+        let started_at = started_at.expect("the playout never started");
+        assert!(
+            started_at >= 3 * 960,
+            "the playout started after {started_at} samples — the buffer was not full"
+        );
+
+        // And from then on the sound is continuous: no run of silence
+        // longer than the resampler's first sample.
+        let mut run = 0;
+        let mut worst = 0;
+        for value in played.iter().skip(started_at) {
+            if value.abs() < 0.01 {
+                run += 1;
+                worst = worst.max(run);
+            } else {
+                run = 0;
+            }
+        }
+        assert!(worst <= 2, "the playout had a hole of {worst} samples");
+
+        // The tone is there, at the level it was sent at.
+        let loudest = played
+            .iter()
+            .skip(started_at)
+            .fold(0.0f32, |loudest, value| loudest.max(value.abs()));
+        assert!(loudest > 0.2, "the tone did not arrive: {loudest}");
+    }
+
+    #[test]
+    fn the_playout_waits_for_the_buffer_to_be_full() {
+        // This is the fix for a call that sounds like it is breaking
+        // up: the speaker gets silence until there is enough audio
+        // buffered to cover the jitter, and then it plays steadily.
+        let state = AudioState::default();
+        let target = state.playout_target_samples();
+
+        let mut playback = Playback::new(8000, 48000);
+
+        // Not enough yet: silence, and nothing is consumed.
+        state.push_inbound(&vec![1000i16; target - 1]);
+        playback.begin(&state);
+        assert!(!playback.primed, "the playout started too early");
+        assert_eq!(playback.next(&state), 0.0);
+        assert_eq!(
+            state.inbound_samples(),
+            target - 1,
+            "the samples were consumed before the playout started"
+        );
+
+        // One more frame and the playout starts.
+        state.push_inbound(&[1000; 1]);
+        playback.begin(&state);
+        assert!(playback.primed, "the playout did not start");
+    }
+
+    #[test]
+    fn the_playout_stays_started_when_the_buffer_runs_low() {
+        // The playout starts once. After that it plays what it has,
+        // and a gap in the stream is a gap in the sound — not a
+        // restart of the wait.
+        let state = AudioState::default();
+        let target = state.playout_target_samples();
+        state.push_inbound(&vec![1000i16; target]);
+
+        let mut playback = Playback::new(8000, 48000);
+        playback.begin(&state);
+        assert!(playback.primed);
+
+        // The buffer runs dry.
+        state.take_inbound();
+        playback.begin(&state);
+        assert!(playback.primed, "the playout stopped again");
+        assert_eq!(playback.next(&state), 0.0);
+    }
+
+    #[test]
+    fn the_playout_follows_a_peer_whose_clock_is_slow() {
+        // The peer's packets are timestamped with its clock and our
+        // sound card runs on ours, and the two drift against each
+        // other by a few hundred parts per million. If the peer is the
+        // slow one, the buffer empties — and the sound breaks up
+        // again, minutes into a call, which is the worst time for it.
+        //
+        // The simulation: a card that takes exactly 8000 samples a
+        // second, and a peer that sends 7990 — a hundredth of a
+        // percent slow, which is what two independent sound cards do
+        // to each other.
+        let state = AudioState::default();
+        let mut playback = Playback::new(8000, 8000);
+
+        let frame = vec![1000i16; 160];
+        // Fill the buffer to its target.
+        for _ in 0..4 {
+            state.push_inbound(&frame);
+        }
+
+        let mut underruns = 0;
+        let mut lowest = usize::MAX;
+        for round in 0..6000 {
+            // Every twentieth millisecond the peer sends 159 samples
+            // instead of 160, because it is slow.
+            if round % 5 == 4 {
+                state.push_inbound(&frame[..159]);
+            } else {
+                state.push_inbound(&frame);
+            }
+            playback.begin(&state);
+            for _ in 0..160 {
+                if playback.next(&state) == 0.0 {
+                    underruns += 1;
+                }
+            }
+            lowest = lowest.min(state.inbound_samples());
+        }
+
+        assert_eq!(underruns, 0, "the playout ran dry {underruns} times");
+        assert!(lowest > 0, "the buffer ran down to {lowest} samples");
+        // And the playout slowed down to make up for the peer's clock.
+        assert!(
+            playback.resampler.rate < 1.0,
+            "the rate was not trimmed: {}",
+            playback.resampler.rate
+        );
+    }
+
+    #[test]
+    fn the_playout_follows_a_peer_whose_clock_is_fast() {
+        // The other way round: the peer is quick, the buffer fills up,
+        // and the playout has to hurry a little to keep the delay
+        // where it is.
+        let state = AudioState::default();
+        let mut playback = Playback::new(8000, 8000);
+
+        let frame = vec![1000i16; 160];
+        for _ in 0..4 {
+            state.push_inbound(&frame);
+        }
+
+        for round in 0..6000 {
+            state.push_inbound(&frame);
+            if round % 5 == 4 {
+                // One sample more than the card takes: the peer is quick.
+                state.push_inbound(&[1000i16]);
+            }
+            playback.begin(&state);
+            for _ in 0..160 {
+                playback.next(&state);
+            }
+        }
+
+        assert!(
+            playback.resampler.rate > 1.0,
+            "the rate was not trimmed: {}",
+            playback.resampler.rate
+        );
+        // The delay did not run away: the buffer is still near its
+        // target and the peer is not seconds ahead of us.
+        let level = state.inbound_samples();
+        let target = state.playout_target_samples();
+        assert!(level < target * 2, "the buffer ran away to {level} samples");
     }
 
     #[test]

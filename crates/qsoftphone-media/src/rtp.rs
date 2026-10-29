@@ -160,6 +160,10 @@ impl RtpSender {
 pub struct Received {
     /// The payload type the peer used.
     pub payload_type: u8,
+    /// The sequence number — which frame this is.
+    pub sequence_number: u16,
+    /// The timestamp — where in the stream it belongs.
+    pub timestamp: u32,
     /// The media payload, with the RTP header stripped.
     pub payload: Vec<u8>,
 }
@@ -188,6 +192,8 @@ pub fn receive(
         from,
         Received {
             payload_type: packet.header.payload_type,
+            sequence_number: packet.header.sequence_number,
+            timestamp: packet.header.timestamp,
             payload: packet.payload.to_vec(),
         },
     )))

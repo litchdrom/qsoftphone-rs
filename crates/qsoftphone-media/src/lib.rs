@@ -4,11 +4,17 @@
 //! carried no sound at all: the SDP named a port that nothing was
 //! bound to, and the peer sent its RTP into the void.
 //!
-//! M5 added the wideband codec: G.722 is 16 kHz of speech in 64
+//! M4.1 added the wideband codec: G.722 is 16 kHz of speech in 64
 //! kbit/s, and it needs a codec that keeps a state, a frame that is
 //! twice as big, and an RTP clock that does not move — RFC 3551
 //! §4.5.2 keeps G.722 on the 8 kHz clock of the original
 //! recommendation, so the RTP layer itself did not change at all.
+//!
+//! M4.2 added the **jitter buffer**: the frames wait in it before they
+//! are played, the playout starts only once it holds enough of them,
+//! a frame that never arrives is concealed, and the playout follows
+//! the peer's clock. Without it a call connects and sounds as if it is
+//! breaking up every twenty milliseconds.
 //!
 //! ## The shape of it
 //!
@@ -52,6 +58,7 @@ use tracing::{debug, warn};
 
 pub mod audio;
 pub mod codec;
+pub mod jitter;
 pub mod rtp;
 
 pub use audio::{AudioError, AudioState, DeviceInfo, devices, play_test_sound};
@@ -60,7 +67,17 @@ pub use rtp::RtpSocket;
 
 /// How long the receiving thread waits before it looks at the stop
 /// flag again.
-const READ_TIMEOUT: Duration = Duration::from_millis(20);
+///
+/// It is short on purpose: the playout has to notice that the buffer
+/// is running low, and it has to notice it before the speaker runs
+/// dry.
+const READ_TIMEOUT: Duration = Duration::from_millis(5);
+
+/// How many frames may wait in the jitter buffer.
+///
+/// Five frames is 100 ms — a little more than the playout delay, so
+/// that a burst of packets has somewhere to go.
+const MAX_JITTER_FRAMES: usize = 5;
 
 /// How long the sending thread waits for a frame before it looks at
 /// the stop flag again.
@@ -267,6 +284,10 @@ impl MediaSession {
         self.inner
             .payload_type
             .store(payload_type, Ordering::Relaxed);
+        // The frame is bigger for G.722, and the playout buffer is
+        // measured in frames — so the state has to know the codec
+        // even on a machine with no sound card to ask.
+        self.inner.state.set_frame_samples(codec.frame_samples());
     }
 
     /// Where the RTP is going.
@@ -570,6 +591,11 @@ fn receiver_loop(
     // The decoder is stateful for G.722: it has to see every frame in
     // order, from the first one, or the sound is noise.
     let mut decoder = codec.decoder();
+    // The frames that arrived, waiting for their turn. The jitter
+    // buffer knows which frame comes next, so a frame that arrives
+    // late is put back in its place and a frame that never arrives is
+    // noticed.
+    let mut jitter = jitter::JitterBuffer::new(MAX_JITTER_FRAMES);
     while !stop.load(Ordering::Relaxed) {
         match rtp::receive(&socket, &mut buffer) {
             Ok(Some((_from, packet))) => {
@@ -579,8 +605,11 @@ fn receiver_loop(
                 if packet.payload_type != payload_type {
                     continue;
                 }
-                let pcm = decoder.decode(&packet.payload);
-                state.push_inbound(&pcm);
+                jitter.push(jitter::Frame {
+                    sequence: packet.sequence_number,
+                    timestamp: packet.timestamp,
+                    payload: packet.payload,
+                });
             }
             Ok(None) => {
                 // Not an RTP packet. Ignore it.
@@ -596,8 +625,59 @@ fn receiver_loop(
                 break;
             }
         }
+
+        // The playout: decode the frames that are due, in order, and
+        // keep the buffer at its target.
+        drain_jitter(&mut jitter, &mut decoder, &state);
     }
     debug!("the RTP receiver has stopped");
+}
+
+/// Decode the frames that are due, and conceal the ones that are lost.
+///
+/// This is the playout step of the receiving thread. It is a function
+/// of its own so that it can be tested without a socket.
+///
+/// The buffer is the jitter delay — the audio waits here before it
+/// goes to the speaker. Decoding only while the buffer is below the
+/// target is what makes the wait work: the frames that arrive in the
+/// meantime wait in the jitter buffer, and the playout takes them when
+/// it needs them.
+fn drain_jitter(
+    jitter: &mut jitter::JitterBuffer,
+    decoder: &mut codec::Decoder,
+    state: &AudioState,
+) {
+    while state.inbound_samples() < state.playout_target_samples() {
+        match jitter.take() {
+            Some(frame) => {
+                let pcm = decoder.decode(&frame.payload);
+                state.push_inbound(&pcm);
+            }
+            None => {
+                // The frame has not arrived. A frame that is late is
+                // not a frame that is lost: while there is still audio
+                // in the buffer, wait for it.
+                if state.inbound_samples() >= state.frame_samples() {
+                    break;
+                }
+                // The playout is about to run dry. But a frame is only
+                // lost if the peer is still sending: if nothing has
+                // come after it, the peer may have stopped, and
+                // inventing audio for it would be wrong.
+                if jitter.depth() == 0 {
+                    break;
+                }
+                // The frame is lost. The decoder has to take a step
+                // anyway, or it falls out of step with the encoder at
+                // the other end — and for G.722 that means noise for
+                // the rest of the call.
+                jitter.skip();
+                let pcm = decoder.conceal();
+                state.push_inbound(&pcm);
+            }
+        }
+    }
 }
 
 /// Turn an address and a port into a socket address.
@@ -647,6 +727,112 @@ mod tests {
         // A peer that put G.711 on a dynamic number.
         session.negotiate(Codec::Pcma, 96);
         assert_eq!(session.payload_type(), 96);
+    }
+
+    #[test]
+    fn a_late_frame_is_waited_for_rather_than_concealed() {
+        // A frame that has not arrived yet may be on its way. The
+        // playout only gives up on it when the audio in the buffer
+        // runs out — and until then a late frame is used, not
+        // concealed.
+        let state = AudioState::default();
+        let mut jitter = jitter::JitterBuffer::new(5);
+        let mut decoder = Codec::Pcmu.decoder();
+
+        // The peer sends frame 1 and frame 3; frame 2 is late.
+        jitter.push(jitter::Frame {
+            sequence: 1,
+            timestamp: 160,
+            payload: vec![0xFF; 160],
+        });
+        jitter.push(jitter::Frame {
+            sequence: 3,
+            timestamp: 480,
+            payload: vec![0xFF; 160],
+        });
+
+        drain_jitter(&mut jitter, &mut decoder, &state);
+        assert_eq!(state.inbound_samples(), 160, "frame 1 was not decoded");
+
+        // There is still slack, so frame 2 is waited for.
+        drain_jitter(&mut jitter, &mut decoder, &state);
+        assert_eq!(
+            state.inbound_samples(),
+            160,
+            "the late frame was concealed while there was still slack"
+        );
+
+        // And now it turns up.
+        jitter.push(jitter::Frame {
+            sequence: 2,
+            timestamp: 320,
+            payload: vec![0xFF; 160],
+        });
+        drain_jitter(&mut jitter, &mut decoder, &state);
+        assert_eq!(state.inbound_samples(), 480, "the late frame was not used");
+    }
+
+    #[test]
+    fn a_frame_that_never_arrives_is_concealed() {
+        // The other side of the rule: when the playout has run out of
+        // patience, and the peer is still sending, the frame is lost
+        // and the decoder takes a step anyway — otherwise it falls out
+        // of step with the encoder at the other end.
+        let state = AudioState::default();
+        let mut jitter = jitter::JitterBuffer::new(5);
+        let mut decoder = Codec::Pcmu.decoder();
+
+        // The peer sends frame 1 and frame 3. Frame 2 never arrives.
+        jitter.push(jitter::Frame {
+            sequence: 1,
+            timestamp: 160,
+            payload: vec![0xFF; 160],
+        });
+        jitter.push(jitter::Frame {
+            sequence: 3,
+            timestamp: 480,
+            payload: vec![0xFF; 160],
+        });
+        drain_jitter(&mut jitter, &mut decoder, &state);
+        assert_eq!(state.inbound_samples(), 160);
+
+        // The card plays what was there, and frame 2 is not coming.
+        state.take_inbound();
+        drain_jitter(&mut jitter, &mut decoder, &state);
+        // The concealment (160) and frame 3 (160).
+        assert_eq!(
+            state.inbound_samples(),
+            320,
+            "the lost frame was not concealed"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_stops_sending_is_not_concealed() {
+        // The other half of the rule: a frame that will never arrive
+        // is not a lost frame when the peer has stopped sending — it
+        // is the end of the stream. Inventing audio for it would be
+        // wrong, and the playout is silent either way.
+        let state = AudioState::default();
+        let mut jitter = jitter::JitterBuffer::new(5);
+        let mut decoder = Codec::Pcmu.decoder();
+
+        jitter.push(jitter::Frame {
+            sequence: 1,
+            timestamp: 160,
+            payload: vec![0xFF; 160],
+        });
+        drain_jitter(&mut jitter, &mut decoder, &state);
+        assert_eq!(state.inbound_samples(), 160);
+
+        // The card plays it, and nothing more comes.
+        state.take_inbound();
+        drain_jitter(&mut jitter, &mut decoder, &state);
+        assert_eq!(
+            state.inbound_samples(),
+            0,
+            "audio was invented for a peer that stopped sending"
+        );
     }
 
     #[test]

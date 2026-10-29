@@ -331,7 +331,66 @@ impl Decoder {
             }
         }
     }
+
+    /// The samples that stand in for a frame that never arrived.
+    ///
+    /// The decoder has to keep going: a gap in the stream would leave
+    /// it out of step with the encoder at the other end — and for
+    /// G.722, which is ADPCM and keeps a state, that means the sound
+    /// is wrong for the rest of the call.
+    ///
+    /// For G.711 the frame is the silence code, which every
+    /// implementation agrees on.
+    ///
+    /// For G.722 there is no fixed code, and the two obvious choices
+    /// are both traps — see [`G722_CONCEALMENT_BYTE`] for what the
+    /// codec's own tables say about them.
+    pub fn conceal(&mut self) -> Vec<i16> {
+        let frame = match &self.inner {
+            DecoderInner::G711(codec) => {
+                let byte = match codec {
+                    Codec::Pcmu => 0xFF,
+                    Codec::Pcma => 0xD5,
+                    Codec::G722 => unreachable!("G.722 is not a G.711 codec"),
+                };
+                vec![byte; self.codec.frame_bytes()]
+            }
+            DecoderInner::G722(_) => {
+                vec![G722_CONCEALMENT_BYTE; self.codec.frame_bytes()]
+            }
+        };
+        self.decode(&frame)
+    }
 }
+
+/// The byte a G.722 decoder is given for a frame that never arrived.
+///
+/// G.722 has no silence code, and the two obvious choices are traps:
+///
+/// * **A frame of zeros is the worst one.** The high band's code 0
+///   means "a large negative change" — the difference it reconstructs
+///   is the biggest in the table — and its magnitude index is the
+///   largest too, so the step size *grows* while it is fed. The
+///   sound is at full scale within a frame or two, and stays there.
+/// * **Repeating the last frame pumps the last frame's step size.**
+///   The step size follows the magnitude of the code, so a frame of
+///   loud speech makes the decoder's step size grow with every
+///   repetition. It runs away the same way.
+///
+/// The byte 0xC0 says "no change" to both bands, and it says it in the
+/// only way the codec can:
+///
+/// * the low band code is 0, whose difference is the smallest there
+///   is and whose magnitude index is the lowest — the step size
+///   *shrinks*;
+/// * the high band code is 3, whose difference is the smallest of the
+///   four and whose magnitude index is also the lowest — the step
+///   size shrinks as well.
+///
+/// So the decoder converges: the step sizes fall to their minimum, the
+/// reconstruction rings down to the value it was at, and nothing runs
+/// away. The step sizes then grow again as the real frames arrive.
+const G722_CONCEALMENT_BYTE: u8 = 0xC0;
 
 /// The bias µ-law adds before the segment search.
 ///
@@ -636,6 +695,91 @@ mod tests {
         for (before, after) in pcm.iter().zip(decoded.iter()) {
             assert!((before - after).abs() < 300, "{before} -> {after}");
         }
+    }
+
+    #[test]
+    fn a_concealment_frame_is_quiet_and_the_right_size() {
+        for codec in Codec::ALL {
+            let mut decoder = codec.decoder();
+            let pcm = decoder.conceal();
+            assert_eq!(pcm.len(), codec.frame_samples());
+            for sample in pcm {
+                // G.722 has no fixed silence code, so its concealment
+                // is the smallest step the decoder knows — and the
+                // synthesis filter rings a little at the start of a
+                // frame. A few hundred counts is nothing.
+                assert!(
+                    sample.saturating_abs() < 128,
+                    "{codec:?} concealed to {sample}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_concealment_does_not_run_away() {
+        // G.722 is ADPCM: the decoder's step size follows the signal
+        // it is given. A concealment frame of zeros would say "no
+        // change", the error would grow, and the sound would end up at
+        // full scale within a frame or two. Repeating the last frame
+        // keeps the decoder in step and the sound in hand.
+        let pcm: Vec<i16> = (0..320)
+            .map(|i| (12_000.0 * (i as f32 / 40.0).sin()) as i16)
+            .collect();
+        let mut encoder = Codec::G722.encoder();
+        let frame = encoder.encode(&pcm);
+
+        let mut decoder = Codec::G722.decoder();
+        decoder.decode(&frame);
+        for _ in 0..8 {
+            let concealed = decoder.conceal();
+            let peak = concealed
+                .iter()
+                .map(|s| s.saturating_abs())
+                .max()
+                .unwrap_or(0);
+            assert!(peak < 16_384, "the concealment ran away: {peak}");
+        }
+    }
+
+    #[test]
+    fn a_lost_frame_does_not_derail_the_decoder() {
+        // G.722 is ADPCM: the decoder remembers the signal, and it has
+        // to see every frame in order. A frame that is missing and is
+        // not replaced would put the decoder out of step with the
+        // encoder at the other end — and then the rest of the call is
+        // noise.
+        let pcm: Vec<i16> = (0..320 * 8)
+            .map(|i| ((i as f32 / 2560.0) * 8000.0) as i16)
+            .collect();
+
+        let mut encoder = Codec::G722.encoder();
+        let frames: Vec<Vec<u8>> = pcm.chunks(320).map(|chunk| encoder.encode(chunk)).collect();
+
+        let mut decoder = Codec::G722.decoder();
+        let mut decoded = Vec::new();
+        for (index, frame) in frames.iter().enumerate() {
+            if index == 1 {
+                // The frame never arrived.
+                decoded.extend(decoder.conceal());
+            } else {
+                decoded.extend(decoder.decode(frame));
+            }
+        }
+
+        // The decoder caught up: a couple of frames later the signal
+        // is the signal again.
+        let start = 4 * 320;
+        let mut error = 0f64;
+        let mut signal = 0f64;
+        for (before, after) in pcm[start..].iter().zip(decoded[start..].iter()) {
+            let before = *before as f64;
+            let after = *after as f64;
+            signal += before * before;
+            error += (before - after) * (before - after);
+        }
+        let snr = 10.0 * (signal / error).log10();
+        assert!(snr > 20.0, "the decoder did not catch up: {snr:.1} dB");
     }
 
     #[test]
