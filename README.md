@@ -9,7 +9,7 @@ identity resolution, the call event contract, the history rules and
 the transfer construction all have to behave identically, including the
 bugs that have already been fixed there.
 
-**Status: M4.2 complete.** The workspace builds, the test suite passes, the
+**Status: M4.3 complete.** The workspace builds, the test suite passes, the
 app starts and exits cleanly, an account can be registered against a SIP
 registrar with digest authentication (MD5 and SHA-256), and calls can be
 placed and received over that registration — outbound INVITE, inbound
@@ -18,8 +18,10 @@ A call carries a voice: the RTP runs over a bound UDP port, G.711 and
 G.722 are both spoken, and the mute keeps the clock running. The codecs,
 the sound card and the test sound live on a settings page, and the
 history is in SQLite. The sound itself is continuous now: the playout
-waits for a jitter buffer to fill, a lost frame is concealed, and the
-playout follows the peer's clock. See [Milestones](#milestones).
+waits for a jitter buffer to fill, a lost frame is concealed, the
+playout follows the peer's clock, and the speaker is fed one value per
+*frame* rather than per channel slot — which is what was playing the
+audio at double speed. See [Milestones](#milestones).
 
 ---
 
@@ -1121,7 +1123,13 @@ went, for G.711 and for G.722 alike. **Both codecs being wrong the
 same way was the clue**: a codec fault does not look like that, and
 G.711 and G.722 share no code at all below the RTP layer.
 
-The fault was above the codecs: **there was no jitter buffer**.
+The fault was above the codecs, and it took two milestones to find it
+all. **M4.2 is the first half**: there was no jitter buffer. **M4.3 is
+the half that actually mattered**: the sound card's channels were
+miscounted, and the audio was being played at double speed. Both had
+to be fixed, and the second one is the one that made the noise.
+
+The first half, then:
 
 RTP is UDP. The peer sends a frame every 20 ms, and the sound card
 takes what it is given, ten milliseconds at a time. Without a buffer
@@ -1143,6 +1151,8 @@ Three things, and the first is the one that fixes the sound.
   plays them steadily. That is the jitter delay: the time the audio
   spends in the machine so that a packet which arrives late does not
   leave a hole in it.
+
+  *This is necessary, and it is not sufficient: see M4.3.*
 * **A jitter buffer** (`media::jitter`) holds the frames that arrived,
   in sequence order, so a packet that took a detour is put back in its
   place and a packet that never arrives is noticed.
@@ -1264,6 +1274,107 @@ comparison; the rate correction is a multiplier on the resampler's step.
 
 ---
 
+## M4.3 — The sound card's channels
+
+### The bug, again
+
+The jitter buffer went in and the sound was **still** broken. The
+report was the same as before: a "dithering" that came and went, for
+both codecs.
+
+And the clue that broke it open was this one: **the raw pcap plays
+without distortion.** The payloads on the wire are good. So the fault
+was not in the network, not in the codecs and not in the RTP — it was
+in what the build did with the samples between the socket and the
+speaker.
+
+### What was wrong
+
+The playback wrote **one resampled sample per channel slot**. The
+device's buffer is *interleaved*: a frame is one sample per channel,
+and the frames follow each other. A stereo card therefore wants one
+value per **frame**, and it got one per **slot** — so the audio was
+played at **double speed**.
+
+The capture side had it right all along:
+
+```rust
+let frames = data.len() / channels;   // the microphone: one value per frame
+for frame in 0..frames {
+    let mut sum = 0.0;
+    for channel in 0..channels { sum += data[frame * channels + channel]...; }
+    capture.push(sum / channels as f32, &state);
+}
+```
+
+The playback side did not:
+
+```rust
+for slot in data.iter_mut() {          // the speaker: one value per slot
+    let value = playback.next(&state);
+    *slot = T::from_normalised(value);
+}
+```
+
+Which is why the capture never showed the fault, and why the *sent*
+audio was clean in the pcap while the *received* audio was noise.
+
+### Why it sounds like that
+
+At double speed the voice is a chipmunk, and — this is the part that
+made it "dithering" rather than merely fast — **the buffer can never
+stay full**. Twice as much is taken out of the playout buffer as goes
+into it, so it is empty almost all the time: the speaker plays a
+fragment of audio, then silence, then the next fragment, as fast as
+the packets arrive. That is a dither, and the fragments are the
+missing bits.
+
+The measurement is in the test, and it is not subtle: with the old
+code, a stereo card starved the playout **44,876 times out of 48,000
+samples — 94 % of the time.** With the fix: never.
+
+It also explains why the jitter buffer could not save it. A buffer
+cannot hold a level that is being drained twice as fast as it is
+filled, and no amount of priming changes that.
+
+And it explains why the test sound was fine: the tone is generated at
+the card's own rate, so playing it at double speed is still a tone —
+just the wrong one, and a warble rather than a clean 440 Hz. That is
+fixed too, in the same way.
+
+### The fix
+
+`fill_output` walks the buffer **frame by frame** and gives every
+channel of a frame the same value:
+
+```rust
+for frame in data.chunks_mut(channels) {
+    let value = next();
+    for slot in frame { *slot = T::from_normalised(value); }
+}
+```
+
+The microphone and the speaker are now symmetric, and the audio moves
+at the speed of the frames.
+
+### The dependency cost: nothing
+
+### What is *not* in M4.3
+
+* **No per-device channel layouts.** Mono and stereo are handled; a
+  device with more than two channels gets the mono signal in every
+  channel, which is what a softphone wants anyway.
+* **No loudness control.** The pcap plays at the peer's level and so
+  does this; there is no gain stage between the socket and the card.
+* **The decimating resampler still averages only on a whole-number
+  ratio.** On a 44.1 kHz card the microphone's 44.100 → 8.000
+  conversion goes through point sampling rather than an averaging
+  filter, which is a weak low-pass. It is a quality wart on the
+  *sent* audio, not the received, and the card here runs at 48 kHz —
+  but a proper anti-aliasing filter belongs on that path.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -1295,6 +1406,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | M4 | Media: `rtc` RTP + `cpal` audio — SDP negotiation, send/receive audio, mute, codec selection | **done** |
 | **M4.1** | Codecs & the sound card: G.722 (wideband), the codec list on a settings page, the device pickers, the test sound, the redial of an incoming call | **done** |
 | **M4.2** | The jitter buffer: the playout waits for the buffer to fill, a lost frame is concealed, and the playout follows the peer's clock | **done** |
+| **M4.3** | The sound card's channels: one value per frame, not per slot — the audio was being played at double speed | **done** |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
@@ -1356,7 +1468,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 269 tests, all passing.
+* `cargo test --workspace` — 271 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -1525,6 +1637,15 @@ player lands.
   that is 0.125 % slow — what two independent sound cards do to each
   other — runs for two minutes with no underrun, and a peer that is
   that fast does not make the delay run away either.
+* **A stereo card gets one value per frame.** The interleaving is
+  checked directly — left, right, left, right, and every channel of a
+  frame gets the same value.
+* **A stereo card plays the audio at the right speed.** The whole
+  path, with a 48 kHz stereo device and a peer that sends a frame
+  every 20 ms: the playout never runs dry. With the old code it ran
+  dry **44,876 times out of 48,000 samples** — 94 % of the time.
+  That measurement is the bug: it is why the sound was a dither
+  rather than merely fast, and why a jitter buffer could not save it.
 
 **Verified against a real Asterisk:**
 
@@ -1553,11 +1674,13 @@ player lands.
   repository did not write.
 * **No audio has been heard by a human.** The RTP path is proved
   end to end between two sessions in this repository, the G.711 codec
-  is proved against its own tables, and the jitter buffer is proved in
-  simulation — but no call has yet been made to Asterisk and listened
-  to. The desktop was locked for most of the M4 build, so the sound
-  card could not be exercised by a person. **The dithering that M4.2
-  fixes has not been heard fixed.**
+  is proved against its own tables, and the jitter buffer and the
+  channel handling are proved in simulation — but no call has yet been
+  made to Asterisk and listened to. The desktop was locked for most of
+  the M4 build, so the sound card could not be exercised by a person.
+  **The dithering that M4.3 fixes has not been heard fixed** — it has
+  been proved wrong on the numbers, which is not the same thing, and
+  the next call is the real test.
 * **G.722 has not been talked to a PBX.** The codec is proved
   byte-exact against the reference implementation Asterisk uses — the
   published SHA-256 digests of the `sippy/libg722` vectors both match

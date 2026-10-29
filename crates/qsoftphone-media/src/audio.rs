@@ -713,6 +713,7 @@ pub fn play_test_sound(name: Option<&str>) -> Result<(), AudioError> {
         .default_output_config()
         .map_err(|e| AudioError::Backend(e.to_string()))?;
     let rate = supported.sample_rate();
+    let channels = supported.channels().max(1);
     let config: StreamConfig = supported.config();
     let format = supported.sample_format();
 
@@ -733,16 +734,16 @@ pub fn play_test_sound(name: Option<&str>) -> Result<(), AudioError> {
 
     let tone = Tone { samples, index: 0 };
     let stream = match format {
-        SampleFormat::I8 => build_tone_output::<i8>(&device, config, tone),
-        SampleFormat::I16 => build_tone_output::<i16>(&device, config, tone),
-        SampleFormat::I32 => build_tone_output::<i32>(&device, config, tone),
-        SampleFormat::I64 => build_tone_output::<i64>(&device, config, tone),
-        SampleFormat::U8 => build_tone_output::<u8>(&device, config, tone),
-        SampleFormat::U16 => build_tone_output::<u16>(&device, config, tone),
-        SampleFormat::U32 => build_tone_output::<u32>(&device, config, tone),
-        SampleFormat::U64 => build_tone_output::<u64>(&device, config, tone),
-        SampleFormat::F32 => build_tone_output::<f32>(&device, config, tone),
-        SampleFormat::F64 => build_tone_output::<f64>(&device, config, tone),
+        SampleFormat::I8 => build_tone_output::<i8>(&device, config, channels, tone),
+        SampleFormat::I16 => build_tone_output::<i16>(&device, config, channels, tone),
+        SampleFormat::I32 => build_tone_output::<i32>(&device, config, channels, tone),
+        SampleFormat::I64 => build_tone_output::<i64>(&device, config, channels, tone),
+        SampleFormat::U8 => build_tone_output::<u8>(&device, config, channels, tone),
+        SampleFormat::U16 => build_tone_output::<u16>(&device, config, channels, tone),
+        SampleFormat::U32 => build_tone_output::<u32>(&device, config, channels, tone),
+        SampleFormat::U64 => build_tone_output::<u64>(&device, config, channels, tone),
+        SampleFormat::F32 => build_tone_output::<f32>(&device, config, channels, tone),
+        SampleFormat::F64 => build_tone_output::<f64>(&device, config, channels, tone),
         other => {
             return Err(AudioError::UnsupportedFormat(format!(
                 "{other} is not a format this build can write"
@@ -780,6 +781,7 @@ impl Tone {
 fn build_tone_output<T: FromNormalised + cpal::SizedSample>(
     device: &Device,
     config: StreamConfig,
+    channels: u16,
     tone: Tone,
 ) -> Result<Stream, AudioError> {
     let mut tone = tone;
@@ -788,9 +790,8 @@ fn build_tone_output<T: FromNormalised + cpal::SizedSample>(
         .build_output_stream::<T, _, _>(
             config,
             move |data: &mut [T], _| {
-                for slot in data.iter_mut() {
-                    *slot = T::from_normalised(tone.next());
-                }
+                // One value per frame, not per slot: see `fill_output`.
+                fill_output(data, channels, || tone.next());
             },
             |error| {
                 tracing::warn!(error = %error, "the speaker reported an error");
@@ -880,6 +881,7 @@ pub fn open_speaker(
         .default_output_config()
         .map_err(|e| AudioError::Backend(e.to_string()))?;
     let rate = supported.sample_rate();
+    let channels = supported.channels().max(1);
     let config: StreamConfig = supported.config();
     let format = supported.sample_format();
     let device_name = device
@@ -890,16 +892,32 @@ pub fn open_speaker(
     let playback = Playback::new(codec.sample_rate(), rate);
 
     let stream = match format {
-        SampleFormat::I8 => build_output::<i8>(&device, config, state.clone(), playback),
-        SampleFormat::I16 => build_output::<i16>(&device, config, state.clone(), playback),
-        SampleFormat::I32 => build_output::<i32>(&device, config, state.clone(), playback),
-        SampleFormat::I64 => build_output::<i64>(&device, config, state.clone(), playback),
-        SampleFormat::U8 => build_output::<u8>(&device, config, state.clone(), playback),
-        SampleFormat::U16 => build_output::<u16>(&device, config, state.clone(), playback),
-        SampleFormat::U32 => build_output::<u32>(&device, config, state.clone(), playback),
-        SampleFormat::U64 => build_output::<u64>(&device, config, state.clone(), playback),
-        SampleFormat::F32 => build_output::<f32>(&device, config, state.clone(), playback),
-        SampleFormat::F64 => build_output::<f64>(&device, config, state.clone(), playback),
+        SampleFormat::I8 => build_output::<i8>(&device, config, channels, state.clone(), playback),
+        SampleFormat::I16 => {
+            build_output::<i16>(&device, config, channels, state.clone(), playback)
+        }
+        SampleFormat::I32 => {
+            build_output::<i32>(&device, config, channels, state.clone(), playback)
+        }
+        SampleFormat::I64 => {
+            build_output::<i64>(&device, config, channels, state.clone(), playback)
+        }
+        SampleFormat::U8 => build_output::<u8>(&device, config, channels, state.clone(), playback),
+        SampleFormat::U16 => {
+            build_output::<u16>(&device, config, channels, state.clone(), playback)
+        }
+        SampleFormat::U32 => {
+            build_output::<u32>(&device, config, channels, state.clone(), playback)
+        }
+        SampleFormat::U64 => {
+            build_output::<u64>(&device, config, channels, state.clone(), playback)
+        }
+        SampleFormat::F32 => {
+            build_output::<f32>(&device, config, channels, state.clone(), playback)
+        }
+        SampleFormat::F64 => {
+            build_output::<f64>(&device, config, channels, state.clone(), playback)
+        }
         other => {
             return Err(AudioError::UnsupportedFormat(format!(
                 "{other} is not a format this build can write"
@@ -967,6 +985,7 @@ impl Capture {
 fn build_output<T: FromNormalised + cpal::SizedSample>(
     device: &Device,
     config: StreamConfig,
+    channels: u16,
     state: Arc<AudioState>,
     playback: Playback,
 ) -> Result<Stream, AudioError> {
@@ -978,10 +997,7 @@ fn build_output<T: FromNormalised + cpal::SizedSample>(
             config,
             move |data: &mut [T], _| {
                 playback.begin(&state);
-                for slot in data.iter_mut() {
-                    let value = playback.next(&state);
-                    *slot = T::from_normalised(value);
-                }
+                fill_output(data, channels, || playback.next(&state));
             },
             |error| {
                 tracing::warn!(error = %error, "the speaker reported an error");
@@ -989,6 +1005,32 @@ fn build_output<T: FromNormalised + cpal::SizedSample>(
             None,
         )
         .map_err(|e| AudioError::Backend(e.to_string()))
+}
+
+/// Fill a device's buffer with the next frames of audio.
+///
+/// The device's buffer is **interleaved**: a frame is one sample per
+/// channel, and the frames follow each other. The audio is mono, so
+/// every channel of a frame gets the same value.
+///
+/// It is the **frame** that moves the audio along, not the slot.
+/// Writing one value per *slot* instead plays the audio as many times
+/// too fast as the device has channels — a stereo card plays it at
+/// double speed. That is distortion the whole way through, and it
+/// empties the playout buffer besides, because twice as much is taken
+/// out of it as goes in.
+fn fill_output<T: FromNormalised + cpal::SizedSample>(
+    data: &mut [T],
+    channels: u16,
+    mut next: impl FnMut() -> f32,
+) {
+    let channels = channels.max(1) as usize;
+    for frame in data.chunks_mut(channels) {
+        let value = next();
+        for slot in frame {
+            *slot = T::from_normalised(value);
+        }
+    }
 }
 
 /// The playback side: the decoded frames become the device's samples.
@@ -1496,6 +1538,71 @@ mod tests {
         let level = state.inbound_samples();
         let target = state.playout_target_samples();
         assert!(level < target * 2, "the buffer ran away to {level} samples");
+    }
+
+    #[test]
+    fn a_stereo_device_gets_one_value_per_frame() {
+        // The device's buffer is interleaved: left, right, left,
+        // right. The audio is mono, so every channel of a frame gets
+        // the same value — and it is the *frame* that moves the audio
+        // along.
+        //
+        // Writing one value per slot instead plays the audio at double
+        // speed on a stereo card, which is distortion the whole way
+        // through and empties the playout buffer besides.
+        let mut data = [0.0f32; 8];
+        let mut index = 0;
+        fill_output(&mut data, 2, || {
+            let value = index as f32;
+            index += 1;
+            value
+        });
+        assert_eq!(data, [0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn a_stereo_device_plays_the_audio_at_the_right_speed() {
+        // The whole thing, with a stereo card: a 48 kHz device, ten
+        // milliseconds of buffer, and a peer that sends one frame
+        // every 20 ms.
+        //
+        // If the audio is taken out of the buffer at the speed of the
+        // *slots* rather than the *frames*, twice as much is taken as
+        // comes in, and the playout runs dry.
+        let state = AudioState::default();
+        let mut playback = Playback::new(8000, 48000);
+
+        let frame = vec![1000i16; 160];
+        // Fill the buffer to its target.
+        for _ in 0..4 {
+            state.push_inbound(&frame);
+        }
+
+        // Ten milliseconds of a stereo card: 480 frames, 960 samples.
+        let mut buffer = [0.0f32; 960];
+        let mut underruns = 0;
+        for round in 0..100 {
+            playback.begin(&state);
+            fill_output(&mut buffer, 2, || {
+                let value = playback.next(&state);
+                if value == 0.0 {
+                    underruns += 1;
+                }
+                value
+            });
+            // The peer sends a frame every 20 ms.
+            if round % 2 == 1 {
+                state.push_inbound(&frame);
+            }
+        }
+
+        assert_eq!(underruns, 0, "the playout ran dry {underruns} times");
+        // And the buffer is still where it should be.
+        let level = state.inbound_samples();
+        assert!(
+            level <= state.playout_target_samples() + 160,
+            "the buffer ran away to {level} samples"
+        );
     }
 
     #[test]
