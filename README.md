@@ -9,7 +9,7 @@ identity resolution, the call event contract, the history rules and
 the transfer construction all have to behave identically, including the
 bugs that have already been fixed there.
 
-**Status: M4.3 complete.** The workspace builds, the test suite passes, the
+**Status: M4.4 complete.** The workspace builds, the test suite passes, the
 app starts and exits cleanly, an account can be registered against a SIP
 registrar with digest authentication (MD5 and SHA-256), and calls can be
 placed and received over that registration — outbound INVITE, inbound
@@ -19,9 +19,10 @@ G.722 are both spoken, and the mute keeps the clock running. The codecs,
 the sound card and the test sound live on a settings page, and the
 history is in SQLite. The sound itself is continuous now: the playout
 waits for a jitter buffer to fill, a lost frame is concealed, the
-playout follows the peer's clock, and the speaker is fed one value per
-*frame* rather than per channel slot — which is what was playing the
-audio at double speed. See [Milestones](#milestones).
+speaker is fed one value per *frame* rather than per channel slot —
+which is what was playing the audio at double speed — and the playout
+does **not** touch the pitch to chase the peer's clock, which is what
+made it wobble. See [Milestones](#milestones).
 
 ---
 
@@ -66,6 +67,7 @@ qsoftphone-rs/
     ├── qsoftphone-media/          the media plane: RTP, G.711, G.722, the sound card
     │   ├── audio.rs               the microphone, the speaker, the resampling
     │   ├── codec.rs               G.711, computed rather than tabulated
+    │   ├── jitter.rs              the jitter buffer: what arrived, in order
     │   ├── lib.rs                 the session: socket, negotiation, threads
     │   └── rtp.rs                 the UDP socket and the packets on it
     ├── qsoftphone-sip/            the SIP layer: transport, registration, calls
@@ -1214,12 +1216,28 @@ parts per million — the difference between two independent sound cards.
 Left alone, the buffer slowly empties and the sound breaks up again,
 minutes into a long call, which is the worst possible time for it.
 
-So the playout follows the peer: it plays very slightly faster or
-slower, by at most half a percent, according to how the buffer's level
-is trending. Half a percent is a sixth of a semitone and nobody hears
-it. The correction is slow, and it follows the *average* level rather
-than the level of the moment, so one late packet does not throw the
-rate about.
+**M4.2 answered that by trimming the playout rate**: the playout played
+very slightly faster or slower, by at most half a percent, according to
+how the buffer's level was trending. The correction was slow, and it
+followed the *average* level rather than the level of the moment, so one
+late packet did not throw the rate about.
+
+**That was wrong, and M4.4 removed it.** A rate change *is* a pitch
+change, and the correction was not the gentle half-percent it was
+meant to be: the buffer's level moves in whole frames, and a fast loop
+over a signal that steps a whole frame at a time turns that into a
+pitch wobble at the frame rate. Measured on a 400 Hz sine, the pitch
+wandered and the sine's purity — how much of the output's energy is at
+the frequency it is supposed to be at — fell from **1.000 to 0.17**.
+That was the "dithering", and it was in this section, not in the
+network.
+
+What holds the clock difference now is the buffer's **slack**: four
+frames, eighty milliseconds of difference between the two clocks. That
+covers a peer's drift for the better part of a minute, and it does it
+without touching the pitch. A clock recovery that does *not* touch the
+pitch — a timestamp-driven playout, as pjmedia does it — is the next
+piece of work and is on the [backlog](#backlog--low-priority).
 
 ### What the C++ does, and what this does not
 
@@ -1242,9 +1260,11 @@ ideas and not the code:
 
 This build is fixed-depth (four frames) rather than adaptive, it is
 level-driven rather than clock-driven, it conceals a lost frame in the
-codec itself rather than in the transport, and it follows the peer's
-clock by playing very slightly faster or slower instead of by
-discarding frames.
+codec itself rather than in the transport, and — since M4.4 — it does
+not trim the playout rate at all: the difference between the clocks is
+absorbed by the buffer's slack rather than by changing the pitch. A
+timestamp-driven playout, which is how pjmedia absorbs it without
+audible artefacts, is still to come.
 
 80 ms is a deliberate choice. ITU-T G.114 puts the one-way delay of a
 telephone call under 150 ms, and a hole in the audio is worse than
@@ -1255,7 +1275,8 @@ network without giving up the margin on a bad one.
 ### The dependency cost: nothing
 
 No new crate. The jitter buffer is a `VecDeque` and a sequence-number
-comparison; the rate correction is a multiplier on the resampler's step.
+comparison. (M4.2's rate correction was also a few lines on the
+resampler; M4.4 deleted them.)
 
 ### What is *not* in M4.2
 
@@ -1375,6 +1396,136 @@ at the speed of the frames.
 
 ---
 
+## M4.4 — The pitch wobble
+
+### The bug, a third time
+
+M4.2 and M4.3 both went in to fix "the distorted sound" and the report
+came back the same: *"Still have distorted sound. ANYHOW raw pcap plays
+sound without distortion."* The pcap playing cleanly is the clue that
+has held all along — **the payloads on the wire are good**, so the
+fault is in what this build does with the samples between the socket
+and the speaker.
+
+M4.2 built the jitter buffer and M4.3 fixed the channel count, and
+neither was enough. What was left was the **playout's own rate
+correction**, which M4.2 had added and nobody had measured.
+
+### What the correction did
+
+M4.2 wanted the playout to follow the peer's clock, because the two
+sound cards drift against each other, and it did it by trimming the
+resampler's step by up to half a percent. The intent was a sixth of a
+semitone — inaudible.
+
+The problem is that the buffer's level moves in **whole frames**: it is
+a count of frames waiting to be played, and it steps by one frame at a
+time, at the frame rate. A control loop with a fast gain (0.02 per
+callback) over a signal that steps a whole frame at a time does not
+produce a small steady offset. It produces a **pitch wobble at the
+frame rate** — the resampler's step is pushed up and down once per
+frame, and the sound's pitch moves with it.
+
+### The measurement
+
+This is where M4.2 went wrong, and it is worth saying plainly: the
+drift tests only checked that the buffer **did not run dry**. They
+could not see a pitch that was moving. So M4.4 built the measurement
+that could.
+
+The **fidelity harness** drives the whole path — a sine wave into the
+codec, through the jitter buffer, the decoder, the sample queue, the
+resampler and out to a simulated 48 kHz stereo card — and measures the
+output with a **Goertzel filter**, which picks out one frequency out of
+a signal. The number it reports is the **purity**: how much of the
+output's energy is at the frequency it is supposed to be at. A clean
+sine is 1.000.
+
+| | purity | fundamental |
+|---|---|---|
+| with the rate correction | **0.17** | 400.5 Hz (wandering) |
+| without it | **1.000** | 0.248 of the expected 0.25 |
+
+A wobble smears the phase, and a smeared sine has its energy spread
+across a band — which is exactly what a purity of 0.17 says.
+
+### The fix
+
+**The rate correction is gone.** Deleted, not clamped: `Resampler::rate`
+and `set_rate()`, `Playback::average_level`, and the three constants
+that drove them (`MAX_RATE_TRIM`, `RATE_GAIN`, `LEVEL_SMOOTHING`).
+`Playback::begin()` is now just the priming check.
+
+What holds the clock difference instead is the buffer's **slack**:
+four frames, eighty milliseconds. That covers a peer's drift for the
+better part of a minute, and it does it without touching the pitch.
+
+The rule this milestone leaves behind: **any rate change is a pitch
+change.** A jitter buffer that corrects a clock difference by changing
+the playout rate is trading one artefact for a worse one.
+
+### A constant shift is not a wobble
+
+The purity metric has to distinguish the two, or it will fail a build
+that is merely a fraction of a percent sharp. It does:
+
+* the metric **searches** for the strongest frequency near the
+  nominal one, so a build that sits at 400.5 Hz is still found, and is
+  not a wobble;
+* it takes the **worst** short window (200 ms), because a shift smears
+  in a long window while a wobble smears in every window it touches.
+
+### The tests
+
+M4.4 replaced two drift tests that could only see "the buffer ran dry"
+with seven that can see the audio:
+
+* `the_audio_that_comes_out_is_the_audio_that_went_in` — the whole
+  path, both codecs: purity above 0.98, the amplitude is right, and
+  there is **no energy at twice the frequency** (which is what a
+  double-speed playout looks like).
+* `the_audio_survives_a_jittery_and_lossy_peer` — one frame in fifty
+  lost, packets arriving early and late: less than 5 % silence, purity
+  above 0.95.
+* `the_pitch_does_not_move` — the dominant frequency, measured second
+  by second, stays within 1 Hz of 400 Hz.
+* `the_buffer_absorbs_the_difference_between_the_two_clocks` — thirty
+  seconds of a peer that is 0.125 % slow: no underrun.
+* `a_fast_peer_does_not_make_the_delay_run_away` — the other way
+  round.
+* `a_stereo_device_gets_one_value_per_frame` and
+  `a_stereo_device_plays_the_audio_at_the_right_speed` — M4.3's
+  regressions, kept.
+
+The first of these was checked against the old code: **it fails** when
+the rate correction is put back. That is what makes it a regression
+test and not a description.
+
+### The dependency cost: nothing
+
+No new crate, and no new dependency of any kind. The measurement is a
+Goertzel filter, which is a recurrence with two state variables.
+
+### What is *not* in M4.4
+
+* **No timestamp-driven playout.** The proper fix for the two clocks —
+  what pjmedia does — is to play each frame at the time its RTP
+  timestamp says, and to absorb a clock difference by discarding or
+  repeating a sample *at the boundary* rather than by changing the rate
+  of everything. That is the next piece of work and it is on the
+  [backlog](#backlog--low-priority). Without it, a clock difference
+  bigger than the buffer's slack — minutes into a long call, at a few
+  hundred parts per million — will still empty the buffer.
+* **The live call is still unverified.** The path is proved in
+  simulation and the numbers are clean, but the failing call's pcap
+  is not on this machine, so the real stream's loss and clock offset
+  have not been replayed through it. See
+  [Not verified](#verified-and-not).
+* **No adaptive jitter depth.** The buffer is still a fixed four
+  frames, so the delay is a flat 80 ms.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -1405,8 +1556,9 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M3** | History: SQLite persistence with the §5.3 semantics, redial using the resolved dialled number (§5.1), searchable list in the UI | **done** |
 | M4 | Media: `rtc` RTP + `cpal` audio — SDP negotiation, send/receive audio, mute, codec selection | **done** |
 | **M4.1** | Codecs & the sound card: G.722 (wideband), the codec list on a settings page, the device pickers, the test sound, the redial of an incoming call | **done** |
-| **M4.2** | The jitter buffer: the playout waits for the buffer to fill, a lost frame is concealed, and the playout follows the peer's clock | **done** |
+| **M4.2** | The jitter buffer: the playout waits for the buffer to fill, and a lost frame is concealed | **done** |
 | **M4.3** | The sound card's channels: one value per frame, not per slot — the audio was being played at double speed | **done** |
+| **M4.4** | The pitch wobble: the playout no longer trims its rate to chase the peer's clock — that *was* the dithering | **done** |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
@@ -1419,6 +1571,7 @@ none of them is lost and none of them disturbs the order above.
 
 | Item | Lands in | Notes |
 |---|---|---|
+| **A timestamp-driven playout** | M5 | The proper way to absorb the difference between the peer's clock and ours without touching the pitch. Each frame is played at the time its **RTP timestamp** says, and a clock difference is absorbed by dropping or repeating a sample at the **boundary** of a frame rather than by changing the rate of the whole stream. This is what pjmedia's jitter buffer does (`pjmedia_jbuf` is frame-indexed and clock-driven). M4.4 removed the rate correction that was doing it wrongly; this replaces it properly, and it is what makes a call hold up for hours rather than minutes. |
 | **Codec selection per account** | M6 | The codec list is now on the settings page and is **app-level**: the order is the offer's order, and it is kept in the settings file. What is still missing is that it should be **per account** — one account may only speak PCMU, another only PCMA. `AccountProfile` has no codec field yet, and the account editor has no control for one. |
 | **Media device selection, in the main settings** | **done in M4.1** | The picker is on the settings page: the microphone and the speaker, with "System default" and the devices of the machine. The device list is read on the runtime, not on the interface thread, and the name is persisted in the settings file — the fields were already there (`media.microphone`, `media.speaker`) and the media crate reads them. |
 | **Opus, as a third codec** | M6 | The next codec after G.722. It needs a pure-Rust encoder (`opus-rs`, which brings `fearless_simd` and `libm` with it), the RFC 7587 RTP framing, and — the hard part — a **third-party `codec_opus` module on the PBX**: Asterisk does not ship one, so the PBX has to be built with it before a single Opus call is possible. |
@@ -1633,10 +1786,22 @@ player lands.
 * **The G.722 concealment cannot run away.** A frame of zeros and a
   repeated loud frame both reach full scale; the byte this build uses
   stays bounded over eight consecutive concealments.
-* **The playout follows the peer's clock.** A simulation of a peer
-  that is 0.125 % slow — what two independent sound cards do to each
-  other — runs for two minutes with no underrun, and a peer that is
-  that fast does not make the delay run away either.
+* **The playout does not touch the pitch.** A 400 Hz sine through the
+  whole path — codec, jitter buffer, decoder, queue, resampler, a
+  simulated 48 kHz stereo card — comes out with a **purity of 1.000**:
+  all of the energy is at the frequency it went in at. The pitch does
+  not move: measured second by second, the dominant frequency stays
+  within 1 Hz of 400 Hz. With M4.2's rate correction put back, the
+  purity falls to **0.17** and the pitch wanders to 400.5 Hz. That
+  measurement is the bug, and it is what the "dithering" was.
+* **The buffer absorbs the difference between the two clocks.** A
+  simulation of a peer that is 0.125 % slow — what two independent
+  sound cards do to each other — runs for thirty seconds with no
+  underrun, and a peer that is that fast does not make the delay run
+  away either.
+* **The audio survives a jittery and lossy peer.** One frame in fifty
+  lost, with packets arriving early and late: less than 5 % silence
+  and a purity above 0.95.
 * **A stereo card gets one value per frame.** The interleaving is
   checked directly — left, right, left, right, and every channel of a
   frame gets the same value.
@@ -1646,6 +1811,9 @@ player lands.
   dry **44,876 times out of 48,000 samples** — 94 % of the time.
   That measurement is the bug: it is why the sound was a dither
   rather than merely fast, and why a jitter buffer could not save it.
+* **There is no energy at twice the frequency.** A playout running at
+  double speed puts a second harmonic where there should be none; the
+  fidelity test looks for it and does not find it.
 
 **Verified against a real Asterisk:**
 
@@ -1674,13 +1842,22 @@ player lands.
   repository did not write.
 * **No audio has been heard by a human.** The RTP path is proved
   end to end between two sessions in this repository, the G.711 codec
-  is proved against its own tables, and the jitter buffer and the
-  channel handling are proved in simulation — but no call has yet been
-  made to Asterisk and listened to. The desktop was locked for most of
-  the M4 build, so the sound card could not be exercised by a person.
-  **The dithering that M4.3 fixes has not been heard fixed** — it has
-  been proved wrong on the numbers, which is not the same thing, and
-  the next call is the real test.
+  is proved against its own tables, the jitter buffer and the channel
+  handling are proved in simulation, and the audio's **fidelity** is
+  measured (a purity of 1.000 through the whole path) — but no call
+  has yet been made to Asterisk and listened to. The desktop was locked
+  for most of the M4 build, so the sound card could not be exercised by
+  a person. **The dithering that M4.3 and M4.4 fix has not been heard
+  fixed** — it has been proved wrong on the numbers, which is not the
+  same thing, and the next call is the real test.
+* **The failing call's pcap is not on this machine.** The report was
+  that the raw pcap plays cleanly and the softphone does not, which
+  proves the payloads are good; but the capture itself has not been
+  replayed through this build's path, so the real stream's loss and its
+  clock offset have not been measured. Dropping that pcap into the
+  workspace would settle it: the RTP timestamps against the arrival
+  times give the clock difference directly, and the sequence numbers
+  give the loss.
 * **G.722 has not been talked to a PBX.** The codec is proved
   byte-exact against the reference implementation Asterisk uses — the
   published SHA-256 digests of the `sippy/libg722` vectors both match

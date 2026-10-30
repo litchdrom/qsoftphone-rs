@@ -71,30 +71,6 @@ const MAX_INBOUND_FRAMES: usize = 100;
 /// noticeable; a hole in the audio is.
 const PLAYOUT_FRAMES: usize = 4;
 
-/// How much the playout rate may be trimmed to follow the peer's clock.
-///
-/// The peer's clock and ours are two different clocks — its sound card
-/// and ours — and they drift against each other by a few hundred parts
-/// per million. The playout makes up the difference by playing very
-/// slightly faster or slower. Half a percent is a sixth of a semitone,
-/// which nobody hears; more than that would be.
-const MAX_RATE_TRIM: f64 = 0.005;
-
-/// How hard the correction pulls.
-///
-/// The correction is proportional to how far the buffer is from its
-/// target, so it settles with the buffer sitting a little below the
-/// target — a fraction of a percent of it, which is a handful of
-/// samples out of several hundred.
-const RATE_GAIN: f64 = 0.05;
-
-/// How quickly the average level follows the real one.
-///
-/// A fiftieth of the way per callback is about half a second of
-/// memory: enough to smooth out a late packet, slow enough that the
-/// correction does not chase the jitter.
-const LEVEL_SMOOTHING: f64 = 0.02;
-
 /// What went wrong with the sound card.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioError {
@@ -387,14 +363,6 @@ impl AudioState {
 pub struct Resampler {
     /// The input samples per output sample.
     step: f64,
-    /// What the step is multiplied by.
-    ///
-    /// One is the nominal rate. A number below one makes the
-    /// resampler consume its input more slowly: the audio is played a
-    /// little slower, and the pitch with it. That is how the playout
-    /// follows a peer whose clock runs slow — see
-    /// [`Playback::begin`].
-    rate: f64,
     /// The position of the next output, in input samples.
     position: f64,
     /// The input samples not yet consumed.
@@ -438,22 +406,12 @@ impl Resampler {
 
         Self {
             step,
-            rate: 1.0,
             position: 0.0,
             pending: VecDeque::new(),
             base: 0,
             output: VecDeque::new(),
             group,
         }
-    }
-
-    /// Change the rate the input is consumed at.
-    ///
-    /// One is the nominal rate. Below one the input lasts longer — the
-    /// audio is stretched, and the pitch with it — and above one it is
-    /// shortened. The playout uses this to follow the peer's clock.
-    pub fn set_rate(&mut self, rate: f64) {
-        self.rate = rate.clamp(0.5, 2.0);
     }
 
     /// Feed one input sample.
@@ -483,7 +441,7 @@ impl Resampler {
             let first = self.pending[offset];
             let second = self.pending[offset + 1];
             self.output.push_back(first + (second - first) * fraction);
-            self.position += self.step * self.rate;
+            self.position += self.step;
         }
 
         // Drop what no output will read any more.
@@ -569,13 +527,6 @@ struct Playback {
     resampler: Resampler,
     /// Whether enough audio has arrived to start playing.
     primed: bool,
-    /// The average number of samples waiting to be played.
-    ///
-    /// The level of the buffer says how the two clocks differ — the
-    /// peer's and ours — and the average is what the correction is
-    /// worked out from, so that a single late packet does not throw
-    /// the rate about.
-    average_level: f64,
 }
 
 /// Accumulates the codec's samples into whole frames.
@@ -1040,7 +991,6 @@ impl Playback {
         Self {
             resampler: Resampler::new(codec_rate, device_rate),
             primed: false,
-            average_level: 0.0,
         }
     }
 
@@ -1055,36 +1005,9 @@ impl Playback {
     /// check reads a counter, and a counter read per sample would be
     /// 48 thousand locks a second.
     fn begin(&mut self, state: &AudioState) {
-        let target = state.playout_target_samples() as f64;
-        let level = state.inbound_samples() as f64;
-
-        if !self.primed {
-            if level < target {
-                // Not enough audio yet: the speaker stays silent.
-                return;
-            }
+        if !self.primed && state.inbound_samples() >= state.playout_target_samples() {
             self.primed = true;
         }
-
-        // The two clocks.
-        //
-        // The peer's packets are timestamped with *its* clock and our
-        // sound card runs on *ours*, and the two drift against each
-        // other by a few hundred parts per million — the difference
-        // between two independent sound cards. The buffer's level says
-        // which way: if it is going down, the peer is slower than we
-        // are, and the playout has to slow down with it. Left alone,
-        // the buffer empties and the sound breaks up again — minutes
-        // into a long call, which is the worst time for it.
-        //
-        // The correction is small and slow on purpose. It changes the
-        // pitch by a fraction of a percent, and it follows the average
-        // level rather than the level of the moment, so that one late
-        // packet does not throw the rate about.
-        self.average_level += (level - self.average_level) * LEVEL_SMOOTHING;
-        let error = (target - self.average_level) / target;
-        let trim = (error * RATE_GAIN).clamp(-MAX_RATE_TRIM, MAX_RATE_TRIM);
-        self.resampler.set_rate(1.0 - trim);
     }
 
     /// The next sample for the speaker.
@@ -1341,7 +1264,6 @@ mod tests {
         let mut playback = Playback {
             resampler: Resampler::new(8000, 48000),
             primed: true,
-            average_level: 0.0,
         };
         assert_eq!(playback.next(&state), 0.0);
         // The samples are still consumed: two of the three.
@@ -1454,17 +1376,25 @@ mod tests {
     }
 
     #[test]
-    fn the_playout_follows_a_peer_whose_clock_is_slow() {
+    fn the_buffer_absorbs_the_difference_between_the_two_clocks() {
         // The peer's packets are timestamped with its clock and our
         // sound card runs on ours, and the two drift against each
         // other by a few hundred parts per million. If the peer is the
         // slow one, the buffer empties — and the sound breaks up
         // again, minutes into a call, which is the worst time for it.
         //
+        // What holds it is the **slack**: four frames of buffer, which
+        // is eighty milliseconds of difference between the two clocks.
         // The simulation: a card that takes exactly 8000 samples a
         // second, and a peer that sends 7990 — a hundredth of a
         // percent slow, which is what two independent sound cards do
         // to each other.
+        //
+        // The playout must not **change the pitch** to cover the
+        // difference: that is audible, and it is what a jitter buffer
+        // is supposed to prevent. The buffer's slack covers the
+        // difference instead, and a clock recovery that does not touch
+        // the pitch is the next piece of work.
         let state = AudioState::default();
         let mut playback = Playback::new(8000, 8000);
 
@@ -1476,9 +1406,10 @@ mod tests {
 
         let mut underruns = 0;
         let mut lowest = usize::MAX;
-        for round in 0..6000 {
-            // Every twentieth millisecond the peer sends 159 samples
-            // instead of 160, because it is slow.
+        // Thirty seconds: the slack covers the difference for a minute.
+        for round in 0..1500 {
+            // Every fifth round the peer sends 159 samples instead of
+            // 160, because it is slow.
             if round % 5 == 4 {
                 state.push_inbound(&frame[..159]);
             } else {
@@ -1495,19 +1426,12 @@ mod tests {
 
         assert_eq!(underruns, 0, "the playout ran dry {underruns} times");
         assert!(lowest > 0, "the buffer ran down to {lowest} samples");
-        // And the playout slowed down to make up for the peer's clock.
-        assert!(
-            playback.resampler.rate < 1.0,
-            "the rate was not trimmed: {}",
-            playback.resampler.rate
-        );
     }
 
     #[test]
-    fn the_playout_follows_a_peer_whose_clock_is_fast() {
-        // The other way round: the peer is quick, the buffer fills up,
-        // and the playout has to hurry a little to keep the delay
-        // where it is.
+    fn a_fast_peer_does_not_make_the_delay_run_away() {
+        // The other way round: the peer is quick, so the buffer fills
+        // up. The delay must not run away with it.
         let state = AudioState::default();
         let mut playback = Playback::new(8000, 8000);
 
@@ -1516,7 +1440,7 @@ mod tests {
             state.push_inbound(&frame);
         }
 
-        for round in 0..6000 {
+        for round in 0..1500 {
             state.push_inbound(&frame);
             if round % 5 == 4 {
                 // One sample more than the card takes: the peer is quick.
@@ -1528,11 +1452,6 @@ mod tests {
             }
         }
 
-        assert!(
-            playback.resampler.rate > 1.0,
-            "the rate was not trimmed: {}",
-            playback.resampler.rate
-        );
         // The delay did not run away: the buffer is still near its
         // target and the peer is not seconds ahead of us.
         let level = state.inbound_samples();
@@ -1602,6 +1521,331 @@ mod tests {
         assert!(
             level <= state.playout_target_samples() + 160,
             "the buffer ran away to {level} samples"
+        );
+    }
+
+    /// The energy of a signal at one frequency.
+    ///
+    /// This is the Goertzel filter: it picks out one frequency out of
+    /// a signal, which is how a test says "that is a 400 Hz sine" and
+    /// "that is not a 400 Hz sine".
+    fn goertzel(samples: &[f32], frequency: f32, rate: u32) -> f64 {
+        let n = samples.len() as f64;
+        let omega = 2.0 * std::f64::consts::PI * frequency as f64 / rate as f64;
+        let coefficient = 2.0 * omega.cos();
+        let (mut previous, mut before) = (0.0f64, 0.0f64);
+        for &sample in samples {
+            let current = sample as f64 + coefficient * previous - before;
+            before = previous;
+            previous = current;
+        }
+        (previous * previous + before * before - coefficient * previous * before).sqrt() / n
+    }
+
+    /// The strongest frequency near `around`, and its strength.
+    ///
+    /// The search matters: a playout that tracks the peer's clock may
+    /// sit a fraction of a percent off the nominal frequency, and that
+    /// is a pitch shift, not a distortion. What is a distortion is the
+    /// frequency *wandering* — and that shows up as a spread, which no
+    /// single frequency accounts for.
+    fn strongest_frequency(samples: &[f32], rate: u32, around: f32, span: f32) -> (f32, f64) {
+        let mut best = (around, 0.0f64);
+        let mut frequency = around - span;
+        while frequency <= around + span {
+            let strength = goertzel(samples, frequency, rate);
+            if strength > best.1 {
+                best = (frequency, strength);
+            }
+            frequency += 0.25;
+        }
+        best
+    }
+
+    /// How much of a signal's energy is at its strongest frequency.
+    fn purity(samples: &[f32], rate: u32, around: f32, span: f32) -> (f32, f64) {
+        let total: f64 = samples
+            .iter()
+            .map(|s| (*s as f64) * (*s as f64))
+            .sum::<f64>()
+            / samples.len() as f64;
+        let (frequency, strength) = strongest_frequency(samples, rate, around, span);
+        (frequency, 2.0 * strength * strength / total)
+    }
+
+    /// The worst purity in a series of short windows.
+    ///
+    /// A short window is the point: a playout that sits a fraction of
+    /// a percent off the nominal frequency is playing a *shifted*
+    /// sine, which is not a distortion, and a long window would
+    /// smear it into one. A wobble, on the other hand — a pitch that
+    /// moves — smears every window it touches, and the worst window
+    /// says so.
+    fn worst_purity(samples: &[f32], rate: u32, around: f32, span: f32) -> f64 {
+        let window = (rate as usize / 5).max(1024);
+        let mut worst = 1.0f64;
+        let mut start = 0;
+        while start + window <= samples.len() {
+            let (_, purity) = purity(&samples[start..start + window], rate, around, span);
+            worst = worst.min(purity);
+            start += window;
+        }
+        worst
+    }
+
+    #[test]
+    fn the_audio_that_comes_out_is_the_audio_that_went_in() {
+        // The whole path, with a clean signal: a sine wave, encoded to
+        // the codec, through the jitter buffer, the decoder, the sample
+        // queue and the resampler, out to a simulated 48 kHz stereo
+        // card.
+        //
+        // What comes out has to be the same sine. A sample lost, a
+        // rate that is wrong, a channel counted twice, a frame played
+        // out of order — every one of those shows up here as energy
+        // where there should be none.
+        //
+        // The measure is the **purity**: how much of the output's
+        // energy is at the frequency it is supposed to be at. A clean
+        // sine is 1.0. The pitch wandering by a fraction of a percent
+        // — which a jitter buffer's clock correction can easily do —
+        // smears the phase and takes it to a fraction.
+        const CARD_RATE: u32 = 48000;
+        const CHANNELS: u16 = 2;
+        const FREQUENCY: f32 = 400.0;
+        const AMPLITUDE: f32 = 0.5;
+        const SECONDS: usize = 5;
+
+        for codec in [crate::codec::Codec::Pcmu, crate::codec::Codec::Pcma] {
+            let codec_rate = codec.sample_rate();
+            let total = codec_rate as usize * SECONDS;
+
+            // The signal, and the frames it becomes.
+            let signal: Vec<i16> = (0..total)
+                .map(|i| {
+                    let t = i as f32 / codec_rate as f32;
+                    (AMPLITUDE * (2.0 * std::f32::consts::PI * FREQUENCY * t).sin() * 32767.0)
+                        as i16
+                })
+                .collect();
+            let mut encoder = codec.encoder();
+            let payloads: Vec<Vec<u8>> = signal
+                .chunks(codec.frame_samples())
+                .map(|chunk| encoder.encode(chunk))
+                .collect();
+
+            // The peer, the jitter buffer and the decoder.
+            let state = AudioState::default();
+            let mut jitter = crate::jitter::JitterBuffer::new(5);
+            let mut decoder = codec.decoder();
+            let mut playback = Playback::new(codec_rate, CARD_RATE);
+
+            // The card: ten milliseconds of a stereo device.
+            let mut buffer = [0.0f32; 960];
+            let mut output: Vec<f32> = Vec::new();
+
+            for round in 0..(SECONDS * 100) {
+                // The card's callback.
+                playback.begin(&state);
+                fill_output(&mut buffer, CHANNELS, || playback.next(&state));
+                for frame in buffer.chunks_exact(CHANNELS as usize) {
+                    output.push(frame[0]);
+                }
+
+                // The peer sends a frame every 20 ms.
+                if round % 2 == 0 && round / 2 < payloads.len() {
+                    let index = round / 2;
+                    jitter.push(crate::jitter::Frame {
+                        sequence: index as u16,
+                        timestamp: (index as u32) * 160,
+                        payload: payloads[index].clone(),
+                    });
+                    crate::drain_jitter(&mut jitter, &mut decoder, &state);
+                }
+            }
+
+            // The first 200 ms are the playout filling its buffer.
+            let played = &output[200 * (CARD_RATE as usize / 1000)..];
+
+            let (frequency, _) = purity(played, CARD_RATE, FREQUENCY, 20.0);
+            let purity = worst_purity(played, CARD_RATE, FREQUENCY, 20.0);
+
+            assert!(
+                purity > 0.98,
+                "{codec:?}: the output is not a clean sine — \
+                 {purity:.3} of the energy is at the frequency"
+            );
+            // The pitch may sit a fraction of a percent off nominal —
+            // the playout follows the peer's clock — but not more.
+            assert!(
+                (frequency - FREQUENCY).abs() < FREQUENCY * 0.01,
+                "{codec:?}: the output is at {frequency:.1} Hz, \
+                 expected {FREQUENCY}"
+            );
+            let amplitude = 2.0 * goertzel(played, frequency, CARD_RATE);
+            assert!(
+                (amplitude - AMPLITUDE as f64).abs() < 0.05,
+                "{codec:?}: the output's amplitude is {amplitude:.3}, \
+                 expected {AMPLITUDE}"
+            );
+            // And nothing at twice the frequency — that is what a
+            // double-speed playback looks like.
+            let double = goertzel(played, frequency * 2.0, CARD_RATE);
+            assert!(
+                double < amplitude * 0.05,
+                "{codec:?}: there is energy at twice the frequency \
+                 ({double:.5} against {amplitude:.5})"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pitch_does_not_move() {
+        // The playout must not change the pitch to cover a difference
+        // in clocks: a rate is a pitch, and a pitch that moves is
+        // heard — as a wobble, or as a slow slide.
+        //
+        // So the pitch is watched, second by second, over a call.
+        const CARD_RATE: u32 = 48000;
+        let state = AudioState::default();
+        let playback = Playback::new(8000, CARD_RATE);
+        let mut playback = playback;
+        let frame = vec![16384i16; 160];
+        for _ in 0..4 {
+            state.push_inbound(&frame);
+        }
+        let mut buffer = [0.0f32; 960];
+        let mut output = Vec::new();
+        // A sine, so that there is a pitch to watch.
+        let sine: Vec<i16> = (0..8000 * 5)
+            .map(|i| {
+                let t = i as f32 / 8000.0;
+                (0.5 * (2.0 * std::f32::consts::PI * 400.0 * t).sin() * 32767.0) as i16
+            })
+            .collect();
+        let mut sent = 0usize;
+        for round in 0..500 {
+            playback.begin(&state);
+            fill_output(&mut buffer, 2, || playback.next(&state));
+            for frame in buffer.chunks_exact(2) {
+                output.push(frame[0]);
+            }
+            if round % 2 == 0 {
+                let index = sent;
+                sent += 1;
+                state.push_inbound(&sine[index * 160..(index + 1) * 160]);
+            }
+        }
+
+        let mut pitches = Vec::new();
+        for second in 1..4 {
+            let window = &output[second * CARD_RATE as usize..(second + 1) * CARD_RATE as usize];
+            let (frequency, _) = purity(window, CARD_RATE, 400.0, 20.0);
+            pitches.push(frequency);
+        }
+        for frequency in &pitches {
+            assert!(
+                (frequency - 400.0).abs() < 1.0,
+                "the pitch moved: {pitches:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_audio_survives_a_jittery_and_lossy_peer() {
+        // The real world: the packets do not arrive exactly every
+        // 20 ms, and some of them never arrive. The audio must still
+        // be the sine, and the gaps must be no worse than the loss.
+        const CARD_RATE: u32 = 48000;
+        const CHANNELS: u16 = 2;
+        const FREQUENCY: f32 = 400.0;
+        const AMPLITUDE: f32 = 0.5;
+
+        let codec = crate::codec::Codec::Pcmu;
+        let codec_rate = codec.sample_rate();
+        let total = codec_rate as usize * 5;
+
+        let signal: Vec<i16> = (0..total)
+            .map(|i| {
+                let t = i as f32 / codec_rate as f32;
+                (AMPLITUDE * (2.0 * std::f32::consts::PI * FREQUENCY * t).sin() * 32767.0) as i16
+            })
+            .collect();
+        let mut encoder = codec.encoder();
+        let payloads: Vec<Vec<u8>> = signal
+            .chunks(codec.frame_samples())
+            .map(|chunk| encoder.encode(chunk))
+            .collect();
+
+        let state = AudioState::default();
+        let mut jitter = crate::jitter::JitterBuffer::new(5);
+        let mut decoder = codec.decoder();
+        let mut playback = Playback::new(codec_rate, CARD_RATE);
+        let mut buffer = [0.0f32; 960];
+        let mut output: Vec<f32> = Vec::new();
+        let mut sent = 0usize;
+
+        // A simple deterministic "network": the packets arrive a little
+        // early or late, and one in fifty is lost.
+        let mut seed = 12345u64;
+        let next = |seed: &mut u64| {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((*seed >> 33) % 41) as i64 - 20
+        };
+
+        for round in 0..500 {
+            playback.begin(&state);
+            fill_output(&mut buffer, CHANNELS, || playback.next(&state));
+            for frame in buffer.chunks_exact(CHANNELS as usize) {
+                output.push(frame[0]);
+            }
+
+            // The peer sends a frame every 20 ms, with jitter, and
+            // loses one in fifty.
+            if round % 2 == 0 {
+                let index = sent;
+                sent += 1;
+                let jitter_ms = next(&mut seed);
+                if jitter_ms >= 0 {
+                    // On time, or late: it goes now, and the jitter
+                    // buffer sorts it out.
+                    jitter.push(crate::jitter::Frame {
+                        sequence: index as u16,
+                        timestamp: (index as u32) * 160,
+                        payload: payloads[index].clone(),
+                    });
+                } else {
+                    // "Early" is modelled as a late packet: it turns
+                    // up after the one that follows it.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    jitter.push(crate::jitter::Frame {
+                        sequence: index as u16,
+                        timestamp: (index as u32) * 160,
+                        payload: payloads[index].clone(),
+                    });
+                }
+                crate::drain_jitter(&mut jitter, &mut decoder, &state);
+            }
+        }
+
+        // How much of the output is silence? The peer lost one frame in
+        // fifty, so one frame in fifty of the audio is missing — and
+        // no more than that.
+        let played = &output[200 * (CARD_RATE as usize / 1000)..];
+        let silent = played.iter().filter(|v| **v == 0.0).count();
+        let silence_ratio = silent as f64 / played.len() as f64;
+        assert!(
+            silence_ratio < 0.05,
+            "the playout was silent for {silence_ratio:.3} of the time"
+        );
+
+        // And the audio that is there is still the sine: a jittery,
+        // lossy peer must not put a wobble on it.
+        let purity = worst_purity(played, CARD_RATE, FREQUENCY, 20.0);
+        assert!(
+            purity > 0.95,
+            "the output is not a clean sine — {purity:.3} of the energy \
+             is at the frequency"
         );
     }
 
