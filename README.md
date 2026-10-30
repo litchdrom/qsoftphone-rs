@@ -9,7 +9,7 @@ identity resolution, the call event contract, the history rules and
 the transfer construction all have to behave identically, including the
 bugs that have already been fixed there.
 
-**Status: M4.4 complete.** The workspace builds, the test suite passes, the
+**Status: M4.5 complete.** The workspace builds, the test suite passes, the
 app starts and exits cleanly, an account can be registered against a SIP
 registrar with digest authentication (MD5 and SHA-256), and calls can be
 placed and received over that registration — outbound INVITE, inbound
@@ -22,7 +22,10 @@ waits for a jitter buffer to fill, a lost frame is concealed, the
 speaker is fed one value per *frame* rather than per channel slot —
 which is what was playing the audio at double speed — and the playout
 does **not** touch the pitch to chase the peer's clock, which is what
-made it wobble. See [Milestones](#milestones).
+made it wobble. The sound card's callback no longer takes a lock, and
+unregistering in the middle of a call ends the call and closes the
+device instead of leaving it to the next one. Every call now says what
+its media did. See [Milestones](#milestones).
 
 ---
 
@@ -1454,7 +1457,8 @@ across a band — which is exactly what a purity of 0.17 says.
 **The rate correction is gone.** Deleted, not clamped: `Resampler::rate`
 and `set_rate()`, `Playback::average_level`, and the three constants
 that drove them (`MAX_RATE_TRIM`, `RATE_GAIN`, `LEVEL_SMOOTHING`).
-`Playback::begin()` is now just the priming check.
+`Playback::begin()` is now just the priming check — and, since M4.5,
+the one place the callback takes the shared queue.
 
 What holds the clock difference instead is the buffer's **slack**:
 four frames, eighty milliseconds. That covers a peer's drift for the
@@ -1519,10 +1523,151 @@ Goertzel filter, which is a recurrence with two state variables.
 * **The live call is still unverified.** The path is proved in
   simulation and the numbers are clean, but the failing call's pcap
   is not on this machine, so the real stream's loss and clock offset
-  have not been replayed through it. See
-  [Not verified](#verified-and-not).
+  have not been replayed through it. The pcap turned out not to be
+  needed: the log line that came with the report named the cause, and
+  it was not in this section — see
+  [M4.5](#m45--the-stale-call-and-the-real-time-callback).
 * **No adaptive jitter depth.** The buffer is still a fixed four
   frames, so the delay is a flat 80 ms.
+
+---
+
+## M4.5 — The stale call and the real-time callback
+
+### What the log said
+
+The report came with a log line, and the log line is the clue:
+
+```text
+WARN qsoftphone_media::audio: the microphone reported an error
+      error=A buffer underrun or overrun occurred.
+```
+
+That is `cpal`'s `ErrorKind::Xrun`. In cpal's WASAPI backend it is
+emitted in exactly one place — when the capture buffer comes back with
+the **`AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`** flag, which the
+Windows audio engine sets when *a client on that endpoint did not
+consume its buffer in time*.
+
+It is not a codec error and it is not a network error. It says the
+sound card had more than one client, or that a client's callback
+missed its deadline.
+
+And it came with a second observation, which turned out to be the
+same bug:
+
+> if user do unregister in active call state — next call became stale
+> and does corrupted mic. After full restart of the app — echo test
+> passed.
+
+A restart fixes it. That is the signature of **state that outlives the
+thing it belongs to**.
+
+### The stale call
+
+Here is the chain, and every link is in the code:
+
+1. `AccountSession` holds the media of that account's calls, in a map
+   keyed by Call-ID.
+2. The media is taken off the account in exactly one place:
+   `forget_media`, and it is called from exactly one place — the
+   `DialogState::Terminated` arm of the call's watcher.
+3. **Unregistering does not terminate the dialog.** The registration
+   task is cancelled, the endpoint's token goes, the transport dies —
+   and the dialog layer never pushes `Terminated`, because the thing
+   that would have pushed it is the thing that just died.
+4. `SessionRegistry::remove()` — which exists, and which closes a
+   session properly — **had no caller in production code at all**. Only
+   a test called it.
+5. So the account's session stayed in the registry with its media
+   attached: the **microphone and the speaker stayed open**, and the
+   RTP threads kept running and kept sending.
+
+The next call then opened a **second** capture stream and a **second**
+render stream on the same device. Two clients on one WASAPI endpoint
+is exactly the situation the engine flags with a discontinuity, and
+exactly the situation where the microphone's audio comes back
+corrupted — and where the second render client leaves the first one
+starved, which is what "hear nothing" is.
+
+### The fix
+
+* **Unregistering ends the account's calls.** `RegistrationManager::stop`
+  removes the session from the registry, and removing a session now
+  **closes** it: the token is cancelled, every media session is
+  stopped, and the sound card is closed.
+* **A closed account ends its calls.** The account's session has a
+  `CancellationToken`, and the call's watcher waits on it beside the
+  dialog's state channel. When the account goes away the watcher ends
+  the call: the media is released and the interface is told the call
+  ended, so it does not sit on the screen as a stale call.
+* **The teardown does not wait for the network.** The final
+  `Expires: 0` REGISTER is a round trip, and the user does not wait
+  for it: the calls end and the devices close **now**, on the
+  runtime — never on the interface thread (§6).
+
+### The real-time callback
+
+The second defect is separate, and it is worth being precise about
+what it is: the sound card's callback took a **lock**.
+
+The playback callback pulled its samples from the shared queue one at a
+time, taking the mutex every time — thousands of times a second, in a
+thread with a deadline. A lock is a kernel wait, and a kernel wait in
+a real-time thread is a buffer overrun. It was not proved to be *this*
+call's overrun, and this README does not claim it was: the stale call
+is the proven cause. But a callback that blocks is a defect on its own
+account, and the fix is the one the discipline demands:
+
+* **The callback takes the queue once per callback**, not once per
+  sample, and then works on its own copy. The per-sample path has no
+  lock in it at all — the per-sample accessor is gone, so there is no
+  way for it to come back.
+* **The test for it is a test for the discipline**, not a description:
+  a whole callback's worth of samples, and exactly **one** take of the
+  queue.
+
+### The call now says what it did
+
+Every call used to end in silence, in every sense: there was no number
+anywhere saying whether the audio had arrived, been lost, or run dry.
+A call now logs what its media did when it stops:
+
+```text
+INFO qsoftphone_media: the call's media stopped
+      received=1832 concealed=3 underruns=0
+```
+
+* `received` — the frames the peer sent.
+* `concealed` — the frames that never arrived and had to be concealed.
+* `underruns` — the samples of silence the speaker had to play, which
+  is the number that says the sound broke up.
+
+A call that ended in silence now says so, instead of having to be
+guessed at from the outside. That is the measurement M4.2 and M4.3
+both lacked.
+
+### The dependency cost: nothing
+
+No new crate. The token is `rsipstack`'s own `CancellationToken`, which
+the registrar was already using.
+
+### What is *not* in M4.5
+
+* **Two concurrent calls still open two sound cards.** The stale call
+  is fixed, but a user who genuinely places a second call while the
+  first is up still gets two capture streams on the device. The C++
+  had one sound card for the whole application; this build has one per
+  call. That is a design difference, not a bug, and it is on the
+  backlog.
+* **The capture callback still takes a lock** — once per 20 ms frame,
+  to hand the encoded frame to the sender. It is far better than the
+  old playback path, but it is still a lock in a real-time thread; the
+  proper answer is a lock-free hand-off, which is a bigger change
+  than this milestone.
+* **The jitter buffer is still a fixed four frames**, and the two
+  clocks are still absorbed by its slack rather than by a
+  timestamp-driven playout. See M4.4.
 
 ---
 
@@ -1559,6 +1704,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M4.2** | The jitter buffer: the playout waits for the buffer to fill, and a lost frame is concealed | **done** |
 | **M4.3** | The sound card's channels: one value per frame, not per slot — the audio was being played at double speed | **done** |
 | **M4.4** | The pitch wobble: the playout no longer trims its rate to chase the peer's clock — that *was* the dithering | **done** |
+| **M4.5** | The stale call and the real-time callback: unregistering ends the call and closes the sound card, and the callback no longer takes a lock | **done** |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
@@ -1571,6 +1717,8 @@ none of them is lost and none of them disturbs the order above.
 
 | Item | Lands in | Notes |
 |---|---|---|
+| **One sound card for the whole application** | M6 | The C++ had **one** microphone and one speaker for the application; this build opens a pair **per call**, so two concurrent calls put two clients on the same device — which is what the Windows audio engine flags with a discontinuity. M4.5 fixed the stale call (a call whose account was unregistered); what is left is the genuine two-calls-at-once case. The fix is to open the devices once and share them, which means the media plane stops belonging to a call and belongs to the application. |
+| **A lock-free hand-off to the sound card** | M6 | The playback callback now takes the shared queue **once per callback** and works on its own copy — no lock in the per-sample path. The capture side still takes one lock per 20 ms frame to hand the encoded frame to the sender, which is far better and still a lock in a real-time thread. The proper answer is a single-producer/single-consumer ring buffer with no lock at all. |
 | **A timestamp-driven playout** | M5 | The proper way to absorb the difference between the peer's clock and ours without touching the pitch. Each frame is played at the time its **RTP timestamp** says, and a clock difference is absorbed by dropping or repeating a sample at the **boundary** of a frame rather than by changing the rate of the whole stream. This is what pjmedia's jitter buffer does (`pjmedia_jbuf` is frame-indexed and clock-driven). M4.4 removed the rate correction that was doing it wrongly; this replaces it properly, and it is what makes a call hold up for hours rather than minutes. |
 | **Codec selection per account** | M6 | The codec list is now on the settings page and is **app-level**: the order is the offer's order, and it is kept in the settings file. What is still missing is that it should be **per account** — one account may only speak PCMU, another only PCMA. `AccountProfile` has no codec field yet, and the account editor has no control for one. |
 | **Media device selection, in the main settings** | **done in M4.1** | The picker is on the settings page: the microphone and the speaker, with "System default" and the devices of the machine. The device list is read on the runtime, not on the interface thread, and the name is persisted in the settings file — the fields were already there (`media.microphone`, `media.speaker`) and the media crate reads them. |
@@ -1814,6 +1962,23 @@ player lands.
 * **There is no energy at twice the frequency.** A playout running at
   double speed puts a second harmonic where there should be none; the
   fidelity test looks for it and does not find it.
+* **The sound card's callback takes the queue once.** A whole
+  callback's worth of samples, and exactly **one** take of the shared
+  queue: the per-sample path has no lock in it at all. This is the
+  discipline a real-time thread has to keep — a lock there is a kernel
+  wait, and a kernel wait is a buffer overrun.
+* **Unregistering in the middle of a call ends the call.** The
+  account's session is closed: its token is cancelled, its media is
+  stopped, the sound card is closed, and the interface is told the call
+  ended. The call does not sit on the screen as a stale one.
+* **Closing a session stops its media.** The media of a call is not
+  running any more after the account is closed — checked on the
+  transport, so the test never opens a microphone on the machine it
+  runs on.
+* **A hole in the call is counted.** A playout that runs dry is
+  counted, so that the log says whether the sound was continuous or
+  broken — and a call now says what its media did when it stops:
+  frames received, frames concealed, samples of silence played.
 
 **Verified against a real Asterisk:**
 
@@ -1847,15 +2012,26 @@ player lands.
   measured (a purity of 1.000 through the whole path) — but no call
   has yet been made to Asterisk and listened to. The desktop was locked
   for most of the M4 build, so the sound card could not be exercised by
-  a person. **The dithering that M4.3 and M4.4 fix has not been heard
-  fixed** — it has been proved wrong on the numbers, which is not the
-  same thing, and the next call is the real test.
+  a person. **The dithering that M4.3, M4.4 and M4.5 fix has not been
+  heard fixed** — it has been proved wrong on the numbers, which is not
+  the same thing, and the next call is the real test.
+* **The stale call has been proved by reading the code, not by
+  hearing it.** The chain is in [M4.5](#m45--the-stale-call-and-the-real-time-callback)
+  and every link is checkable: the media was only ever released by the
+  dialog's `Terminated` state, unregistering never produces that state,
+  and the registry's `remove` — the one function that closes a session
+  properly — had no caller outside a test. What has *not* been done is
+  to watch a call be unregistered and then watch the next call open
+  the device cleanly. **That is the one thing to check on the next
+  call**, and the log now says what happened:
+  `the call's media stopped received=… concealed=… underruns=…`.
 * **The failing call's pcap is not on this machine.** The report was
   that the raw pcap plays cleanly and the softphone does not, which
   proves the payloads are good; but the capture itself has not been
   replayed through this build's path, so the real stream's loss and its
-  clock offset have not been measured. Dropping that pcap into the
-  workspace would settle it: the RTP timestamps against the arrival
+  clock offset have not been measured. It is not needed to check the
+  next call — the call's own numbers are now in the log — but it would
+  settle the clock question: the RTP timestamps against the arrival
   times give the clock difference directly, and the sequence numbers
   give the loss.
 * **G.722 has not been talked to a PBX.** The codec is proved

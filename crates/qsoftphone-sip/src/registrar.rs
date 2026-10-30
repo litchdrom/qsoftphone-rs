@@ -145,7 +145,21 @@ impl RegistrationManager {
     ///
     /// The shutdown is asynchronous: the UI thread must not wait for
     /// the network.
+    ///
+    /// The account's calls end **now**, not when the final REGISTER
+    /// comes back: a call that keeps the microphone open would have
+    /// the next call find the device in use. The final REGISTER is a
+    /// network round trip, and the user does not wait for it.
     pub fn stop(&mut self, account_id: &str) {
+        // The calls end and their sound cards are closed — on the
+        // runtime, because closing a device is slow and §6 forbids
+        // blocking the interface thread.
+        let sessions = self.sessions.clone();
+        let closing = account_id.to_string();
+        self.handle.spawn(async move {
+            sessions.remove(&closing);
+        });
+
         if let Some(task) = self.tasks.remove(account_id) {
             self.handle.spawn(async move {
                 task.stop().await;
@@ -307,6 +321,9 @@ async fn run_registration_inner(
                 reason: format!("`{}` is not a usable registrar", account.registrar),
             },
         );
+        // The session is already published: it has to go back out, or
+        // the account keeps an endpoint it cannot register with.
+        sessions.remove(&account.id);
         return;
     };
 
@@ -385,6 +402,15 @@ async fn run_registration_inner(
         Ok(response) => info!(status = response.status_code.code(), "unregistered"),
         Err(e) => warn!(error = %e, "the unregister failed"),
     }
+
+    // The account is going away, and everything that belongs to it goes
+    // with it: the calls end and **their sound cards are closed**.
+    //
+    // This is the part that must not be skipped. A call that is still
+    // open keeps the microphone and the speaker, and the next call
+    // then finds the device already in use — which shows up as a
+    // buffer overrun on the capture side and a corrupted microphone.
+    sessions.remove(&account.id);
 
     send(&sender, &account, RegistrationState::Idle);
 }

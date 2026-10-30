@@ -169,6 +169,28 @@ pub struct AudioState {
     /// bound of the inbound queue — two seconds of audio — is twice as
     /// many samples for the wideband codec.
     frame_samples: AtomicUsize,
+    /// How many times the playout ran out of audio.
+    ///
+    /// A playout that runs dry is a hole in the call, and it is worth
+    /// counting: the count is what says whether the sound was
+    /// continuous or broken.
+    playout_underruns: AtomicUsize,
+    /// How many frames the peer sent.
+    frames_received: AtomicUsize,
+    /// How many frames never arrived and had to be concealed.
+    ///
+    /// These two, with the underruns, are what a call's end says about
+    /// itself: a call that ended in silence says so here, instead of
+    /// having to be guessed at from the outside.
+    frames_concealed: AtomicUsize,
+    /// How many times the queue has been taken.
+    ///
+    /// The sound card's callback must take it **once per callback**,
+    /// never once per sample: a lock in a real-time thread is a
+    /// kernel wait, and a kernel wait there is a buffer overrun. The
+    /// counter is what the test measures.
+    #[cfg(test)]
+    inbound_takes: AtomicUsize,
 }
 
 impl Default for AudioState {
@@ -189,6 +211,11 @@ impl AudioState {
             mic_gain: AtomicU32::new(mic_gain.clamp(0.0, 1.0).to_bits()),
             speaker_gain: AtomicU32::new(speaker_gain.clamp(0.0, 1.0).to_bits()),
             frame_samples: AtomicUsize::new(FRAME_SAMPLES),
+            playout_underruns: AtomicUsize::new(0),
+            frames_received: AtomicUsize::new(0),
+            frames_concealed: AtomicUsize::new(0),
+            #[cfg(test)]
+            inbound_takes: AtomicUsize::new(0),
         }
     }
 
@@ -334,13 +361,15 @@ impl AudioState {
         }
     }
 
-    /// Take the next sample to play, if there is one.
-    pub(crate) fn pop_inbound(&self) -> Option<i16> {
-        self.inbound.lock().expect("inbound lock").pop_front()
-    }
-
     /// Take everything that is waiting to be played.
+    ///
+    /// This is the **only** way the sound card's callback touches the
+    /// shared queue, and it takes it **once per callback**: the lock
+    /// is a kernel wait, and a kernel wait in a real-time thread is a
+    /// buffer overrun. The callback works on its own copy afterwards.
     pub fn take_inbound(&self) -> Vec<i16> {
+        #[cfg(test)]
+        self.inbound_takes.fetch_add(1, Ordering::Relaxed);
         self.inbound
             .lock()
             .expect("inbound lock")
@@ -351,6 +380,36 @@ impl AudioState {
     /// How many samples are waiting to be played.
     pub fn inbound_samples(&self) -> usize {
         self.inbound.lock().expect("inbound lock").len()
+    }
+
+    /// How many times the playout ran out of audio.
+    pub fn playout_underruns(&self) -> usize {
+        self.playout_underruns.load(Ordering::Relaxed)
+    }
+
+    /// Count a playout that ran dry.
+    fn count_underrun(&self) {
+        self.playout_underruns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many frames the peer sent.
+    pub fn frames_received(&self) -> usize {
+        self.frames_received.load(Ordering::Relaxed)
+    }
+
+    /// How many frames never arrived and had to be concealed.
+    pub fn frames_concealed(&self) -> usize {
+        self.frames_concealed.load(Ordering::Relaxed)
+    }
+
+    /// Count a frame that arrived.
+    pub(crate) fn count_frame_received(&self) {
+        self.frames_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a frame that never arrived.
+    pub(crate) fn count_frame_concealed(&self) {
+        self.frames_concealed.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -527,6 +586,13 @@ struct Playback {
     resampler: Resampler,
     /// Whether enough audio has arrived to start playing.
     primed: bool,
+    /// The audio waiting to be played, at the codec's rate.
+    ///
+    /// The callback takes the shared queue **once** and works on this
+    /// copy. The copy is what keeps the lock out of the per-sample
+    /// path: a real-time callback that takes a lock waits on a kernel
+    /// object, and the wait shows up in the audio as an overrun.
+    pending: VecDeque<f32>,
 }
 
 /// Accumulates the codec's samples into whole frames.
@@ -991,6 +1057,7 @@ impl Playback {
         Self {
             resampler: Resampler::new(codec_rate, device_rate),
             primed: false,
+            pending: VecDeque::new(),
         }
     }
 
@@ -1001,11 +1068,25 @@ impl Playback {
     /// arrived as it arrives is what makes a call sound like it keeps
     /// breaking up.
     ///
-    /// This is called once per callback, not once per sample: the
-    /// check reads a counter, and a counter read per sample would be
-    /// 48 thousand locks a second.
+    /// This is called once per callback, and it is the **only** place
+    /// the shared queue is touched: one lock for the whole callback,
+    /// not one per sample. The check reads a counter, and a counter
+    /// read per sample would be 48 thousand locks a second.
     fn begin(&mut self, state: &AudioState) {
-        if !self.primed && state.inbound_samples() >= state.playout_target_samples() {
+        // One lock for the whole callback.
+        let chunk = state.take_inbound();
+        let waiting = self.pending.len() + chunk.len();
+        self.pending
+            .extend(chunk.into_iter().map(|sample| sample as f32 / 32768.0));
+
+        // The bound still holds: a peer that sends faster than we play
+        // must not make the delay run away.
+        let limit = state.max_inbound_samples();
+        while self.pending.len() > limit {
+            self.pending.pop_front();
+        }
+
+        if !self.primed && waiting >= state.playout_target_samples() {
             self.primed = true;
         }
     }
@@ -1027,9 +1108,15 @@ impl Playback {
             if let Some(value) = self.resampler.next_output() {
                 return if muted { 0.0 } else { value * gain };
             }
-            match state.pop_inbound() {
-                Some(sample) => self.resampler.push(sample as f32 / 32768.0),
-                None => return 0.0,
+            match self.pending.pop_front() {
+                Some(sample) => self.resampler.push(sample),
+                None => {
+                    // The playout ran dry: there is no audio left to
+                    // play. That is a hole in the call, and it is
+                    // counted so that the call's end says so.
+                    state.count_underrun();
+                    return 0.0;
+                }
             }
         }
     }
@@ -1264,10 +1351,14 @@ mod tests {
         let mut playback = Playback {
             resampler: Resampler::new(8000, 48000),
             primed: true,
+            pending: VecDeque::new(),
         };
+        // The callback takes the queue first — once, for the whole
+        // callback.
+        playback.begin(&state);
         assert_eq!(playback.next(&state), 0.0);
         // The samples are still consumed: two of the three.
-        assert_eq!(state.inbound_samples(), 1);
+        assert_eq!(playback.pending.len(), 1);
     }
 
     #[test]
@@ -1344,7 +1435,7 @@ mod tests {
         assert!(!playback.primed, "the playout started too early");
         assert_eq!(playback.next(&state), 0.0);
         assert_eq!(
-            state.inbound_samples(),
+            playback.pending.len(),
             target - 1,
             "the samples were consumed before the playout started"
         );
@@ -1368,8 +1459,10 @@ mod tests {
         playback.begin(&state);
         assert!(playback.primed);
 
-        // The buffer runs dry.
+        // The buffer runs dry: nothing is waiting, in the queue or in
+        // the callback's own copy.
         state.take_inbound();
+        playback.pending.clear();
         playback.begin(&state);
         assert!(playback.primed, "the playout stopped again");
         assert_eq!(playback.next(&state), 0.0);
@@ -1421,7 +1514,7 @@ mod tests {
                     underruns += 1;
                 }
             }
-            lowest = lowest.min(state.inbound_samples());
+            lowest = lowest.min(playback.pending.len());
         }
 
         assert_eq!(underruns, 0, "the playout ran dry {underruns} times");
@@ -1454,7 +1547,7 @@ mod tests {
 
         // The delay did not run away: the buffer is still near its
         // target and the peer is not seconds ahead of us.
-        let level = state.inbound_samples();
+        let level = playback.pending.len();
         let target = state.playout_target_samples();
         assert!(level < target * 2, "the buffer ran away to {level} samples");
     }
@@ -1477,6 +1570,76 @@ mod tests {
             value
         });
         assert_eq!(data, [0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn the_callback_takes_the_queue_once_and_never_again() {
+        // The sound card's callback is a real-time thread: it has a
+        // deadline, and missing it is a buffer overrun — the device
+        // hands back a buffer with a discontinuity in it, and the
+        // audio glitches.
+        //
+        // A lock is a kernel wait, so the callback must take the
+        // shared queue **once** and then work on its own copy. This
+        // is the test for that: a whole callback's worth of samples,
+        // and exactly one take.
+        let state = AudioState::default();
+        let mut playback = Playback::new(8000, 48000);
+
+        let frame = vec![1000i16; 160];
+        for _ in 0..4 {
+            state.push_inbound(&frame);
+        }
+
+        let takes_before = state.inbound_takes.load(Ordering::Relaxed);
+
+        // Ten milliseconds of a 48 kHz card: 480 frames.
+        let mut buffer = [0.0f32; 960];
+        playback.begin(&state);
+        fill_output(&mut buffer, 2, || playback.next(&state));
+
+        let takes = state.inbound_takes.load(Ordering::Relaxed) - takes_before;
+        assert_eq!(
+            takes, 1,
+            "the callback took the queue {takes} times — it must take it once"
+        );
+
+        // And the audio came out of the callback's own copy.
+        assert!(
+            state.inbound_samples() == 0,
+            "the callback left audio in the shared queue"
+        );
+        assert!(
+            !playback.pending.is_empty(),
+            "the callback took the queue and threw the audio away"
+        );
+    }
+
+    #[test]
+    fn a_playout_that_runs_dry_is_counted() {
+        // A hole in the call is worth counting: the count is what the
+        // log says when the call ends, so a call that ended in silence
+        // says so instead of having to be guessed at.
+        let state = AudioState::default();
+        let target = state.playout_target_samples();
+        state.push_inbound(&vec![1000i16; target]);
+
+        let mut playback = Playback::new(8000, 8000);
+        playback.begin(&state);
+        assert!(playback.primed);
+        assert_eq!(state.playout_underruns(), 0);
+
+        // The peer stops sending: the playout runs dry.
+        playback.pending.clear();
+        for _ in 0..100 {
+            playback.next(&state);
+        }
+
+        assert_eq!(
+            state.playout_underruns(),
+            100,
+            "the holes in the call were not counted"
+        );
     }
 
     #[test]
@@ -1517,7 +1680,7 @@ mod tests {
 
         assert_eq!(underruns, 0, "the playout ran dry {underruns} times");
         // And the buffer is still where it should be.
-        let level = state.inbound_samples();
+        let level = playback.pending.len();
         assert!(
             level <= state.playout_target_samples() + 160,
             "the buffer ran away to {level} samples"

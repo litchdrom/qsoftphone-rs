@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use rsipstack::dialog::dialog_layer::DialogLayer;
 use rsipstack::dialog::invite_dialog::InviteDialog;
+use rsipstack::platform::CancellationToken;
 use rsipstack::transaction::endpoint::Endpoint;
 
 use qsoftphone_core::model::account::Account;
@@ -35,6 +36,11 @@ pub struct AccountSession {
     pub dialog_layer: Arc<DialogLayer>,
     /// The address the registrar sees us at.
     pub public_address: PublicAddress,
+    /// Cancelled when the account goes away.
+    ///
+    /// The calls wait on it. A call whose transport has gone cannot be
+    /// carried on, and it must not be left on the screen either.
+    pub token: CancellationToken,
     /// The dialogs we can still act on, keyed by SIP Call-ID.
     dialogs: Mutex<HashMap<String, InviteDialog>>,
     /// The media of the calls that are up, keyed by SIP Call-ID.
@@ -66,10 +72,29 @@ impl AccountSession {
             endpoint,
             dialog_layer,
             public_address,
+            token: CancellationToken::new(),
             dialogs: Mutex::new(HashMap::new()),
             media: Mutex::new(HashMap::new()),
             media_config,
         })
+    }
+
+    /// End every call of this account.
+    ///
+    /// The sound card is closed and the RTP threads stop. This has to
+    /// happen when the account is unregistered: a call that is still
+    /// open would keep the microphone and the speaker, and the **next**
+    /// call would find the device already in use — which is a buffer
+    /// overrun on the capture side and a corrupted microphone.
+    ///
+    /// The token goes with it, so the calls watching it end too.
+    pub fn close(&self) {
+        self.token.cancel();
+        let mut media = self.media.lock().expect("media lock");
+        for (_, session) in media.drain() {
+            session.stop();
+        }
+        self.dialogs.lock().expect("dialog lock").clear();
     }
 
     /// What the media of a call should be.
@@ -192,8 +217,15 @@ impl SessionRegistry {
 
     /// Drop a session — the account was unregistered, or the app is
     /// shutting down.
+    ///
+    /// The session is **closed** on the way out: the calls of that
+    /// account end, and their sound cards are closed. A session that
+    /// was only dropped would leave the microphone open, and the next
+    /// call would find the device in use.
     pub fn remove(&self, account_id: &str) {
-        self.inner.lock().expect("session lock").remove(account_id);
+        if let Some(session) = self.inner.lock().expect("session lock").remove(account_id) {
+            session.close();
+        }
     }
 
     /// How many sessions are live.
@@ -251,5 +283,72 @@ mod tests {
 
         registry.remove("acct-1");
         assert!(registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_stops_its_calls() {
+        // The bug this fixes: the user unregisters in the middle of a
+        // call, and the call's sound card stays open. The next call
+        // then finds the device in use — a buffer overrun on the
+        // capture side and a corrupted microphone.
+        let token = CancellationToken::new();
+        let endpoint = crate::build_endpoint(Transport::Udp, 0, token.clone(), None)
+            .await
+            .expect("endpoint");
+        let account = Account::new("Office", "example.com", "104", "pw", "udp");
+        let registry = SessionRegistry::new();
+        let session = AccountSession::new(
+            account,
+            endpoint,
+            PublicAddress::default(),
+            registry.media_config_handle(),
+        );
+
+        // The transport, not the sound card: the test must not open a
+        // microphone on the machine it runs on.
+        let media = MediaSession::new(&MediaConfig::default()).expect("media");
+        media.start_transport();
+        assert!(media.is_running(), "the media is not running");
+        session.remember_media("call-1", media.clone());
+
+        session.close();
+
+        assert!(!media.is_running(), "the media is still running");
+        assert!(
+            session.media("call-1").is_none(),
+            "the media was left on the account"
+        );
+        assert!(session.token.is_cancelled(), "the calls were not told");
+    }
+
+    #[tokio::test]
+    async fn removing_a_session_closes_it() {
+        // The registry is where the registrar puts a session and where
+        // it takes it away again. Taking it away has to **close** it:
+        // a session that was only dropped would leave its sound card
+        // open.
+        let token = CancellationToken::new();
+        let endpoint = crate::build_endpoint(Transport::Udp, 0, token.clone(), None)
+            .await
+            .expect("endpoint");
+        let account = Account::new("Office", "example.com", "104", "pw", "udp");
+        let registry = SessionRegistry::new();
+        let session = AccountSession::new(
+            account,
+            endpoint,
+            PublicAddress::default(),
+            registry.media_config_handle(),
+        );
+
+        let media = MediaSession::new(&MediaConfig::default()).expect("media");
+        media.start_transport();
+        session.remember_media("call-1", media.clone());
+
+        registry.insert("acct-1", session.clone());
+        registry.remove("acct-1");
+
+        assert!(registry.is_empty());
+        assert!(!media.is_running(), "the media is still running");
+        assert!(session.token.is_cancelled(), "the calls were not told");
     }
 }

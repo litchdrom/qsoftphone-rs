@@ -54,7 +54,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 pub mod audio;
 pub mod codec;
@@ -495,6 +495,18 @@ impl MediaSession {
         drop(running.microphone);
         drop(running.speaker);
         self.inner.running.store(false, Ordering::Relaxed);
+
+        self.log_the_call();
+    }
+
+    /// Say what the call's media did.
+    ///
+    /// A call that ended in silence says so here: how many frames the
+    /// peer sent, how many never arrived, and how many samples of
+    /// silence the speaker had to play. Without this, a broken call is
+    /// a thing that has to be guessed at from the outside.
+    fn log_the_call(&self) {
+        log_the_call(&self.inner.state);
     }
 
     /// Whether the audio is running.
@@ -550,7 +562,30 @@ impl Drop for MediaInner {
                 let _ = receiver.join();
             }
         }
+        // The session may be dropped without `stop()` being called —
+        // when the account is unregistered in the middle of a call —
+        // and the call's numbers have to be said either way.
+        log_the_call(&self.state);
     }
+}
+
+/// Say what the call's media did.
+///
+/// A call that ended in silence says so here: how many frames the peer
+/// sent, how many never arrived, and how many samples of silence the
+/// speaker had to play. Without this, a broken call is a thing that has
+/// to be guessed at from the outside.
+fn log_the_call(state: &AudioState) {
+    let received = state.frames_received();
+    let concealed = state.frames_concealed();
+    let underruns = state.playout_underruns();
+
+    if received == 0 && concealed == 0 && underruns == 0 {
+        // Nothing was ever played: the call had no media at all.
+        return;
+    }
+
+    info!(received, concealed, underruns, "the call's media stopped");
 }
 
 /// The sending thread: the captured frames, onto the wire.
@@ -605,6 +640,7 @@ fn receiver_loop(
                 if packet.payload_type != payload_type {
                     continue;
                 }
+                state.count_frame_received();
                 jitter.push(jitter::Frame {
                     sequence: packet.sequence_number,
                     timestamp: packet.timestamp,
@@ -673,6 +709,7 @@ fn drain_jitter(
                 // the other end — and for G.722 that means noise for
                 // the rest of the call.
                 jitter.skip();
+                state.count_frame_concealed();
                 let pcm = decoder.conceal();
                 state.push_inbound(&pcm);
             }

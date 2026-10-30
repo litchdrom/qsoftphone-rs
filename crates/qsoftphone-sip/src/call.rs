@@ -585,8 +585,21 @@ async fn watch_dialog(
     media_config: MediaConfig,
 ) {
     let account_id = session.account.id.clone();
+    let mut ended = false;
 
-    while let Some(state) = states.recv().await {
+    loop {
+        // The account can go away under a live call: the user
+        // unregisters, or the app is shutting down. The dialog will
+        // never be told, because its transport is going down with it —
+        // so the token is what ends the call.
+        let state = tokio::select! {
+            state = states.recv() => match state {
+                Some(state) => state,
+                None => break,
+            },
+            _ = session.token.cancelled() => break,
+        };
+
         match state {
             DialogState::Early(_, response) => {
                 // For an outgoing call this is the peer's 180. For an
@@ -673,6 +686,7 @@ async fn watch_dialog(
                 event.sip_code = code as i32;
                 event.hangup_cause = cause;
                 bus.publish(&account_id, event);
+                ended = true;
 
                 // The dialog has to leave the registry, or it leaks.
                 session.forget(&call_id);
@@ -681,6 +695,22 @@ async fn watch_dialog(
             }
             _ => {}
         }
+    }
+
+    if !ended {
+        // The call was cut short — the account went away under it.
+        // The media goes with it: a call that keeps the microphone
+        // open is a call the next one cannot use the device for.
+        session.forget_media(&call_id);
+        session.forget(&call_id);
+
+        let mut event = CallEvent::new(CallEventType::CallEnded);
+        event.user = user.clone();
+        event.call_id = call_id.clone();
+        event.call_direction = Some(direction);
+        event.call_state = "ended".to_string();
+        event.hangup_cause = "the account was unregistered".to_string();
+        bus.publish(&account_id, event);
     }
 }
 
@@ -846,6 +876,11 @@ fn fill_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    use rsipstack::sip::Transport;
+
+    use crate::inspector::PublicAddress;
 
     #[test]
     fn the_aor_uses_the_domain_when_there_is_one() {
@@ -884,5 +919,74 @@ mod tests {
             let (code, cause) = terminated_code(&reason);
             assert!(code >= 200, "{reason:?} -> {code} {cause}");
         }
+    }
+
+    /// A session with an endpoint, for the tests that need one.
+    async fn a_session() -> Arc<AccountSession> {
+        let token = rsipstack::platform::CancellationToken::new();
+        let endpoint = crate::build_endpoint(Transport::Udp, 0, token, None)
+            .await
+            .expect("endpoint");
+        let account = Account::new("Office", "example.com", "104", "pw", "udp");
+        let registry = SessionRegistry::new();
+        AccountSession::new(
+            account,
+            endpoint,
+            PublicAddress::default(),
+            registry.media_config_handle(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_call_ends_when_the_account_is_unregistered() {
+        // The user unregisters in the middle of a call. The dialog will
+        // never be told — its transport is going down with it — so the
+        // account's token is what ends the call.
+        //
+        // What matters is that the call *ends*: it must not stay on the
+        // screen, and its sound card must be released. A call that keeps
+        // the microphone open is a call the next one cannot use the
+        // device for.
+        let session = a_session().await;
+
+        let media = MediaSession::new(&MediaConfig::default()).expect("media");
+        // The transport, not the sound card: the test must not open a
+        // microphone on the machine it runs on.
+        media.start_transport();
+        assert!(media.is_running(), "the media is not running");
+        session.remember_media("call-1", media.clone());
+
+        let (bus, mut updates) = CallBus::new();
+        let (_tx, states) = tokio::sync::mpsc::unbounded_channel();
+
+        let watcher = tokio::spawn(watch_dialog(
+            session.clone(),
+            "call-1".to_string(),
+            Direction::Outgoing,
+            "104".to_string(),
+            states,
+            bus,
+            MediaConfig::default(),
+        ));
+
+        // The account goes away.
+        session.close();
+
+        // The call ends, and the interface is told.
+        let update = tokio::time::timeout(Duration::from_secs(5), updates.recv())
+            .await
+            .expect("the call never ended")
+            .expect("the bus closed");
+        assert_eq!(update.event.call_id, "call-1");
+        assert_eq!(update.event.event_type, CallEventType::CallEnded);
+
+        // And its sound card is released.
+        assert!(!media.is_running(), "the media is still running");
+        assert!(
+            session.media("call-1").is_none(),
+            "the media was left on the account"
+        );
+
+        watcher.await.expect("the watcher panicked");
     }
 }
