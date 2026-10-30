@@ -9,7 +9,7 @@ identity resolution, the call event contract, the history rules and
 the transfer construction all have to behave identically, including the
 bugs that have already been fixed there.
 
-**Status: M4.5 complete.** The workspace builds, the test suite passes, the
+**Status: M4.6 complete.** The workspace builds, the test suite passes, the
 app starts and exits cleanly, an account can be registered against a SIP
 registrar with digest authentication (MD5 and SHA-256), and calls can be
 placed and received over that registration — outbound INVITE, inbound
@@ -25,7 +25,11 @@ does **not** touch the pitch to chase the peer's clock, which is what
 made it wobble. The sound card's callback no longer takes a lock, and
 unregistering in the middle of a call ends the call and closes the
 device instead of leaving it to the next one. Every call now says what
-its media did. See [Milestones](#milestones).
+its media did. The history's rows carry the redial and a legend. And a
+call with **no microphone** — a remote session without a microphone
+redirection, a machine with no sound card — still sends RTP silence, so
+the clock keeps running and the call does not die. See
+[Milestones](#milestones).
 
 ---
 
@@ -1671,6 +1675,125 @@ the registrar was already using.
 
 ---
 
+## M4.6 — The history row, the legend, and the remote session
+
+Three things, and the third is the one that matters.
+
+### The redial is in the row
+
+The redial existed, but only inside the **expanded** row: a user had to
+click "Details" to find the button they came for. It is now in the row
+itself, next to "Details", and the expanded panel is for reading —
+the full URI, the dialled number, the cause, the exact timestamps.
+
+The target is unchanged and still correct: the **caller** for an
+incoming call, the number that was dialled for an outgoing one (§5.1).
+
+### The legend
+
+The rows use an arrow, a colour and a bare number, and none of those
+explain themselves: a `486` in the middle of a line means nothing to
+anyone who has not read the code. There is now a key above the list:
+
+```text
+→ outgoing   ← incoming   OK  Missed  Busy  No answer  Rejected  Failed
+a bare number is the SIP status code
+```
+
+The colours are not written twice. `CallResult::color()` lives in the
+core crate next to `CallResult::label()`, and the legend and the rows
+both ask it — so the key and the rows cannot drift apart.
+
+### The remote session
+
+> Some softphones has issue with sound passing rdp session. Could you
+> try to prevent that issues.
+
+**What Windows actually does**, and it is worth being exact because
+the two directions behave differently:
+
+* **Playback** is redirected by default. The sound the application
+  plays comes out of the **client's** speakers.
+* **Recording is not.** The microphone only appears in the remote
+  session when the *connection* asks for it — "Remote audio recording
+  → Record from this computer" in the client's settings, or
+  `audiocapturemode:i:1` in an `.rdp` file — and when the policy on the
+  machine allows it. Seeing a "Remote Audio" output device is **not**
+  proof that there is a microphone.
+
+So a softphone in a remote session can hear the other end and cannot
+be heard, and the reason is a switch on the client. That is not
+something an application can fix. What it *can* do is stop making it
+worse, and say what is going on.
+
+**The bug it was making worse: a call with no microphone sent
+nothing at all.**
+
+The module has always claimed that "a machine with no sound card is
+not a reason to refuse the call: the RTP still runs, the peer still
+hears our silence". That was **not true**. The sending thread waited
+for a frame to arrive from the capture side, and with no microphone no
+frame ever arrives — so the wire stayed empty. A peer that sees an
+empty RTP stream treats the call as having no media, and a good many
+of them hang up.
+
+The sender now makes the silence itself, on the frame clock, when
+there is no microphone:
+
+* the sender waits one frame period (20 ms — every codec's frame is
+  20 ms) for a frame;
+* if one arrives, it is sent;
+* if none arrives and there **is** a microphone, the frame is merely
+  late, and the sender waits for it rather than put a hole in the
+  middle of real audio;
+* if none arrives and there is **no** microphone, the sender encodes a
+  frame of silence and sends it.
+
+The silence goes **through the codec's encoder**, like any other
+frame — so a stateful codec (G.722, where the encoder's state *is*
+the codec) stays in step with the decoder at the other end.
+
+### The device fallback
+
+A default endpoint that refuses to open is not the end of the road:
+the next device is tried. A remote session's redirected endpoint is
+often the one that refuses, and there is another one behind it.
+
+A device the user asked for **by name** is still the only one tried.
+If the user picked a headset and it is gone, opening the laptop's
+microphone instead would be worse than useless: the user would not
+know which microphone the other end was hearing.
+
+### Saying so
+
+* The **settings page** says what a remote session is and where the
+  switch for the microphone is, and that the call still works — the
+  peer hears silence and this end still hears the peer.
+* The **call's status line** says why the microphone is missing, when
+  it is missing because the session never brought one.
+* The detection is `GetSystemMetrics(SM_REMOTESESSION)` — one call to
+  `user32`, read once at startup.
+
+### The dependency cost: nothing
+
+No new crate. The Win32 call is a three-line `extern "system"` block
+with `#[link(name = "user32")]`.
+
+### What is *not* in M4.6
+
+* **The microphone cannot be brought into a remote session by the
+  application.** The switch is on the client and the policy is on the
+  machine. What this build does is keep the call alive and say where
+  the switch is.
+* **The remote session has not been tested against one.** This machine
+  is at the console, so the detection returns false here and the
+  notice is exercised by a test that forces it on. The behaviour of
+  the redirected endpoint itself is the operating system's, and the
+  fallback covers the case where it refuses.
+* **Two concurrent calls still open two sound cards** — see M4.5.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -1705,6 +1828,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M4.3** | The sound card's channels: one value per frame, not per slot — the audio was being played at double speed | **done** |
 | **M4.4** | The pitch wobble: the playout no longer trims its rate to chase the peer's clock — that *was* the dithering | **done** |
 | **M4.5** | The stale call and the real-time callback: unregistering ends the call and closes the sound card, and the callback no longer takes a lock | **done** |
+| **M4.6** | The history row, the legend, and the remote session: the redial is in the row, the rows have a key, and a call with no microphone still sends | **done** |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
@@ -1979,6 +2103,26 @@ player lands.
   counted, so that the log says whether the sound was continuous or
   broken — and a call now says what its media did when it stops:
   frames received, frames concealed, samples of silence played.
+* **A call with no microphone still sends.** The RTP clock is what
+  tells the peer the call is alive, and a peer that sees an empty
+  stream hangs up. With no microphone there is no capture side, so the
+  sender makes the silence itself, on the frame clock, through the
+  codec's own encoder — which keeps a stateful codec (G.722) in step
+  with the decoder at the other end. The silence is µ-law's `0xFF`.
+* **The clock keeps running.** Not one frame: five, in half a second,
+  with nothing pushed by the test. The frames arrive on their own.
+* **The default device is tried first**, and a device the user asked
+  for by name is the **only** one tried — opening a different
+  microphone without saying so would be worse than useless.
+* **The redial is in the history row**, without expanding it, and it
+  dials the caller back for an incoming call and the dialled number
+  for an outgoing one.
+* **The history rows have a legend.** The arrow, the colours and the
+  bare number are all explained, and the colours come from the same
+  place as the labels, so the key and the rows cannot drift apart.
+* **A remote session is recognised and explained.** The notice says
+  what a remote session is, where the switch for the microphone is, and
+  that the call still works.
 
 **Verified against a real Asterisk:**
 
@@ -2025,6 +2169,12 @@ player lands.
   the device cleanly. **That is the one thing to check on the next
   call**, and the log now says what happened:
   `the call's media stopped received=… concealed=… underruns=…`.
+* **The remote session has not been tested against one.** This machine
+  is at the console, so `GetSystemMetrics(SM_REMOTESESSION)` returns
+  false here and the notice is exercised by a test that forces it on.
+  What the redirected endpoint does is the operating system's
+  business; what this build had wrong — sending *nothing* when there
+  is no microphone — is fixed and proved on the loopback.
 * **The failing call's pcap is not on this machine.** The report was
   that the raw pcap plays cleanly and the softphone does not, which
   proves the payloads are good; but the capture itself has not been

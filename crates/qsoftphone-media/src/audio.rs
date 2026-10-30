@@ -71,6 +71,60 @@ const MAX_INBOUND_FRAMES: usize = 100;
 /// noticeable; a hole in the audio is.
 const PLAYOUT_FRAMES: usize = 4;
 
+/// Whether this is a remote session.
+///
+/// Windows Remote Desktop brings its own audio endpoints — the "Remote
+/// Audio" pair — and **the microphone is not one of them** unless the
+/// connection asked for the recording to be redirected. The playback
+/// side is redirected by default; the recording side is not, and the
+/// switch is a separate one ("Remote audio recording → Record from
+/// this computer" in the client's settings, or `audiocapturemode:i:1`
+/// in an `.rdp` file). Policy on the machine can forbid it outright.
+///
+/// So a softphone in a remote session can hear the other end and cannot
+/// be heard — and the difference is a setting on the client, not
+/// anything the application can fix. What the application *can* do is
+/// say so, and keep the call alive without a microphone.
+///
+/// This is `GetSystemMetrics(SM_REMOTESESSION)`: non-zero in a
+/// terminal-services session, zero at the console.
+pub fn is_remote_session() -> bool {
+    #[cfg(windows)]
+    {
+        /// `SM_REMOTESESSION`.
+        const SM_REMOTESESSION: i32 = 0x1000;
+        // SAFETY: `GetSystemMetrics` takes an integer and returns an
+        // integer. It reads the session's own state and touches
+        // nothing of ours.
+        unsafe { GetSystemMetrics(SM_REMOTESESSION) != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetSystemMetrics(n_index: i32) -> i32;
+}
+
+/// What the application says about a remote session.
+///
+/// The setting that decides whether the microphone arrives is on the
+/// **client** — "Remote audio recording → Record from this computer" —
+/// so this is the text that tells the user where to look.
+pub const REMOTE_SESSION_HINT: &str = "A remote session redirects the playback but not the microphone. \
+     For the microphone to arrive, the connection needs \
+     \"Remote audio recording → Record from this computer\" (or \
+     `audiocapturemode:i:1` in the .rdp file), and the policy on the \
+     machine has to allow it.";
+
+/// The short version of it, for a status line.
+pub const REMOTE_SESSION_MIC_HINT: &str = "this is a remote session, and it brings the microphone only when \
+     the connection asks for the recording to be redirected";
+
 /// What went wrong with the sound card.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioError {
@@ -183,6 +237,14 @@ pub struct AudioState {
     /// itself: a call that ended in silence says so here, instead of
     /// having to be guessed at from the outside.
     frames_concealed: AtomicUsize,
+    /// Whether there is a microphone to capture from.
+    ///
+    /// A call with no microphone still has to **send**: the RTP clock
+    /// is what tells the peer the call is alive, and a peer that stops
+    /// hearing RTP hangs up. This flag is how the sending thread knows
+    /// that no frame is ever going to arrive from the capture side and
+    /// that it has to make the silence itself.
+    has_microphone: AtomicBool,
     /// How many times the queue has been taken.
     ///
     /// The sound card's callback must take it **once per callback**,
@@ -214,6 +276,7 @@ impl AudioState {
             playout_underruns: AtomicUsize::new(0),
             frames_received: AtomicUsize::new(0),
             frames_concealed: AtomicUsize::new(0),
+            has_microphone: AtomicBool::new(false),
             #[cfg(test)]
             inbound_takes: AtomicUsize::new(0),
         }
@@ -324,7 +387,11 @@ impl AudioState {
                 .expect("outbound wait");
             queue = guard;
             if timed_out.timed_out() {
-                return None;
+                // A frame may have arrived as the timeout fired. Take it
+                // rather than reporting nothing: the caller would
+                // otherwise send a silence frame *before* the real one,
+                // and the peer would hear them out of order.
+                return queue.pop_front();
             }
         }
     }
@@ -410,6 +477,16 @@ impl AudioState {
     /// Count a frame that never arrived.
     pub(crate) fn count_frame_concealed(&self) {
         self.frames_concealed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether there is a microphone to capture from.
+    pub fn has_microphone(&self) -> bool {
+        self.has_microphone.load(Ordering::Relaxed)
+    }
+
+    /// Say whether there is a microphone.
+    pub(crate) fn set_has_microphone(&self, has: bool) {
+        self.has_microphone.store(has, Ordering::Relaxed);
     }
 }
 
@@ -681,29 +758,66 @@ impl Speaker {
 /// Find a device by name, or the system default when the name is
 /// empty.
 fn find_device(host: &Host, name: Option<&str>, input: bool) -> Option<Device> {
-    let Some(name) = name.filter(|n| !n.trim().is_empty()) else {
-        return if input {
-            host.default_input_device()
-        } else {
-            host.default_output_device()
-        };
-    };
+    device_candidates(host, name, input).into_iter().next()
+}
 
-    let mut list = host.devices().ok()?;
-    list.find(|device| {
-        let matches = device
-            .description()
-            .map(|d| d.name() == name)
-            .unwrap_or_else(|_| device.to_string() == name);
-        if !matches {
-            return false;
-        }
+/// The devices to try, in the order to try them.
+///
+/// **A device that was asked for by name is the only one tried.** If
+/// the user picked a headset and the headset is gone, opening the
+/// laptop's microphone instead would be worse than useless: the user
+/// would not know which microphone the other end was hearing.
+///
+/// The **default** is different: if the default endpoint cannot be
+/// opened, the next one is tried. That is not a rare thing — a remote
+/// session's redirected endpoint is often the one that refuses, and
+/// there is another one behind it.
+fn device_candidates(host: &Host, name: Option<&str>, input: bool) -> Vec<Device> {
+    let capable = |device: &Device| {
         if input {
             device.supports_input()
         } else {
             device.supports_output()
         }
-    })
+    };
+
+    if let Some(name) = name.filter(|n| !n.trim().is_empty()) {
+        let Ok(list) = host.devices() else {
+            return Vec::new();
+        };
+        return list
+            .into_iter()
+            .filter(|device| {
+                let matches = device
+                    .description()
+                    .map(|d| d.name() == name)
+                    .unwrap_or_else(|_| device.to_string() == name);
+                matches && capable(device)
+            })
+            .collect();
+    }
+
+    let mut out: Vec<Device> = Vec::new();
+    let default = if input {
+        host.default_input_device()
+    } else {
+        host.default_output_device()
+    };
+    if let Some(default) = default {
+        out.push(default);
+    }
+    if let Ok(list) = host.devices() {
+        for device in list {
+            if !capable(&device) {
+                continue;
+            }
+            if out.iter().any(|tried| tried == &device) {
+                continue;
+            }
+            out.push(device);
+        }
+    }
+    out
 }
 
 /// The frequency of the test tone.
@@ -828,9 +942,40 @@ pub fn open_microphone(
     codec: Codec,
 ) -> Result<Microphone, AudioError> {
     let host = cpal::default_host();
-    let device = find_device(&host, name, true)
-        .ok_or_else(|| AudioError::NoDevice("there is no microphone to open".to_string()))?;
+    let candidates = device_candidates(&host, name, true);
+    if candidates.is_empty() {
+        return Err(AudioError::NoDevice(
+            "there is no microphone to open".to_string(),
+        ));
+    }
 
+    // The first device that opens is the one that is used. A default
+    // endpoint that refuses is not the end of the road: the next one
+    // is tried, because a remote session's redirected endpoint often
+    // is the one that refuses.
+    let mut last: Option<AudioError> = None;
+    for device in candidates {
+        match open_microphone_on(&device, &state, codec) {
+            Ok(microphone) => return Ok(microphone),
+            Err(e) => {
+                tracing::warn!(
+                    device = %device_name(&device),
+                    error = %e,
+                    "the microphone could not be opened"
+                );
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| AudioError::NoDevice("there is no microphone to open".to_string())))
+}
+
+/// Open one microphone.
+fn open_microphone_on(
+    device: &Device,
+    state: &Arc<AudioState>,
+    codec: Codec,
+) -> Result<Microphone, AudioError> {
     let supported = device
         .default_input_config()
         .map_err(|e| AudioError::Backend(e.to_string()))?;
@@ -838,10 +983,7 @@ pub fn open_microphone(
     let channels = supported.channels().max(1);
     let config: StreamConfig = supported.config();
     let format = supported.sample_format();
-    let device_name = device
-        .description()
-        .map(|d| d.name().to_string())
-        .unwrap_or_else(|_| device.to_string());
+    let device_name = device_name(device);
 
     // The queue is measured in frames, and a frame is as big as the
     // codec's is.
@@ -853,16 +995,16 @@ pub fn open_microphone(
     };
 
     let stream = match format {
-        SampleFormat::I8 => build_input::<i8>(&device, config, channels, state.clone(), capture),
-        SampleFormat::I16 => build_input::<i16>(&device, config, channels, state.clone(), capture),
-        SampleFormat::I32 => build_input::<i32>(&device, config, channels, state.clone(), capture),
-        SampleFormat::I64 => build_input::<i64>(&device, config, channels, state.clone(), capture),
-        SampleFormat::U8 => build_input::<u8>(&device, config, channels, state.clone(), capture),
-        SampleFormat::U16 => build_input::<u16>(&device, config, channels, state.clone(), capture),
-        SampleFormat::U32 => build_input::<u32>(&device, config, channels, state.clone(), capture),
-        SampleFormat::U64 => build_input::<u64>(&device, config, channels, state.clone(), capture),
-        SampleFormat::F32 => build_input::<f32>(&device, config, channels, state.clone(), capture),
-        SampleFormat::F64 => build_input::<f64>(&device, config, channels, state.clone(), capture),
+        SampleFormat::I8 => build_input::<i8>(device, config, channels, state.clone(), capture),
+        SampleFormat::I16 => build_input::<i16>(device, config, channels, state.clone(), capture),
+        SampleFormat::I32 => build_input::<i32>(device, config, channels, state.clone(), capture),
+        SampleFormat::I64 => build_input::<i64>(device, config, channels, state.clone(), capture),
+        SampleFormat::U8 => build_input::<u8>(device, config, channels, state.clone(), capture),
+        SampleFormat::U16 => build_input::<u16>(device, config, channels, state.clone(), capture),
+        SampleFormat::U32 => build_input::<u32>(device, config, channels, state.clone(), capture),
+        SampleFormat::U64 => build_input::<u64>(device, config, channels, state.clone(), capture),
+        SampleFormat::F32 => build_input::<f32>(device, config, channels, state.clone(), capture),
+        SampleFormat::F64 => build_input::<f64>(device, config, channels, state.clone(), capture),
         other => {
             return Err(AudioError::UnsupportedFormat(format!(
                 "{other} is not a format this build can read"
@@ -881,6 +1023,14 @@ pub fn open_microphone(
     })
 }
 
+/// The name of a device, as the system reports it.
+fn device_name(device: &Device) -> String {
+    device
+        .description()
+        .map(|d| d.name().to_string())
+        .unwrap_or_else(|_| device.to_string())
+}
+
 /// Open the speaker and start playing.
 ///
 /// `codec` says what the incoming audio is: its rate is what the
@@ -891,9 +1041,40 @@ pub fn open_speaker(
     codec: Codec,
 ) -> Result<Speaker, AudioError> {
     let host = cpal::default_host();
-    let device = find_device(&host, name, false)
-        .ok_or_else(|| AudioError::NoDevice("there is no speaker to open".to_string()))?;
+    let candidates = device_candidates(&host, name, false);
+    if candidates.is_empty() {
+        return Err(AudioError::NoDevice(
+            "there is no speaker to open".to_string(),
+        ));
+    }
 
+    // The first device that opens is the one that is used. A default
+    // endpoint that refuses is not the end of the road: the next one
+    // is tried, because a remote session's redirected endpoint often
+    // is the one that refuses.
+    let mut last: Option<AudioError> = None;
+    for device in candidates {
+        match open_speaker_on(&device, &state, codec) {
+            Ok(speaker) => return Ok(speaker),
+            Err(e) => {
+                tracing::warn!(
+                    device = %device_name(&device),
+                    error = %e,
+                    "the speaker could not be opened"
+                );
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| AudioError::NoDevice("there is no speaker to open".to_string())))
+}
+
+/// Open one speaker.
+fn open_speaker_on(
+    device: &Device,
+    state: &Arc<AudioState>,
+    codec: Codec,
+) -> Result<Speaker, AudioError> {
     let supported = device
         .default_output_config()
         .map_err(|e| AudioError::Backend(e.to_string()))?;
@@ -901,40 +1082,21 @@ pub fn open_speaker(
     let channels = supported.channels().max(1);
     let config: StreamConfig = supported.config();
     let format = supported.sample_format();
-    let device_name = device
-        .description()
-        .map(|d| d.name().to_string())
-        .unwrap_or_else(|_| device.to_string());
+    let device_name = device_name(device);
 
     let playback = Playback::new(codec.sample_rate(), rate);
 
     let stream = match format {
-        SampleFormat::I8 => build_output::<i8>(&device, config, channels, state.clone(), playback),
-        SampleFormat::I16 => {
-            build_output::<i16>(&device, config, channels, state.clone(), playback)
-        }
-        SampleFormat::I32 => {
-            build_output::<i32>(&device, config, channels, state.clone(), playback)
-        }
-        SampleFormat::I64 => {
-            build_output::<i64>(&device, config, channels, state.clone(), playback)
-        }
-        SampleFormat::U8 => build_output::<u8>(&device, config, channels, state.clone(), playback),
-        SampleFormat::U16 => {
-            build_output::<u16>(&device, config, channels, state.clone(), playback)
-        }
-        SampleFormat::U32 => {
-            build_output::<u32>(&device, config, channels, state.clone(), playback)
-        }
-        SampleFormat::U64 => {
-            build_output::<u64>(&device, config, channels, state.clone(), playback)
-        }
-        SampleFormat::F32 => {
-            build_output::<f32>(&device, config, channels, state.clone(), playback)
-        }
-        SampleFormat::F64 => {
-            build_output::<f64>(&device, config, channels, state.clone(), playback)
-        }
+        SampleFormat::I8 => build_output::<i8>(device, config, channels, state.clone(), playback),
+        SampleFormat::I16 => build_output::<i16>(device, config, channels, state.clone(), playback),
+        SampleFormat::I32 => build_output::<i32>(device, config, channels, state.clone(), playback),
+        SampleFormat::I64 => build_output::<i64>(device, config, channels, state.clone(), playback),
+        SampleFormat::U8 => build_output::<u8>(device, config, channels, state.clone(), playback),
+        SampleFormat::U16 => build_output::<u16>(device, config, channels, state.clone(), playback),
+        SampleFormat::U32 => build_output::<u32>(device, config, channels, state.clone(), playback),
+        SampleFormat::U64 => build_output::<u64>(device, config, channels, state.clone(), playback),
+        SampleFormat::F32 => build_output::<f32>(device, config, channels, state.clone(), playback),
+        SampleFormat::F64 => build_output::<f64>(device, config, channels, state.clone(), playback),
         other => {
             return Err(AudioError::UnsupportedFormat(format!(
                 "{other} is not a format this build can write"
@@ -1550,6 +1712,58 @@ mod tests {
         let level = playback.pending.len();
         let target = state.playout_target_samples();
         assert!(level < target * 2, "the buffer ran away to {level} samples");
+    }
+
+    #[test]
+    fn the_remote_session_question_has_an_answer() {
+        // It is a question about the machine, and the answer is the
+        // same every time on the same machine. This build is not in a
+        // remote session — but the question has to be answerable, and
+        // it has to be answerable on a machine that is.
+        let remote = is_remote_session();
+        assert_eq!(remote, is_remote_session(), "the answer changed");
+    }
+
+    #[test]
+    fn the_default_device_is_tried_first() {
+        // The order matters: the default is the one the user chose by
+        // not choosing, and it is the one that works most of the time.
+        // The others are the fallback.
+        let host = cpal::default_host();
+        let candidates = device_candidates(&host, None, true);
+        if let Some(default) = host.default_input_device() {
+            assert!(
+                !candidates.is_empty(),
+                "the default microphone was not in the list"
+            );
+            assert_eq!(
+                candidates[0], default,
+                "the default microphone was not tried first"
+            );
+        }
+    }
+
+    #[test]
+    fn a_device_that_was_asked_for_by_name_is_the_only_one_tried() {
+        // If the user picked a headset and it is gone, opening the
+        // laptop's microphone instead would be worse than useless: the
+        // user would not know which microphone the other end was
+        // hearing.
+        let host = cpal::default_host();
+        let Ok(list) = host.devices() else {
+            return;
+        };
+        let Some(device) = list.into_iter().find(|d| d.supports_input()) else {
+            return;
+        };
+        let name = device_name(&device);
+
+        let candidates = device_candidates(&host, Some(&name), true);
+        assert!(
+            candidates.len() <= 1,
+            "a named device brought {} candidates",
+            candidates.len()
+        );
     }
 
     #[test]

@@ -199,11 +199,40 @@ fn a_stopped_session_sends_nothing_more() {
     caller.audio_state().push_outbound(silence(Codec::Pcmu));
     assert!(wait_for_samples(&callee, 160).len() >= 160);
 
+    // The stop comes first: after it the sending thread is gone, so
+    // nothing more can be on the wire. What it sent before is in the
+    // queue, and is emptied — what is being looked for is what arrives
+    // *after* the stop.
+    //
+    // (The queue has to be emptied after the stop rather than before
+    // it: a session with no microphone sends silence on its own clock,
+    // so a frame could be on the wire between the two.)
     caller.stop();
-    // The queue is empty now, and nothing more arrives.
+    callee.audio_state().take_inbound();
+
     std::thread::sleep(Duration::from_millis(200));
     let after = callee.audio_state().take_inbound();
     assert!(after.is_empty(), "{} samples after the stop", after.len());
+}
+
+#[test]
+fn a_session_without_a_microphone_still_keeps_the_clock_moving() {
+    // This is the remote session with no microphone redirection: there
+    // is no capture side, so nothing is ever queued for the sender.
+    // The sender has to make the silence itself, or the peer sees an
+    // empty wire and hangs the call up.
+    //
+    // Nothing is pushed by this test: the frames arrive on their own.
+    let (caller, callee) = pair();
+    caller.start_transport();
+    callee.start_transport();
+
+    let received = wait_for_samples(&callee, 5 * 160);
+    assert!(
+        received.len() >= 5 * 160,
+        "only {} samples arrived — the clock is not running",
+        received.len()
+    );
 }
 
 #[test]

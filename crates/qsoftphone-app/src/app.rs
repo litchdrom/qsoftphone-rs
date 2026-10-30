@@ -96,6 +96,13 @@ pub struct QSoftphoneApp {
     devices: Vec<DeviceInfo>,
     /// Whether the devices have been read yet.
     devices_loaded: bool,
+    /// Whether this is a remote session.
+    ///
+    /// It cannot change while the app runs, so it is read once at
+    /// startup. A remote session redirects the playback but not the
+    /// microphone, and the switch for the microphone is on the
+    /// **client** — so the user has to be told where to look.
+    remote_session: bool,
     /// What the test sound is doing.
     sound_test: SoundTest,
     /// The results of the background media work.
@@ -302,6 +309,7 @@ impl QSoftphoneApp {
             theme_applied: false,
             devices: Vec::new(),
             devices_loaded: false,
+            remote_session: qsoftphone_media::is_remote_session(),
             sound_test: SoundTest::Idle,
             media_updates,
             media_updates_tx,
@@ -1289,9 +1297,15 @@ impl QSoftphoneApp {
     /// The history page: the searchable list of past calls.
     ///
     /// Each row shows the number, how long the call lasted, when it
-    /// happened and the SIP status code. Expanding a row shows the
-    /// full URI, the cause and the exact timestamps, and offers a
-    /// redial (§5.1).
+    /// happened and the SIP status code, and offers a redial (§5.1)
+    /// **in the row itself** — the redial is the common case, and
+    /// making the user expand a row to find it is a step too many.
+    /// Expanding a row shows the full URI, the cause and the exact
+    /// timestamps.
+    ///
+    /// The legend above the list says what the marks mean: the rows
+    /// use an arrow, a colour and a bare number, and none of those
+    /// explain themselves.
     fn draw_history(&mut self, ui: &mut egui::Ui) {
         // The search box and the direction chips.
         ui.horizontal(|ui| {
@@ -1322,6 +1336,42 @@ impl QSoftphoneApp {
                         .query(&self.history_query, self.history_direction);
                 }
             }
+        });
+        ui.separator();
+
+        // The legend.
+        //
+        // The rows use an arrow, a colour and a bare number, and a bare
+        // "486" in the middle of a line means nothing to anyone who has
+        // not read the code. The key is on the page.
+        ui.horizontal_wrapped(|ui| {
+            let dim = egui::Color32::GRAY;
+            ui.label(egui::RichText::new("→").color(dim).strong());
+            ui.label(egui::RichText::new("outgoing").small().color(dim));
+            ui.label(egui::RichText::new("←").color(dim).strong());
+            ui.label(egui::RichText::new("incoming").small().color(dim));
+            ui.separator();
+            for result in [
+                CallResult::Completed,
+                CallResult::Missed,
+                CallResult::Busy,
+                CallResult::NoAnswer,
+                CallResult::Rejected,
+                CallResult::Failed,
+                CallResult::Cancelled,
+            ] {
+                ui.label(
+                    egui::RichText::new(result.label())
+                        .small()
+                        .color(result_color(result)),
+                );
+            }
+            ui.separator();
+            ui.label(
+                egui::RichText::new("a bare number is the SIP status code")
+                    .small()
+                    .color(dim),
+            );
         });
         ui.separator();
 
@@ -1400,15 +1450,14 @@ impl QSoftphoneApp {
                     ui.label(
                         egui::RichText::new(result.label())
                             .small()
-                            .color(match result {
-                                CallResult::Completed => egui::Color32::from_rgb(61, 220, 151),
-                                CallResult::Missed => egui::Color32::from_rgb(231, 76, 60),
-                                CallResult::Busy | CallResult::Rejected | CallResult::Failed => {
-                                    egui::Color32::from_rgb(230, 162, 60)
-                                }
-                                _ => egui::Color32::GRAY,
-                            }),
+                            .color(result_color(result)),
                     );
+
+                    // The redial, in the row: §5.1. It is the thing
+                    // people come to the history for.
+                    if ui.small_button("Redial").clicked() {
+                        action = Some(HistoryAction::Redial(record.clone()));
+                    }
 
                     if ui
                         .small_button(if expanded { "Hide" } else { "Details" })
@@ -1452,9 +1501,6 @@ impl QSoftphoneApp {
                                 egui::RichText::new(format!("Cause: {}", record.hangup_cause))
                                     .small(),
                             );
-                        }
-                        if ui.button("Redial").clicked() {
-                            action = Some(HistoryAction::Redial(record.clone()));
                         }
                     });
                 }
@@ -1728,6 +1774,22 @@ impl QSoftphoneApp {
             ui.weak("This machine has no sound card that could be found.");
         }
 
+        // A remote session is worth saying out loud: it is the one
+        // case where the sound card is there and the microphone is not,
+        // and the reason is a setting on the **client**.
+        if self.remote_session {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("This is a remote session (RDP).")
+                    .strong()
+                    .color(egui::Color32::from_rgb(230, 162, 60)),
+            );
+            ui.weak(qsoftphone_media::REMOTE_SESSION_HINT);
+            ui.weak(
+                "The call still works: the peer hears silence, and this end still hears the peer.",
+            );
+        }
+
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             let label = match &self.sound_test {
@@ -1745,6 +1807,15 @@ impl QSoftphoneApp {
         });
         ui.weak("A short tone through the speaker, to see that it works.");
     }
+}
+
+/// The colour the history list shows a result in.
+///
+/// The colour is decided in the core crate, next to the label, so the
+/// legend above the list and the rows below it cannot drift apart.
+fn result_color(result: CallResult) -> egui::Color32 {
+    let (r, g, b) = result.color();
+    egui::Color32::from_rgb(r, g, b)
 }
 
 /// What the codec is, for the settings page.
@@ -1880,6 +1951,44 @@ mod tests {
         let mut output = ctx.run_ui(input, |ui| app.draw(ui));
         output.textures_delta.clear();
         output
+    }
+
+    /// Where a button with this label is on the page.
+    ///
+    /// The accessibility tree is what a screen reader gets, so it is
+    /// also the one place that says where a button is.
+    fn button_at(output: &egui::FullOutput, label: &str) -> Option<egui::Rect> {
+        let update = output.platform_output.accesskit_update.as_ref()?;
+        update.nodes.iter().find_map(|(_, node)| {
+            if node.label()? != label {
+                return None;
+            }
+            let bounds = node.bounds()?;
+            Some(egui::Rect::from_min_max(
+                egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
+            ))
+        })
+    }
+
+    /// Click a button, by where it is.
+    fn click_at(app: &mut QSoftphoneApp, ctx: &egui::Context, at: egui::Rect) {
+        let pos = at.center();
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::PointerMoved(pos));
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        frame_with(app, ctx, input);
     }
 
     #[tokio::test]
@@ -2185,6 +2294,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_history_row_offers_a_redial_without_being_expanded() {
+        // The redial is what people come to the history for, so it is
+        // in the row: making the user expand a row to find it is a step
+        // too many.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        let record = CallRecord::from_incoming(
+            "acct-ui-1",
+            "call-in",
+            "sip:6661@sip.example.com",
+            "104",
+            "",
+            1_000,
+            2_000,
+            200,
+            "Normal",
+            true,
+        );
+        app.history_rows = vec![record.clone()];
+        app.view = View::History;
+
+        // The row is not expanded.
+        assert!(app.history_expanded.is_none());
+
+        let output = frame(&mut app, &ctx);
+        let button = button_at(&output, "Redial").expect("the row has no redial");
+
+        // Clicking it dials the number back.
+        click_at(&mut app, &ctx, button);
+
+        assert_eq!(app.dial_number, "6661", "the redial did not happen");
+    }
+
+    #[tokio::test]
+    async fn the_history_page_says_what_the_marks_mean() {
+        // The rows use an arrow, a colour and a bare number, and none
+        // of those explain themselves. The legend is the key.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        app.view = View::History;
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+
+        for expected in [
+            "outgoing",
+            "incoming",
+            "a bare number is the SIP status code",
+            // The result labels, so the colours have a key.
+            "Missed",
+            "Busy",
+            "No answer",
+            "Rejected",
+            "Failed",
+        ] {
+            assert!(
+                text.contains(expected),
+                "the legend does not say {expected:?}:\n{text}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn the_history_loads_the_rows_that_were_already_there() {
         // The window opens on a database that already has calls in it
         // — from yesterday, or from before the app was closed.
@@ -2366,6 +2541,39 @@ mod tests {
         assert!(
             text.contains("Test sound"),
             "the test sound is cut off:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_settings_page_says_when_the_session_is_remote() {
+        // A remote session brings the playback and not the microphone,
+        // and the switch for the microphone is on the **client**. The
+        // user has to be told where to look, or the call is one-way
+        // for a reason nobody can guess.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        app.view = View::Settings;
+
+        // Not a remote session: nothing to say.
+        app.remote_session = false;
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            !text.contains("remote session"),
+            "a console session is being warned about:\n{text}"
+        );
+
+        // A remote session: the notice, and where to look.
+        app.remote_session = true;
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("remote session"),
+            "the remote session is not on the page:\n{text}"
+        );
+        assert!(
+            text.contains("Record from this computer"),
+            "the notice does not say where to look:\n{text}"
         );
     }
 

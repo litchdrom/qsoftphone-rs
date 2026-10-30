@@ -357,6 +357,21 @@ impl CallResult {
             CallResult::Failed => "Failed",
         }
     }
+
+    /// The colour the history list shows the result in: red, green and
+    /// blue.
+    ///
+    /// The legend above the list uses this too, so the key and the rows
+    /// cannot drift apart. It is plain RGB rather than a window's
+    /// colour type, because this crate has no window in it.
+    pub fn color(self) -> (u8, u8, u8) {
+        match self {
+            CallResult::Completed => (61, 220, 151),
+            CallResult::Missed => (231, 76, 60),
+            CallResult::Busy | CallResult::Rejected | CallResult::Failed => (230, 162, 60),
+            CallResult::Cancelled | CallResult::NoAnswer => (140, 140, 140),
+        }
+    }
 }
 
 /// Classify a finished call — the port of the C++'s

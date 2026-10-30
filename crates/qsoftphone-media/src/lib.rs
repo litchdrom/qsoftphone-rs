@@ -61,7 +61,10 @@ pub mod codec;
 pub mod jitter;
 pub mod rtp;
 
-pub use audio::{AudioError, AudioState, DeviceInfo, devices, play_test_sound};
+pub use audio::{
+    AudioError, AudioState, DeviceInfo, REMOTE_SESSION_HINT, REMOTE_SESSION_MIC_HINT, devices,
+    is_remote_session, play_test_sound,
+};
 pub use codec::Codec;
 pub use rtp::RtpSocket;
 
@@ -79,9 +82,15 @@ const READ_TIMEOUT: Duration = Duration::from_millis(5);
 /// that a burst of packets has somewhere to go.
 const MAX_JITTER_FRAMES: usize = 5;
 
-/// How long the sending thread waits for a frame before it looks at
-/// the stop flag again.
-const SEND_TIMEOUT: Duration = Duration::from_millis(50);
+/// How long one frame of audio is.
+///
+/// Twenty milliseconds, for every codec: G.711's frame is 160 samples
+/// at 8 kHz and G.722's is 320 samples at 16 kHz, and both are 20 ms
+/// on the wire.
+///
+/// The sender waits this long for each frame, so it is the clock the
+/// RTP runs on when there is no microphone to run it.
+const FRAME_PERIOD: Duration = Duration::from_millis(20);
 
 /// What the media of a call should be.
 #[derive(Debug, Clone)]
@@ -359,10 +368,24 @@ impl MediaSession {
             Ok(microphone) => {
                 *self.inner.microphone_name.lock().expect("microphone lock") =
                     Some(microphone.name().to_string());
+                // The sending thread needs to know: with no microphone,
+                // no frame is ever going to arrive from the capture
+                // side, and the sender has to make the silence itself.
+                self.inner.state.set_has_microphone(true);
                 Some(microphone)
             }
             Err(e) => {
-                problems.push(e.to_string());
+                // A remote session without a microphone redirection is
+                // the one case where the reason is worth saying: the
+                // device is not missing, it was never redirected.
+                let mut problem = e.to_string();
+                if audio::is_remote_session() {
+                    problem.push_str(" (");
+                    problem.push_str(audio::REMOTE_SESSION_MIC_HINT);
+                    problem.push(')');
+                }
+                problems.push(problem);
+                self.inner.state.set_has_microphone(false);
                 None
             }
         };
@@ -422,13 +445,14 @@ impl MediaSession {
             let socket = socket.clone();
             let state = self.inner.state.clone();
             let stop = stop.clone();
+            let codec = self.codec();
             let mut sender = rtp::RtpSender::new(socket.clone(), self.payload_type(), self.ssrc());
             if let Some(remote) = *self.inner.remote.lock().expect("remote lock") {
                 sender.set_remote(remote);
             }
             std::thread::Builder::new()
                 .name("qsoftphone-rtp-send".to_string())
-                .spawn(move || sender_loop(socket, sender, state, stop))
+                .spawn(move || sender_loop(socket, sender, state, stop, codec))
                 .ok()
         };
 
@@ -495,6 +519,9 @@ impl MediaSession {
         drop(running.microphone);
         drop(running.speaker);
         self.inner.running.store(false, Ordering::Relaxed);
+        // There is no microphone any more, so the sender's silence
+        // takes over — until the session is stopped, which it is.
+        self.inner.state.set_has_microphone(false);
 
         self.log_the_call();
     }
@@ -589,21 +616,46 @@ fn log_the_call(state: &AudioState) {
 }
 
 /// The sending thread: the captured frames, onto the wire.
+///
+/// A call with **no microphone** still sends. The RTP clock is what
+/// tells the peer the call is alive, and a peer that stops hearing RTP
+/// hangs up — so the sender makes the silence itself, on the frame
+/// clock, when there is no capture side to make it for it.
+///
+/// That is not an edge case: it is what a remote session without a
+/// microphone redirection is, and it is what a machine with no sound
+/// card is.
 fn sender_loop(
     _socket: Arc<std::net::UdpSocket>,
     mut sender: rtp::RtpSender,
     state: Arc<AudioState>,
     stop: Arc<AtomicBool>,
+    codec: Codec,
 ) {
+    // The encoder is here for the silence: the codec's own silence
+    // frame, from its own encoder, so that a stateful codec (G.722)
+    // stays in step with the decoder at the other end.
+    let mut encoder = codec.encoder();
+
     while !stop.load(Ordering::Relaxed) {
-        match state.wait_for_outbound(SEND_TIMEOUT) {
+        match state.wait_for_outbound(FRAME_PERIOD) {
             Some(frame) => {
                 if let Err(e) = sender.send_frame(&frame) {
                     warn!(error = %e, "an RTP packet could not be sent");
                 }
             }
             None => {
-                // The wait timed out: look at the stop flag again.
+                if state.has_microphone() {
+                    // The frame is late. Wait for it rather than put a
+                    // hole in the middle of real audio.
+                    continue;
+                }
+                // There is no microphone, so no frame is ever coming.
+                // The call still has to send.
+                let frame = encoder.encode_silence();
+                if let Err(e) = sender.send_frame(&frame) {
+                    warn!(error = %e, "an RTP packet could not be sent");
+                }
             }
         }
     }
@@ -743,6 +795,78 @@ mod tests {
         let session = MediaSession::new(&MediaConfig::default()).expect("a session");
         assert_ne!(session.local_port(), 0);
         assert!(session.local_port() > 1024);
+    }
+
+    #[test]
+    fn a_call_with_no_microphone_still_sends() {
+        // The RTP clock is what tells the peer the call is alive, and
+        // a peer that stops hearing RTP hangs up. A machine with no
+        // sound card — and a remote session whose microphone was not
+        // redirected — has to send **silence**, not nothing at all.
+        //
+        // This is the bug: the sending thread used to wait for a frame
+        // that was never going to arrive, and the wire stayed empty.
+        let session = MediaSession::new(&MediaConfig::default()).expect("a session");
+
+        // Somewhere for the RTP to arrive.
+        let listener = std::net::UdpSocket::bind("127.0.0.1:0").expect("listener");
+        listener
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        let port = listener.local_addr().expect("addr").port();
+
+        session.set_remote("127.0.0.1", port).expect("remote");
+        // The transport, and no sound card: this is the remote
+        // session, and the machine with no microphone.
+        session.start_transport();
+
+        let mut buffer = [0u8; 1500];
+        let (read, _from) = listener
+            .recv_from(&mut buffer)
+            .expect("no RTP arrived — the call is sending nothing at all");
+
+        // The RTP header is twelve bytes without extensions, and what
+        // is behind it is µ-law silence.
+        assert!(read > 12, "the packet was empty");
+        assert_eq!(
+            &buffer[12..read],
+            &[0xFF; 160],
+            "the packet was not silence"
+        );
+
+        session.stop();
+    }
+
+    #[test]
+    fn a_call_with_no_microphone_keeps_the_clock_running() {
+        // More than one frame: the clock is what matters. A peer that
+        // sees one packet and then nothing hangs up.
+        let session = MediaSession::new(&MediaConfig::default()).expect("a session");
+
+        let listener = std::net::UdpSocket::bind("127.0.0.1:0").expect("listener");
+        listener
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        let port = listener.local_addr().expect("addr").port();
+
+        session.set_remote("127.0.0.1", port).expect("remote");
+        session.start_transport();
+
+        let mut buffer = [0u8; 1500];
+        let mut frames = 0;
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            if listener.recv_from(&mut buffer).is_ok() {
+                frames += 1;
+            }
+        }
+
+        assert!(
+            frames >= 3,
+            "only {frames} frames arrived in half a second — the clock is not running"
+        );
+
+        session.stop();
     }
 
     #[test]
