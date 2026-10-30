@@ -36,6 +36,38 @@ impl Direction {
             _ => None,
         }
     }
+
+    /// The mark the history shows for a call that went this way.
+    ///
+    /// It is the *name* of the mark: the app paints the arrow and the
+    /// cross itself, because the font it uses has no arrows in them —
+    /// a character the font does not have is drawn as an empty box.
+    /// This one is what the accessibility tree gets, so a screen reader
+    /// says "rightwards arrow" and not nothing at all.
+    ///
+    /// It is decided here, next to the direction, so the legend above
+    /// the list and the rows below it cannot drift apart — the same
+    /// reason [`CallResult::color`] lives here.
+    ///
+    /// The C++ draws a red ✕ for a missed call
+    /// (`src/ui/HistoryPanel.qml`), and that is worth keeping: a
+    /// missed call is not an incoming call that happened to be short.
+    pub fn arrow(self) -> &'static str {
+        match self {
+            Direction::Incoming => "←",
+            Direction::Outgoing => "→",
+            Direction::Missed => "✕",
+        }
+    }
+
+    /// The colour the history shows the mark in.
+    pub fn color(self) -> (u8, u8, u8) {
+        match self {
+            Direction::Incoming => (85, 170, 255),
+            Direction::Outgoing => (61, 220, 151),
+            Direction::Missed => (231, 76, 60),
+        }
+    }
 }
 
 /// One row of call history.
@@ -260,9 +292,15 @@ impl CallRecord {
 /// The wall-clock time of a call: `03:12`.
 const TIME_FORMAT: &[BorrowedFormatItem<'_>] = format_description!("[hour]:[minute]");
 
-/// When a call happened: `28 Oct 2026, 03:12`.
+/// When a call happened: `28 Oct 2026, 03:12:41`.
+///
+/// The **seconds** are there for a reason: a call that lasted twenty
+/// seconds starts and ends in the same minute, and without them the
+/// two timestamps read identically — which looks exactly like the
+/// history not knowing when the call ended. The C++ formats the
+/// expanded timestamps as `yyyy-MM-dd HH:mm:ss` for the same reason.
 const STAMP_FORMAT: &[BorrowedFormatItem<'_>] =
-    format_description!("[day] [month repr:short] [year], [hour]:[minute]");
+    format_description!("[day] [month repr:short] [year], [hour]:[minute]:[second]");
 
 /// The local time, for the history's timestamps.
 ///
@@ -718,10 +756,54 @@ mod tests {
     }
 
     #[test]
+    fn the_stamp_has_seconds() {
+        // A call that lasted twenty seconds starts and ends in the
+        // same minute. Without the seconds the two timestamps read
+        // identically — which looks exactly like the history not
+        // knowing when the call ended.
+        let clock = LocalTime::default();
+        let start = clock.stamp(1_000_000_000_000);
+        let end = clock.stamp(1_000_022_000_000);
+
+        assert_ne!(
+            start, end,
+            "a call that lasted 22 seconds reads the same: {start}"
+        );
+        assert_eq!(
+            start.matches(':').count(),
+            2,
+            "the stamp has no seconds: {start}"
+        );
+    }
+
+    #[test]
     fn direction_round_trips_through_its_wire_name() {
         for d in [Direction::Incoming, Direction::Outgoing, Direction::Missed] {
             assert_eq!(Direction::parse(d.as_str()), Some(d));
         }
         assert_eq!(Direction::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn every_direction_has_its_own_mark() {
+        // The legend above the list draws these marks, so a missed
+        // call must not look like an incoming one.
+        let arrows = [
+            Direction::Incoming.arrow(),
+            Direction::Outgoing.arrow(),
+            Direction::Missed.arrow(),
+        ];
+        for (index, arrow) in arrows.iter().enumerate() {
+            assert!(!arrow.is_empty());
+            for other in &arrows[index + 1..] {
+                assert_ne!(arrow, other, "two directions share the mark {arrow:?}");
+            }
+        }
+        // And a mark of its own colour.
+        assert_ne!(
+            Direction::Missed.color(),
+            Direction::Incoming.color(),
+            "a missed call is drawn like an incoming one"
+        );
     }
 }

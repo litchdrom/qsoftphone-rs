@@ -398,6 +398,13 @@ impl QSoftphoneApp {
                     if let Some(record) = Self::history_record(view) {
                         self.history.record(record);
                     }
+                    // The status line goes back to what it says when
+                    // there is nothing to say. It used to stay on
+                    // "Hanging up…" for ever, because nothing ever
+                    // said the call was over — and a status line that
+                    // lies about the state of the app is worse than no
+                    // status line at all.
+                    self.status = "Ready.".to_string();
                 }
                 _ => {}
             }
@@ -1099,8 +1106,22 @@ impl QSoftphoneApp {
                     self.view = View::Settings;
                 }
                 ui.separator();
-                ui.label(egui::RichText::new("M5 — settings").small());
                 ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).small());
+
+                // The keypad, on the right of the page.
+                //
+                // The C++ has one keypad, always on the dialer page,
+                // and it does both jobs: it dials the number when the
+                // app is idle and it sends the DTMF tones during a
+                // call. This is the same keypad in the same place.
+                if self.view == View::Call {
+                    // The keypad's width, so that the spacer pushes it
+                    // to the right of the page.
+                    let width = 3.0 * 30.0 + 2.0 * 4.0;
+                    let spacer = (ui.available_width() - width).max(0.0);
+                    ui.add_space(spacer);
+                    self.draw_keypad(ui);
+                }
             });
             ui.separator();
 
@@ -1200,6 +1221,47 @@ impl QSoftphoneApp {
         }
     }
 
+    /// The keypad.
+    ///
+    /// The C++ has one keypad, always on the dialer page, and it does
+    /// both jobs: it dials the number when the app is idle and it
+    /// sends the DTMF tones during a call. This is the same keypad in
+    /// the same place — the header, to the right of the page tabs.
+    ///
+    /// The digits are the C++'s: `*` and `#` are there for the
+    /// feature codes a PBX puts in front of a call.
+    fn draw_keypad(&mut self, ui: &mut egui::Ui) {
+        // While a call is up, the keypad sends the tones; otherwise it
+        // dials the number.
+        let in_call = self
+            .active_call()
+            .is_some_and(|call| call.state == "connected");
+
+        ui.vertical(|ui| {
+            for row in [
+                ["1", "2", "3"],
+                ["4", "5", "6"],
+                ["7", "8", "9"],
+                ["*", "0", "#"],
+            ] {
+                ui.horizontal(|ui| {
+                    for digit in row {
+                        if ui
+                            .add(egui::Button::new(digit).min_size(egui::vec2(30.0, 20.0)))
+                            .clicked()
+                        {
+                            if in_call {
+                                self.send_dtmf(digit);
+                            } else {
+                                self.dial_number.push_str(digit);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
     /// One call, in the call list.
     fn draw_call(&mut self, ui: &mut egui::Ui, call: CallView) {
         let who = if call.caller_id.is_empty() {
@@ -1271,26 +1333,9 @@ impl QSoftphoneApp {
                 }
             });
 
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("DTMF").strong().size(11.0));
-                for row in [
-                    ["1", "2", "3"],
-                    ["4", "5", "6"],
-                    ["7", "8", "9"],
-                    ["*", "0", "#"],
-                ] {
-                    ui.vertical(|ui| {
-                        for digit in row {
-                            if ui
-                                .add(egui::Button::new(digit).min_size(egui::vec2(34.0, 22.0)))
-                                .clicked()
-                            {
-                                self.send_dtmf(digit);
-                            }
-                        }
-                    });
-                }
-            });
+            // The DTMF keypad is in the header, where it is always
+            // visible and does double duty: it dials the number when
+            // the app is idle and it sends the tones during a call.
         }
     }
 
@@ -1346,10 +1391,14 @@ impl QSoftphoneApp {
         // not read the code. The key is on the page.
         ui.horizontal_wrapped(|ui| {
             let dim = egui::Color32::GRAY;
-            ui.label(egui::RichText::new("→").color(dim).strong());
-            ui.label(egui::RichText::new("outgoing").small().color(dim));
-            ui.label(egui::RichText::new("←").color(dim).strong());
-            ui.label(egui::RichText::new("incoming").small().color(dim));
+            for (direction, name) in [
+                (HistoryDirection::Outgoing, "outgoing"),
+                (HistoryDirection::Incoming, "incoming"),
+                (HistoryDirection::Missed, "missed"),
+            ] {
+                direction_mark(ui, direction);
+                ui.label(egui::RichText::new(name).small().color(dim));
+            }
             ui.separator();
             for result in [
                 CallResult::Completed,
@@ -1375,11 +1424,6 @@ impl QSoftphoneApp {
         });
         ui.separator();
 
-        if self.history_rows.is_empty() {
-            ui.label(egui::RichText::new("No calls yet.").color(egui::Color32::GRAY));
-            return;
-        }
-
         let clock = LocalTime::default();
         // The rows are moved out for the drawing, so that the drawing
         // does not hold a borrow of the app while the buttons are
@@ -1388,123 +1432,177 @@ impl QSoftphoneApp {
         let mut action: Option<HistoryAction> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for record in &rows {
-                let expanded = self.history_expanded == Some(record.id);
-                let result = classify_result(
-                    record.direction,
-                    record.sip_code,
-                    record.duration_sec,
-                    record.answered,
-                    &record.hangup_cause,
+            // The table.
+            //
+            // A table, with a header: the rows are read down the
+            // columns, and a row of marks with nothing to say what
+            // the columns are is not a table.
+            //
+            // The header is drawn even when there is nothing to put
+            // under it: the page is a table, and a table that only
+            // appears once it has rows is a list that occasionally
+            // grows a header.
+            egui::Grid::new("history")
+                .striped(true)
+                .spacing([14.0, 4.0])
+                .show(ui, |ui| {
+                    for title in ["dir", "Number", "Duration", "Time", "code", "status"] {
+                        ui.label(egui::RichText::new(title).strong().size(11.0));
+                    }
+                    // The actions have no title: they are not a column
+                    // of information, they are what you do with the row.
+                    ui.label(egui::RichText::new("").strong());
+                    ui.end_row();
+
+                    for record in &rows {
+                        let expanded = self.history_expanded == Some(record.id);
+                        let result = classify_result(
+                            record.direction,
+                            record.sip_code,
+                            record.duration_sec,
+                            record.answered,
+                            &record.hangup_cause,
+                        );
+
+                        // Which way the call was going.
+                        direction_mark(ui, record.direction);
+
+                        // The number — never the full URI; that is what
+                        // the details are for. The name, when there is
+                        // one, goes under it.
+                        let number = if record.remote_number.is_empty() {
+                            record.remote_uri.clone()
+                        } else {
+                            record.remote_number.clone()
+                        };
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.label(egui::RichText::new(number).strong());
+                            if !record.remote_name.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(&record.remote_name)
+                                        .small()
+                                        .color(egui::Color32::GRAY),
+                                );
+                            }
+                        });
+
+                        // How long it lasted.
+                        ui.label(
+                            egui::RichText::new(format_duration(record.duration_sec))
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        );
+
+                        // When it happened.
+                        ui.label(
+                            egui::RichText::new(clock.time(record.started_at))
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        );
+
+                        // The SIP status code.
+                        if record.sip_code != 0 {
+                            ui.label(
+                                egui::RichText::new(record.sip_code.to_string())
+                                    .small()
+                                    .strong(),
+                            );
+                        } else {
+                            ui.label("");
+                        }
+
+                        // And how it ended.
+                        ui.label(
+                            egui::RichText::new(result.label())
+                                .small()
+                                .color(result_color(result)),
+                        );
+
+                        // The redial, in the row: §5.1. It is the thing
+                        // people come to the history for.
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Redial").clicked() {
+                                action = Some(HistoryAction::Redial(record.clone()));
+                            }
+                            if ui
+                                .small_button(if expanded { "Hide" } else { "Details" })
+                                .clicked()
+                            {
+                                action = Some(HistoryAction::Toggle(record.id));
+                            }
+                        });
+                        ui.end_row();
+                    }
+                });
+
+            // Nothing to put under the header. It goes under the
+            // table, not over it: the header is the table's, and it
+            // stays there.
+            if rows.is_empty() {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(if self.history_query.trim().is_empty() {
+                        "No calls yet."
+                    } else {
+                        "No calls match the search."
+                    })
+                    .color(egui::Color32::GRAY),
                 );
+            }
 
-                ui.horizontal(|ui| {
-                    // Which way the call was going.
-                    let arrow = match record.direction {
-                        HistoryDirection::Outgoing => "→",
-                        _ => "←",
-                    };
-                    ui.label(egui::RichText::new(arrow).color(egui::Color32::GRAY));
-
-                    // The number — never the full URI; that is what
-                    // the expanded row is for.
+            // The expanded row's details, under the table.
+            //
+            // They are under the table rather than inside the row
+            // because a table's columns are sized by their contents:
+            // a URI in the "dir" column would make the whole table
+            // wide.
+            if let Some(record) = rows
+                .iter()
+                .find(|record| self.history_expanded == Some(record.id))
+            {
+                ui.separator();
+                ui.indent("details", |ui| {
                     let number = if record.remote_number.is_empty() {
                         record.remote_uri.clone()
                     } else {
                         record.remote_number.clone()
                     };
-                    ui.label(egui::RichText::new(number).strong());
-
-                    if !record.remote_name.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} — {}",
+                            number,
+                            clock.stamp(record.started_at)
+                        ))
+                        .strong(),
+                    );
+                    if !record.remote_uri.is_empty() {
                         ui.label(
-                            egui::RichText::new(&record.remote_name)
-                                .small()
-                                .color(egui::Color32::GRAY),
+                            egui::RichText::new(format!("URI: {}", record.remote_uri)).small(),
                         );
                     }
-
-                    // How long it lasted.
-                    ui.label(
-                        egui::RichText::new(format_duration(record.duration_sec))
-                            .small()
-                            .color(egui::Color32::GRAY),
-                    );
-
-                    // When it happened.
-                    ui.label(
-                        egui::RichText::new(clock.time(record.started_at))
-                            .small()
-                            .color(egui::Color32::GRAY),
-                    );
-
-                    // The SIP status code.
-                    if record.sip_code != 0 {
+                    if !record.dialed_number.is_empty() {
                         ui.label(
-                            egui::RichText::new(record.sip_code.to_string())
-                                .small()
-                                .strong(),
+                            egui::RichText::new(format!("Dialled: {}", record.dialed_number))
+                                .small(),
                         );
                     }
-
-                    // And how it ended.
                     ui.label(
-                        egui::RichText::new(result.label())
-                            .small()
-                            .color(result_color(result)),
+                        egui::RichText::new(format!("Started: {}", clock.stamp(record.started_at)))
+                            .small(),
                     );
-
-                    // The redial, in the row: §5.1. It is the thing
-                    // people come to the history for.
-                    if ui.small_button("Redial").clicked() {
-                        action = Some(HistoryAction::Redial(record.clone()));
+                    if record.ended_at > 0 {
+                        ui.label(
+                            egui::RichText::new(format!("Ended: {}", clock.stamp(record.ended_at)))
+                                .small(),
+                        );
                     }
-
-                    if ui
-                        .small_button(if expanded { "Hide" } else { "Details" })
-                        .clicked()
-                    {
-                        action = Some(HistoryAction::Toggle(record.id));
+                    if !record.hangup_cause.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("Cause: {}", record.hangup_cause)).small(),
+                        );
                     }
                 });
-
-                if expanded {
-                    ui.indent("details", |ui| {
-                        if !record.remote_uri.is_empty() {
-                            ui.label(
-                                egui::RichText::new(format!("URI: {}", record.remote_uri)).small(),
-                            );
-                        }
-                        if !record.dialed_number.is_empty() {
-                            ui.label(
-                                egui::RichText::new(format!("Dialled: {}", record.dialed_number))
-                                    .small(),
-                            );
-                        }
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Started: {}",
-                                clock.stamp(record.started_at)
-                            ))
-                            .small(),
-                        );
-                        if record.ended_at > 0 {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Ended: {}",
-                                    clock.stamp(record.ended_at)
-                                ))
-                                .small(),
-                            );
-                        }
-                        if !record.hangup_cause.is_empty() {
-                            ui.label(
-                                egui::RichText::new(format!("Cause: {}", record.hangup_cause))
-                                    .small(),
-                            );
-                        }
-                    });
-                }
-                ui.separator();
             }
         });
 
@@ -1818,6 +1916,79 @@ fn result_color(result: CallResult) -> egui::Color32 {
     egui::Color32::from_rgb(r, g, b)
 }
 
+/// The colour the history list shows a direction's mark in.
+///
+/// Like the result colour, it is decided in the core crate — the mark
+/// and its colour belong together, and the legend draws the same mark
+/// in the same colour.
+fn direction_color(direction: HistoryDirection) -> egui::Color32 {
+    let (r, g, b) = direction.color();
+    egui::Color32::from_rgb(r, g, b)
+}
+
+/// The mark that says which way a call was going.
+///
+/// It is **drawn**, not typed. The app's font has no arrows in it, and
+/// a character the font does not have is a little empty box — which is
+/// exactly what the history's direction column showed before this was
+/// drawn by hand.
+///
+/// The character is still there, in the accessibility tree, so a screen
+/// reader says "rightwards arrow" and not nothing at all; it is only
+/// not painted.
+fn direction_mark(ui: &mut egui::Ui, direction: HistoryDirection) {
+    let text = egui::RichText::new(direction.arrow()).color(egui::Color32::TRANSPARENT);
+    let rect = ui.add(egui::Label::new(text)).rect;
+    let side = rect.height().min(11.0);
+    let mark = egui::Rect::from_center_size(rect.center(), egui::vec2(side, side));
+    let color = direction_color(direction);
+    let painter = ui.painter();
+
+    match direction {
+        HistoryDirection::Outgoing => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(mark.left() + 1.0, mark.top()),
+                    egui::pos2(mark.right(), mark.center().y),
+                    egui::pos2(mark.left() + 1.0, mark.bottom()),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+        HistoryDirection::Incoming => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(mark.right() - 1.0, mark.top()),
+                    egui::pos2(mark.left(), mark.center().y),
+                    egui::pos2(mark.right() - 1.0, mark.bottom()),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+        HistoryDirection::Missed => {
+            // A cross, the way the C++ marks a missed call.
+            let stroke = egui::Stroke::new(1.8, color);
+            let inset = 2.0;
+            painter.line_segment(
+                [
+                    egui::pos2(mark.left() + inset, mark.top() + inset),
+                    egui::pos2(mark.right() - inset, mark.bottom() - inset),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(mark.right() - inset, mark.top() + inset),
+                    egui::pos2(mark.left() + inset, mark.bottom() - inset),
+                ],
+                stroke,
+            );
+        }
+    }
+}
+
 /// What the codec is, for the settings page.
 fn codec_note(codec: Codec) -> &'static str {
     match codec {
@@ -1961,6 +2132,24 @@ mod tests {
         let update = output.platform_output.accesskit_update.as_ref()?;
         update.nodes.iter().find_map(|(_, node)| {
             if node.label()? != label {
+                return None;
+            }
+            let bounds = node.bounds()?;
+            Some(egui::Rect::from_min_max(
+                egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
+            ))
+        })
+    }
+
+    /// Where a piece of text is on the page.
+    ///
+    /// A plain label is a **value** in the accessibility tree and a
+    /// button is a **name**, so both are looked for.
+    fn text_at(output: &egui::FullOutput, text: &str) -> Option<egui::Rect> {
+        let update = output.platform_output.accesskit_update.as_ref()?;
+        update.nodes.iter().find_map(|(_, node)| {
+            if node.value() != Some(text) && node.label() != Some(text) {
                 return None;
             }
             let bounds = node.bounds()?;
@@ -2327,6 +2516,253 @@ mod tests {
         click_at(&mut app, &ctx, button);
 
         assert_eq!(app.dial_number, "6661", "the redial did not happen");
+    }
+
+    #[tokio::test]
+    async fn the_history_is_a_table_with_a_header() {
+        // The rows are read down the columns, and a row of marks with
+        // nothing to say what the columns are is not a table.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        app.history_rows = vec![CallRecord::from_incoming(
+            "acct-ui-1",
+            "call-in",
+            "sip:6661@sip.example.com",
+            "104",
+            "",
+            1_000,
+            2_000,
+            200,
+            "Normal",
+            true,
+        )];
+        app.view = View::History;
+        let output = frame(&mut app, &ctx);
+
+        let mut headers = Vec::new();
+        for title in ["dir", "Number", "Duration", "Time", "code", "status"] {
+            let rect = text_at(&output, title)
+                .unwrap_or_else(|| panic!("the table has no {title:?} column"));
+            headers.push(rect);
+        }
+
+        // The header is a row: the columns are side by side, at the
+        // same height, in the order they were asked for.
+        let first = headers[0];
+        for (index, rect) in headers.iter().enumerate().skip(1) {
+            assert!(
+                rect.min.y > first.min.y - 2.0 && rect.min.y < first.min.y + 2.0,
+                "the {index} column is not on the header row"
+            );
+            assert!(
+                rect.min.x > headers[index - 1].min.x,
+                "the {index} column is to the left of the one before it"
+            );
+        }
+
+        // And the row is under the header, in the column it belongs
+        // to: the number is between "dir" and "Duration", and below
+        // the header.
+        let number = text_at(&output, "6661").expect("the row has no number");
+        assert!(
+            number.min.y > first.max.y,
+            "the row is not under the header: {number:?} against {first:?}"
+        );
+        assert!(
+            number.min.x >= headers[1].min.x && number.max.x <= headers[2].min.x,
+            "the number is not in the Number column: {number:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_history_table_has_a_header_when_there_is_nothing_to_put_under_it() {
+        // A table that only grows a header once it has rows is a list
+        // that occasionally grows a header.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        app.view = View::History;
+        let output = frame(&mut app, &ctx);
+
+        for title in ["dir", "Number", "Duration", "Time", "code", "status"] {
+            assert!(
+                text_at(&output, title).is_some(),
+                "the empty table has no {title:?} column"
+            );
+        }
+        let text = screen_text(&output);
+        assert!(
+            text.contains("No calls yet."),
+            "the empty table does not say it is empty:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_history_says_when_the_call_started_and_when_it_ended() {
+        // The bug the user reported: "Started" and "Ended" always read
+        // the same. A call that lasted twenty seconds starts and ends
+        // in the same minute, so the timestamps have to carry the
+        // seconds — otherwise the history looks like it does not know
+        // when the call ended.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        let started = 1_000_000_000_000;
+        let ended = started + 22_000;
+        let mut record = CallRecord::from_incoming(
+            "acct-ui-1",
+            "call-in",
+            "sip:559@193.178.169.164:5161",
+            "559",
+            "",
+            started,
+            ended,
+            200,
+            "OK",
+            true,
+        );
+        record.id = 1;
+        app.history_rows = vec![record];
+        app.history_expanded = Some(1);
+        app.view = View::History;
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+
+        let start = text
+            .lines()
+            .find_map(|line| line.strip_prefix("Started: "))
+            .unwrap_or_else(|| panic!("the details have no start:\n{text}"));
+        let stop = text
+            .lines()
+            .find_map(|line| line.strip_prefix("Ended: "))
+            .unwrap_or_else(|| panic!("the details have no end:\n{text}"));
+
+        assert_ne!(start, stop, "the start and the end read the same: {start}");
+        // And the seconds are in there — that is what tells them
+        // apart.
+        assert!(
+            start.matches(':').count() == 2,
+            "the timestamp has no seconds: {start}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_keypad_is_in_the_header_of_the_call_page() {
+        // The C++ has one keypad, always on the dialer page, and it
+        // does both jobs. This is the same keypad, in the header.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        app.view = View::Call;
+        let output = frame(&mut app, &ctx);
+
+        let mut keys = Vec::new();
+        for digit in ["1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#"] {
+            let rect =
+                button_at(&output, digit).unwrap_or_else(|| panic!("the keypad has no {digit:?}"));
+            keys.push(rect);
+        }
+
+        // It is on the right of the window: the header is the tabs on
+        // the left and the keypad on the right.
+        let rightmost = keys.iter().map(|r| r.max.x).fold(0.0f32, f32::max);
+        assert!(
+            rightmost > 900.0,
+            "the keypad is not on the right of the window: {rightmost}"
+        );
+
+        // And it is only on the call page.
+        app.view = View::History;
+        let output = frame(&mut app, &ctx);
+        assert!(
+            button_at(&output, "5").is_none(),
+            "the keypad is on the history page as well"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_keypad_dials_when_the_app_is_idle_and_sends_tones_in_a_call() {
+        // The C++ has one keypad that does both jobs: "it dials
+        // numbers when idle and sends DTMF tones during the call"
+        // (`src/ui/Dialer.qml`). This is the same keypad.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        // Idle: the key dials the number.
+        app.view = View::Call;
+        let output = frame(&mut app, &ctx);
+        let five = button_at(&output, "5").expect("the keypad has no 5");
+        click_at(&mut app, &ctx, five);
+        assert_eq!(app.dial_number, "5", "the key did not dial the number");
+
+        // In a call: the same key sends a tone and does not touch the
+        // number. The tone cannot be sent here — there is no stack
+        // behind the test — but the branch is the one that matters,
+        // and it says so.
+        let mut ok = CallEvent::new(CallEventType::CallAnswered);
+        ok.call_id = "call-1".to_string();
+        ok.call_direction = Some(Direction::Incoming);
+        ok.call_state = "connected".to_string();
+        bus.publish("acct-ui-1", ok);
+        frame(&mut app, &ctx);
+
+        let output = frame(&mut app, &ctx);
+        let five = button_at(&output, "5").expect("the keypad has no 5");
+        click_at(&mut app, &ctx, five);
+
+        assert_eq!(
+            app.dial_number, "5",
+            "the key dialled the number during the call"
+        );
+        assert!(
+            app.status.starts_with("Could not send the digit"),
+            "the key did not send a tone during the call: {:?}",
+            app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn the_milestone_note_is_gone() {
+        // "M5 — settings" is the build's own bookkeeping. It says
+        // nothing to a user.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        for view in [View::Call, View::History, View::Account, View::Settings] {
+            app.view = view;
+            let output = frame(&mut app, &ctx);
+            let text = screen_text(&output);
+            assert!(
+                !text.contains("M5 — settings"),
+                "the milestone note is back on the {view:?} page:\n{text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hung_up_call_leaves_the_status_ready() {
+        // The status line used to stay on "Hanging up…" for ever,
+        // because nothing ever said the call was over.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.status = "Hanging up…".to_string();
+
+        run_a_call(&bus, "call-1", true).await;
+        frame(&mut app, &ctx);
+
+        assert_eq!(
+            app.status, "Ready.",
+            "the status line still says {:?}",
+            app.status
+        );
     }
 
     #[tokio::test]

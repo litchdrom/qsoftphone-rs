@@ -9,7 +9,7 @@ identity resolution, the call event contract, the history rules and
 the transfer construction all have to behave identically, including the
 bugs that have already been fixed there.
 
-**Status: M4.6 complete.** The workspace builds, the test suite passes, the
+**Status: M4.7 complete.** The workspace builds, the test suite passes, the
 app starts and exits cleanly, an account can be registered against a SIP
 registrar with digest authentication (MD5 and SHA-256), and calls can be
 placed and received over that registration — outbound INVITE, inbound
@@ -25,10 +25,16 @@ does **not** touch the pitch to chase the peer's clock, which is what
 made it wobble. The sound card's callback no longer takes a lock, and
 unregistering in the middle of a call ends the call and closes the
 device instead of leaving it to the next one. Every call now says what
-its media did. The history's rows carry the redial and a legend. And a
-call with **no microphone** — a remote session without a microphone
-redirection, a machine with no sound card — still sends RTP silence, so
-the clock keeps running and the call does not die. See
+its media did. The history is a **table** — `dir | Number | Duration |
+Time | code | status`, with the legend above it — and its timestamps
+carry the seconds, so a call that lasted twenty seconds no longer reads
+as if it started and ended at the same instant. The status line goes
+back to "Ready." when the call is over. The dialpad is in the header of
+the call page, and it does both jobs: it dials the number when the app
+is idle and it sends the DTMF tones during a call. And a call with **no
+microphone** — a remote session without a microphone redirection, a
+machine with no sound card — still sends RTP silence, so the clock
+keeps running and the call does not die. See
 [Milestones](#milestones).
 
 ---
@@ -1794,6 +1800,133 @@ with `#[link(name = "user32")]`.
 
 ---
 
+## M4.7 — The history as a table, the dialpad, and the timestamps
+
+Four things were asked for, and one more turned up on the way.
+
+### The history is a table
+
+The rows are read **down the columns**, and a row of marks with nothing
+to say what the columns are is not a table. The history page is now a
+grid with a header:
+
+```text
+dir     Number      Duration   Time    code   status
+◀       6661        1:35       09:07   200    OK
+        Bob
+▶       559         0:22       08:50   200    OK
+        Alice
+✗       7777        —          08:31          Missed
+        Carol
+```
+
+The **legend stays above it** — it is the key to the marks and the
+colours, and the columns do not explain them.
+
+Three things follow from being a table:
+
+* **The header is drawn even when there is nothing under it.** A table
+  that grows a header once it has rows is a list that occasionally grows
+  a header; and the empty state ("No calls yet.") goes *under* the
+  header, where it belongs.
+* **The expanded details go under the table, not inside the row.** A
+  grid's columns are sized by their contents, so a full SIP URI in the
+  "dir" column would make the whole table as wide as the URI. The
+  details are for reading, and they read better under the table anyway.
+* **The actions have no title.** "Redial" and "Details" are not a
+  column of information; they are what you do with the row.
+
+### The start and the end of a call
+
+> Started: 30 Oct 2026, 08:26
+> Ended: 30 Oct 2026, 08:26
+
+The **data** was never wrong: the row's `started_at` and `ended_at` are
+two different instants, and the duration column (00:22) said so. The
+**format** was too coarse — the timestamps were printed to the minute,
+so a call that lasted twenty seconds started and ended "at the same
+time" on the page. A history that cannot tell you when a call ended is
+a history that looks broken.
+
+The stamp carries the seconds now:
+
+```text
+30 Oct 2026, 09:07:06
+```
+
+which is also what the C++ does — `Qt.formatDateTime(startedAt,
+"yyyy-MM-dd HH:mm:ss")` in `src/ui/HistoryPanel.qml`.
+
+### The status line goes back to "Ready."
+
+"Hanging up…" was written to the status line when the hangup was
+*requested*, and nothing ever wrote over it: the call ended, the row
+landed in the history, and the status line went on saying that
+something was still being hung up. A status line that lies about the
+state of the app is worse than no status line at all.
+
+The `CallEnded` event now puts it back to "Ready." — the same thing it
+says when there is nothing to say.
+
+### The dialpad, and the milestone note that was not information
+
+The header of the call page carried the label "**M5 — settings**": the
+build's own bookkeeping, telling the user which milestone the software
+was at. It is of no use to a user, and it is gone.
+
+In its place is the **dialpad**, on the right of the page header, where
+the C++ has it on the dialer page (`src/ui/components/Keypad.qml`). It
+is one keypad that does both jobs, exactly as the C++ describes it: *"it
+dials numbers when idle and sends DTMF tones during the call"*. When a
+call is up, the same keys send the tones; when the app is idle, they
+dial the number.
+
+The separate DTMF keypad that used to live inside the call panel is
+gone — there is one keypad now, not two.
+
+### The arrow is drawn, not typed
+
+The direction column used to be a character — `→`, `←`, `✕` — and the
+pictures showed a **little empty box** in every row.
+
+The reason is the font: egui's bundled proportional face (Ubuntu-Light)
+has no arrows in it, and a character the font does not have is drawn as
+a box. The C++ gets away with the same characters because Qt goes
+through the platform's fonts, which do have them.
+
+So the marks are **painted** — a triangle for the way the call was
+going, a cross for a missed call — with the painter, in the direction's
+colour. The character is still in the accessibility tree (a screen
+reader says "rightwards arrow"), it is only not painted.
+
+The colours live in the core crate next to the labels, as
+`Direction::color()`, so the legend and the rows cannot drift apart —
+the same rule as `CallResult::color()`.
+
+### The pictures
+
+This machine's desktop is locked, so its screen cannot be captured: the
+window is never composited and both `CopyFromScreen` and `PrintWindow`
+come back black. The pictures in this repository were therefore made by
+**painting egui's own tessellation** — the shapes egui produced for the
+frame, rasterised by hand — which needs no window, no GPU and no
+unlocked desktop. That is scaffolding, not part of the application: it
+is not in the tree.
+
+### The dependency cost: nothing
+
+No new crate, and no new file in the tree.
+
+### What is *not* in M4.7
+
+* **The expanded row's details are not in the row.** They are under the
+  table, because a grid's columns are sized by their contents.
+* **The keypad is only on the call page**, like the C++'s, so the
+  header row is taller on that page than on the others.
+* **Two concurrent calls still open two sound cards** — see M4.5.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -1829,6 +1962,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M4.4** | The pitch wobble: the playout no longer trims its rate to chase the peer's clock — that *was* the dithering | **done** |
 | **M4.5** | The stale call and the real-time callback: unregistering ends the call and closes the sound card, and the callback no longer takes a lock | **done** |
 | **M4.6** | The history row, the legend, and the remote session: the redial is in the row, the rows have a key, and a call with no microphone still sends | **done** |
+| **M4.7** | The history as a table, the dialpad, and the timestamps: the history has a header row, the timestamps carry the seconds, the status line goes back to "Ready.", and the dialpad is in the header of the call page | **done** |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
@@ -1893,7 +2027,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 271 tests, all passing.
+* `cargo test --workspace` — 297 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -2123,6 +2257,21 @@ player lands.
 * **A remote session is recognised and explained.** The notice says
   what a remote session is, where the switch for the microphone is, and
   that the call still works.
+* **The history is a table with a header.** The headless frame of the
+  history page has a `dir`, `Number`, `Duration`, `Time`, `code` and
+  `status` column, side by side, in that order — and the row's number
+  is under the "Number" column and below the header. The header is
+  there even when the history is empty.
+* **A call that lasted twenty seconds does not read as if it started
+  and ended at the same time.** The stamp carries the seconds, and the
+  test compares the two stamps of a call 22 seconds long.
+* **A hung-up call leaves the status line at "Ready."** The status line
+  used to stay on "Hanging up…" for ever.
+* **The dialpad is in the header of the call page**, it is not on the
+  other pages, it dials the number when the app is idle, and the same
+  key sends a tone during a call.
+* **The build's own bookkeeping is not on the screen.** "M5 — settings"
+  is gone from every page.
 
 **Verified against a real Asterisk:**
 
@@ -2199,7 +2348,11 @@ player lands.
 * The GUI has been started and its window photographed, so the layout
   is as it is shown above. It has not been reviewed by a human at
   normal resolution — this machine's desktop was locked for most of
-  the build, and the screenshots were taken when it was not.
+  the build, and the screenshots were taken when it was not. The latest
+  pictures were painted from egui's own tessellation rather than
+  photographed from the screen, because the desktop was locked; they
+  show the real layout and the real colours, but they are a rasteriser's
+  idea of the frame, not the framebuffer itself.
 * The Linux build has not been compiled or run. The dependency tree is
   resolved for `x86_64-unknown-linux-gnu` (385 package names) but no
   Linux binary was produced.
