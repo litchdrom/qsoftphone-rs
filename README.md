@@ -9,7 +9,7 @@ identity resolution, the call event contract, the history rules and
 the transfer construction all have to behave identically, including the
 bugs that have already been fixed there.
 
-**Status: M4.9 complete.** The workspace builds, the test suite passes, the
+**Status: M4.10 complete.** The workspace builds, the test suite passes, the
 app starts and exits cleanly, an account can be registered against a SIP
 registrar with digest authentication (MD5 and SHA-256), and calls can be
 placed and received over that registration — outbound INVITE, inbound
@@ -43,7 +43,10 @@ guesses: a live level meter, the level in decibels, the names of the
 devices it used, and a warning when the speaker is a headphone jack.
 A call says how many frames it **sent**, and how many of those were
 silence the sender had to make for itself. The call page holds **only
-the calls that are up**. See
+the calls that are up**. And the history's expanded details open **under
+the row they belong to**, the way the C++ opens them — they used to be
+drawn below the whole table, which put them off the screen in a history
+of any length. See
 [Milestones](#milestones).
 
 ---
@@ -2284,6 +2287,107 @@ No new crate.
 
 ---
 
+## M4.10 — The details are under the row they belong to
+
+The report was:
+
+> Thanks. Sound works. Calls shows only active. But now history details
+> are missing.
+
+with a picture of the history page in which the first row's button read
+**"Hide"** — so the row *was* expanded — and the details were not on the
+screen.
+
+### What "missing" meant
+
+The details were not missing. They were drawn **after the whole table**.
+
+The history was an `egui::Grid`, and a grid sizes its columns by what is
+in them. The details of a row are long — the full SIP URI, the exact
+timestamps, the hangup cause — so they could not be a column of the
+table: they would have made the table as wide as the longest URI. They
+were therefore drawn below the table, and a history with twenty-five calls
+put the details of the *first* row below the *twenty-fifth*, which is off
+the screen.
+
+So the button worked, the row was expanded, and the details were on the
+page — just not on the part of the page anybody was looking at. Clicking
+"Hide" and clicking "Details" looked like the same thing.
+
+### The table is drawn by hand, and the details go under their own row
+
+The C++ has the answer, and it is not a grid either
+(`src/ui/HistoryPanel.qml`): the row is a `RowLayout`, and inside it there
+is an **"Expanded details panel"** — a `ColumnLayout` with
+`Layout.fillWidth: true` — that becomes visible when the row is
+expanded. The details belong to the row and they are **inside** it.
+
+So this build now does the same:
+
+* the table is drawn by hand, with the cells placed at rects the code
+  computes — not at rects egui sizes by their contents;
+* the columns have **fixed widths** (`COL_DIR`, `COL_NUMBER`,
+  `COL_DURATION`, `COL_TIME`, `COL_CODE`, `COL_STATUS`), so a long URI
+  cannot widen the table;
+* the details are drawn **inside the row loop**, under the row they
+  belong to.
+
+The columns line up, which is the part a grid could not promise. Measured
+at 1920 points wide:
+
+| | dir | Number | Duration | Time | code | status |
+|---|---|---|---|---|---|---|
+| the header | 238 | **270** | 378 | 454 | 522 | 574 |
+| the row | 238 | **270** | 378 | 454 | 522 | 574 |
+
+The number in the row is at 270, exactly under the "Number" header — not
+at 259, which is where the content-sized cell put it before.
+
+### The second bug: the table was wider than the window
+
+Drawing the page is how the first bug was found, and it found another
+one. The table was sized against `ui.available_width()`, and inside a
+scroll area that number **runs past the edge of the window** — the
+panel's own margin is not clipped away:
+
+```text
+the scroll area's content rect   [238.0 163.0] - [732.0 916.0]   (494 points wide)
+the visible part of it            [230.0 163.0] - [716.0 916.0]   (478 points wide)
+```
+
+Sixteen points of the table were outside the window. In a 716-point
+window the **"Details" button was past the edge** — the button that opens
+the details could not be clicked at all, in a window the size the user
+has.
+
+The table is now measured against the **clip** rectangle, which is where
+the window ends:
+
+```text
+the "Details" button ends at      707.6
+the window is                     716.0
+```
+
+and when the page is too narrow for the fixed widths, the columns shrink
+together, each by the same share, so they keep their proportions and
+still line up.
+
+### The dependency cost: nothing
+
+No new crate.
+
+### What is *not* in M4.10
+
+* **The history is not paginated.** It draws every row it has, in a
+  scroll area. A history of ten thousand calls is still ten thousand
+  rows.
+* **The details are not a copyable field.** The URI and the timestamps
+  are labels; there is no button that puts them on the clipboard.
+* **The columns cannot be re-ordered or resized.** The widths are
+  constants in the code.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -2322,6 +2426,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M4.7** | The history as a table, the dialpad, and the timestamps: the history has a header row, the timestamps carry the seconds, the status line goes back to "Ready.", and the dialpad is in the header of the call page | **done** |
 | **M4.8** | The keypad in the middle, the window that wakes up, and the echo test: the dialpad is centred in the call page, the app asks egui to redraw ten times a second, and the microphone is played back through the speaker with the device names in the report | **done** |
 | **M4.9** | The microphone tells the truth, and the calls are the ones that are up: the echo test has a level meter and says the level in decibels, a call says how many frames it sent, and the call page lists only the calls that are up | **done** |
+| **M4.10** | The details are under the row they belong to: the history table is drawn by hand with fixed columns, an expanded row opens its details **under itself** instead of below the whole table, and the table fits the window | **done** |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
@@ -2386,7 +2491,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 311 tests, all passing.
+* `cargo test --workspace` — 313 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -2672,6 +2777,19 @@ player lands.
   had to make for itself is counted separately.
 * **The call page holds only the calls that are up.** A call leaves the
   list when it is hung up.
+* **The details of a history row are under that row.** The details used
+  to be drawn below the **whole table**, which put them off the screen in
+  a history of any length. The test expands the first row of a
+  three-row history and checks that the details are above the second
+  row — and the test fails if they are moved back below the table.
+* **The button that opens the details is on the page.** The table used
+  to be sized against `ui.available_width()`, which inside the scroll
+  area runs past the edge of the window, so in a 716-point window the
+  "Details" button was outside it. The table is now measured against the
+  clip rectangle, and the test checks the button is on the screen.
+* **The history's columns line up.** The row's number is under the
+  "Number" header — the same x — and every column of the header is to
+  the right of the one before it.
 
 **Verified against a real Asterisk:**
 
@@ -2698,7 +2816,7 @@ player lands.
   Asterisk run above ended in a `404`. The SIP messages on the wire are
   the real ones, but no call has yet been *answered* by a peer this
   repository did not write.
-* **No audio has been heard by a human.** The RTP path is proved
+* **No call has been heard by a human.** The RTP path is proved
   end to end between two sessions in this repository, the G.711 codec
   is proved against its own tables, the jitter buffer and the channel
   handling are proved in simulation, and the audio's **fidelity** is
@@ -2706,8 +2824,8 @@ player lands.
   has yet been made to Asterisk and listened to. The desktop was locked
   for most of the M4 build, so the sound card could not be exercised by
   a person. **The dithering that M4.3, M4.4 and M4.5 fix has not been
-  heard fixed** — it has been proved wrong on the numbers, which is not
-  the same thing, and the next call is the real test.
+  heard fixed on a call** — it has been proved wrong on the numbers,
+  which is not the same thing, and the next call is the real test.
 * **The stale call has been proved by reading the code, not by
   hearing it.** The chain is in [M4.5](#m45--the-stale-call-and-the-real-time-callback)
   and every link is checkable: the media was only ever released by the
@@ -2741,21 +2859,16 @@ player lands.
 * **The test sound has not been heard either.** It is played on the
   runtime and the result comes back, but a locked desktop has no
   speaker to play it on.
-* **The echo test has not been heard either — and its playback half
-  cannot be proved here.** The capture half *is* proved on this
-  machine's real sound card: the real function was run against the real
-  microphone and took 240,128 samples in five seconds, which is exactly
-  the microphone's rate, with the peak at the room's noise floor
-  (−48 dBFS to −67 dBFS, depending on the moment). The **playback**
-  half runs at the right rate too — the output callback delivered
-  96,000 samples a second — but the acoustic loop could not be closed:
-  a full-scale tone on the speaker moved the microphone's peak by
-  **0.4 dB**, and the speaker the app is configured to use is
-  `Headphone (Realtek(R) Audio)`, which is silent unless something is
-  plugged into it. So **whether the sound comes out of the speaker is
-  the one thing in M4.9 that only a person at the machine can say** —
-  and it is a single press of the "Echo test" button, with headphones
-  on, and a watch of the meter.
+* **The echo test has been heard — by the user, on this machine.** After
+  M4.9 the user pressed the "Echo test" button and reported **"Sound
+  works"**, which is the one thing the numbers could not say: the
+  capture half is proved on the real sound card (the real function was
+  run against the real microphone and took 240,128 samples in five
+  seconds, which is exactly the microphone's rate, with the peak at the
+  room's noise floor — −48 dBFS to −67 dBFS, depending on the moment),
+  and the playback half now has a human ear behind it. What it does
+  **not** prove is a call: the echo test is a loopback through the
+  sound card, not an RTP session to a peer.
 * **The microphone's level has not been heard either.** The app
   measures it (−48 dBFS to −67 dBFS here) and says it, but a number is
   not a voice: whether the machine's microphone hears anything at all

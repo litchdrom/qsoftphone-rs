@@ -1669,105 +1669,299 @@ impl QSoftphoneApp {
             //
             // A table, with a header: the rows are read down the
             // columns, and a row of marks with nothing to say what
-            // the columns are is not a table.
+            // the columns are is not a table. The header is drawn even
+            // when there is nothing to put under it: the page is a
+            // table, and a table that only appears once it has rows is
+            // a list that occasionally grows a header.
             //
-            // The header is drawn even when there is nothing to put
-            // under it: the page is a table, and a table that only
-            // appears once it has rows is a list that occasionally
-            // grows a header.
-            egui::Grid::new("history")
-                .striped(true)
-                .spacing([14.0, 4.0])
-                .show(ui, |ui| {
-                    for title in ["dir", "Number", "Duration", "Time", "code", "status"] {
-                        ui.label(egui::RichText::new(title).strong().size(11.0));
-                    }
-                    // The actions have no title: they are not a column
-                    // of information, they are what you do with the row.
-                    ui.label(egui::RichText::new("").strong());
-                    ui.end_row();
+            // The cells are placed at rects this code computes, and
+            // that is the whole point of drawing the table by hand
+            // instead of with a grid: the details of a row are long —
+            // the full SIP URI, the exact timestamps — and a grid sizes
+            // its columns by what is in them, so the details would
+            // widen the table and then have nowhere to go but below the
+            // whole thing, where a long history puts them out of sight.
+            // With fixed widths the details go **under the row they
+            // belong to**, which is what the C++ does
+            // (`src/ui/HistoryPanel.qml`: an "Expanded details panel"
+            // inside the row, filling its width).
+            //
+            // The columns, and whether they fit.
+            //
+            // The widths are fixed, but the table still has to fit the
+            // page: a table whose last column hangs off the edge
+            // cannot be used, and the button that opens the details
+            // lives in that column. When the page is narrow the
+            // columns shrink a little, each by the same share, so they
+            // keep their proportions and still line up.
+            //
+            // The page is measured against the **clip** rectangle and
+            // not against the available width: inside the scroll area
+            // the available width runs past the edge of the window —
+            // the panel's own margin is not clipped away — so a table
+            // sized against it ends its last column outside the window,
+            // and the button that opens the details is one of the
+            // buttons that cannot be reached.
+            let origin = ui.next_widget_position();
+            let page = (ui.clip_rect().max.x - origin.x).max(320.0);
 
-                    for record in &rows {
-                        let expanded = self.history_expanded == Some(record.id);
-                        let result = classify_result(
-                            record.direction,
-                            record.sip_code,
-                            record.duration_sec,
-                            record.answered,
-                            &record.hangup_cause,
+            let wanted = [
+                COL_DIR,
+                COL_NUMBER,
+                COL_DURATION,
+                COL_TIME,
+                COL_CODE,
+                COL_STATUS,
+            ];
+            let overhead = COL_GAP * wanted.len() as f32 + COL_ACTIONS;
+            let room = (page - overhead).max(160.0);
+            let wanted_sum: f32 = wanted.iter().sum();
+            let scale = if wanted_sum > room {
+                room / wanted_sum
+            } else {
+                1.0
+            };
+            let widths = [
+                wanted[0] * scale,
+                wanted[1] * scale,
+                wanted[2] * scale,
+                wanted[3] * scale,
+                wanted[4] * scale,
+                wanted[5] * scale,
+            ];
+
+            let gap = COL_GAP;
+            let mut x = origin.x;
+            for (title, width) in [
+                ("dir", widths[0]),
+                ("Number", widths[1]),
+                ("Duration", widths[2]),
+                ("Time", widths[3]),
+                ("code", widths[4]),
+                ("status", widths[5]),
+            ] {
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(x, origin.y),
+                    egui::vec2(width, ROW_HEIGHT),
+                );
+                x += width + gap;
+                table_cell(ui, rect, |ui| {
+                    ui.label(egui::RichText::new(title).strong().size(11.0));
+                });
+            }
+            // The actions have no title: they are not a column of
+            // information, they are what you do with the row.
+            ui.allocate_space(egui::vec2(0.0, ROW_HEIGHT));
+
+            for record in &rows {
+                let expanded = self.history_expanded == Some(record.id);
+                let result = classify_result(
+                    record.direction,
+                    record.sip_code,
+                    record.duration_sec,
+                    record.answered,
+                    &record.hangup_cause,
+                );
+
+                // The number — never the full URI; that is what the
+                // details are for. The name, when there is one, goes
+                // under it, and a row with a name is two lines high.
+                let number = if record.remote_number.is_empty() {
+                    record.remote_uri.clone()
+                } else {
+                    record.remote_number.clone()
+                };
+                let height = if record.remote_name.is_empty() {
+                    ROW_HEIGHT
+                } else {
+                    ROW_TWO_LINES
+                };
+
+                let origin = ui.next_widget_position();
+                let mut x = origin.x;
+
+                // Which way the call was going.
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(x, origin.y),
+                    egui::vec2(widths[0], height),
+                );
+                x += widths[0] + gap;
+                table_cell(ui, rect, |ui| {
+                    direction_mark(ui, record.direction);
+                });
+
+                // The number.
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(x, origin.y),
+                    egui::vec2(widths[1], height),
+                );
+                x += widths[1] + gap;
+                table_cell(ui, rect, |ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.add(egui::Label::new(egui::RichText::new(&number).strong()).truncate());
+                        if !record.remote_name.is_empty() {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&record.remote_name)
+                                        .small()
+                                        .color(egui::Color32::GRAY),
+                                )
+                                .truncate(),
+                            );
+                        }
+                    });
+                });
+
+                // How long it lasted.
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(x, origin.y),
+                    egui::vec2(widths[2], height),
+                );
+                x += widths[2] + gap;
+                table_cell(ui, rect, |ui| {
+                    ui.label(
+                        egui::RichText::new(format_duration(record.duration_sec))
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
+                });
+
+                // When it happened.
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(x, origin.y),
+                    egui::vec2(widths[3], height),
+                );
+                x += widths[3] + gap;
+                table_cell(ui, rect, |ui| {
+                    ui.label(
+                        egui::RichText::new(clock.time(record.started_at))
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
+                });
+
+                // The SIP status code.
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(x, origin.y),
+                    egui::vec2(widths[4], height),
+                );
+                x += widths[4] + gap;
+                table_cell(ui, rect, |ui| {
+                    if record.sip_code != 0 {
+                        ui.label(
+                            egui::RichText::new(record.sip_code.to_string())
+                                .small()
+                                .strong(),
                         );
+                    } else {
+                        ui.label("");
+                    }
+                });
 
-                        // Which way the call was going.
-                        direction_mark(ui, record.direction);
+                // And how it ended.
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(x, origin.y),
+                    egui::vec2(widths[5], height),
+                );
+                x += widths[5] + gap;
+                table_cell(ui, rect, |ui| {
+                    ui.label(
+                        egui::RichText::new(result.label())
+                            .small()
+                            .color(result_color(result)),
+                    );
+                });
 
-                        // The number — never the full URI; that is what
-                        // the details are for. The name, when there is
-                        // one, goes under it.
+                // The redial, in the row: §5.1. It is the thing
+                // people come to the history for.
+                //
+                // The column is at least as wide as the two buttons
+                // need: a button that hangs off the edge of the page
+                // cannot be clicked, and that button is the one that
+                // opens the details.
+                let width = (origin.x + page - x).max(COL_ACTIONS);
+                let rect =
+                    egui::Rect::from_min_size(egui::pos2(x, origin.y), egui::vec2(width, height));
+                table_cell(ui, rect, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Redial").clicked() {
+                            action = Some(HistoryAction::Redial(record.clone()));
+                        }
+                        if ui
+                            .small_button(if expanded { "Hide" } else { "Details" })
+                            .clicked()
+                        {
+                            action = Some(HistoryAction::Toggle(record.id));
+                        }
+                    });
+                });
+                // The cells were placed by hand, so the cursor has to
+                // be moved past the row by hand too.
+                ui.allocate_space(egui::vec2(0.0, height));
+
+                // The details, **under the row they belong to**.
+                //
+                // They were under the whole table, which is the same
+                // thing as nowhere: a history with twenty calls put the
+                // details of the first row below the twentieth, and the
+                // user was told to click a button that did nothing
+                // they could see. The C++ expands the details inside
+                // the row (`src/ui/HistoryPanel.qml`: an "Expanded
+                // details panel" that fills the row's width).
+                if expanded {
+                    ui.add_space(2.0);
+                    ui.indent("details", |ui| {
                         let number = if record.remote_number.is_empty() {
                             record.remote_uri.clone()
                         } else {
                             record.remote_number.clone()
                         };
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            ui.label(egui::RichText::new(number).strong());
-                            if !record.remote_name.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(&record.remote_name)
-                                        .small()
-                                        .color(egui::Color32::GRAY),
-                                );
-                            }
-                        });
-
-                        // How long it lasted.
                         ui.label(
-                            egui::RichText::new(format_duration(record.duration_sec))
-                                .small()
-                                .color(egui::Color32::GRAY),
+                            egui::RichText::new(format!(
+                                "{} — {}",
+                                number,
+                                clock.stamp(record.started_at)
+                            ))
+                            .strong(),
                         );
-
-                        // When it happened.
-                        ui.label(
-                            egui::RichText::new(clock.time(record.started_at))
-                                .small()
-                                .color(egui::Color32::GRAY),
-                        );
-
-                        // The SIP status code.
-                        if record.sip_code != 0 {
+                        if !record.remote_uri.is_empty() {
                             ui.label(
-                                egui::RichText::new(record.sip_code.to_string())
-                                    .small()
-                                    .strong(),
+                                egui::RichText::new(format!("URI: {}", record.remote_uri)).small(),
                             );
-                        } else {
-                            ui.label("");
                         }
-
-                        // And how it ended.
+                        if !record.dialed_number.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("Dialled: {}", record.dialed_number))
+                                    .small(),
+                            );
+                        }
                         ui.label(
-                            egui::RichText::new(result.label())
-                                .small()
-                                .color(result_color(result)),
+                            egui::RichText::new(format!(
+                                "Started: {}",
+                                clock.stamp(record.started_at)
+                            ))
+                            .small(),
                         );
-
-                        // The redial, in the row: §5.1. It is the thing
-                        // people come to the history for.
-                        ui.horizontal(|ui| {
-                            if ui.small_button("Redial").clicked() {
-                                action = Some(HistoryAction::Redial(record.clone()));
-                            }
-                            if ui
-                                .small_button(if expanded { "Hide" } else { "Details" })
-                                .clicked()
-                            {
-                                action = Some(HistoryAction::Toggle(record.id));
-                            }
-                        });
-                        ui.end_row();
-                    }
-                });
+                        if record.ended_at > 0 {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Ended: {}",
+                                    clock.stamp(record.ended_at)
+                                ))
+                                .small(),
+                            );
+                        }
+                        if !record.hangup_cause.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("Cause: {}", record.hangup_cause))
+                                    .small(),
+                            );
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
+            }
 
             // Nothing to put under the header. It goes under the
             // table, not over it: the header is the table's, and it
@@ -1782,60 +1976,6 @@ impl QSoftphoneApp {
                     })
                     .color(egui::Color32::GRAY),
                 );
-            }
-
-            // The expanded row's details, under the table.
-            //
-            // They are under the table rather than inside the row
-            // because a table's columns are sized by their contents:
-            // a URI in the "dir" column would make the whole table
-            // wide.
-            if let Some(record) = rows
-                .iter()
-                .find(|record| self.history_expanded == Some(record.id))
-            {
-                ui.separator();
-                ui.indent("details", |ui| {
-                    let number = if record.remote_number.is_empty() {
-                        record.remote_uri.clone()
-                    } else {
-                        record.remote_number.clone()
-                    };
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} — {}",
-                            number,
-                            clock.stamp(record.started_at)
-                        ))
-                        .strong(),
-                    );
-                    if !record.remote_uri.is_empty() {
-                        ui.label(
-                            egui::RichText::new(format!("URI: {}", record.remote_uri)).small(),
-                        );
-                    }
-                    if !record.dialed_number.is_empty() {
-                        ui.label(
-                            egui::RichText::new(format!("Dialled: {}", record.dialed_number))
-                                .small(),
-                        );
-                    }
-                    ui.label(
-                        egui::RichText::new(format!("Started: {}", clock.stamp(record.started_at)))
-                            .small(),
-                    );
-                    if record.ended_at > 0 {
-                        ui.label(
-                            egui::RichText::new(format!("Ended: {}", clock.stamp(record.ended_at)))
-                                .small(),
-                        );
-                    }
-                    if !record.hangup_cause.is_empty() {
-                        ui.label(
-                            egui::RichText::new(format!("Cause: {}", record.hangup_cause)).small(),
-                        );
-                    }
-                });
             }
         });
 
@@ -2302,6 +2442,52 @@ fn echo_report_text(report: &qsoftphone_media::EchoReport) -> String {
     format!("Something came in; the loudest moment was {db:.0} dB ({devices}).")
 }
 
+/// The widths of the history table's columns.
+///
+/// They are **fixed**, and that is the whole point of drawing the
+/// table by hand instead of with a grid: the details of a row are
+/// long — the full SIP URI, the exact timestamps — and a grid sizes
+/// its columns by what is in them, so the details would widen the
+/// table and then have nowhere to go but below the whole thing, where
+/// a long history puts them out of sight. With fixed widths the
+/// details go **under the row they belong to**.
+const COL_DIR: f32 = 24.0;
+const COL_NUMBER: f32 = 100.0;
+const COL_DURATION: f32 = 68.0;
+const COL_TIME: f32 = 60.0;
+const COL_CODE: f32 = 44.0;
+const COL_STATUS: f32 = 58.0;
+
+/// What the row's buttons need: "Redial" and "Details" side by side.
+///
+/// Measured: the two buttons are 116 points wide together, and the
+/// column has to hold them both.
+const COL_ACTIONS: f32 = 124.0;
+
+/// The gap between two columns of the history table.
+const COL_GAP: f32 = 8.0;
+
+/// The height of a row of the history table.
+///
+/// One line, or two when the call had a name under the number.
+const ROW_HEIGHT: f32 = 18.0;
+const ROW_TWO_LINES: f32 = 32.0;
+
+/// One cell of the history table.
+///
+/// The cell is placed at a rect the caller computes, so the columns
+/// line up and a long value cannot widen the table. egui's own grid
+/// cannot do this: it sizes its columns by what is in them.
+fn table_cell<R>(ui: &mut egui::Ui, rect: egui::Rect, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+        add,
+    )
+    .inner
+}
+
 /// The size of a keypad button.
 ///
 /// The keypad is in the middle of the page now, so the buttons can be
@@ -2587,6 +2773,27 @@ mod tests {
         let update = output.platform_output.accesskit_update.as_ref()?;
         update.nodes.iter().find_map(|(_, node)| {
             if node.value() != Some(text) && node.label() != Some(text) {
+                return None;
+            }
+            let bounds = node.bounds()?;
+            Some(egui::Rect::from_min_max(
+                egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
+            ))
+        })
+    }
+
+    /// Where a piece of text that **begins with** this is on the page.
+    ///
+    /// The history's details carry a timestamp, so the whole line is
+    /// not known before the clock has been asked; the beginning of it
+    /// is enough to find the line.
+    fn text_starting_at(output: &egui::FullOutput, prefix: &str) -> Option<egui::Rect> {
+        let update = output.platform_output.accesskit_update.as_ref()?;
+        update.nodes.iter().find_map(|(_, node)| {
+            let found = node.value().is_some_and(|v| v.starts_with(prefix))
+                || node.label().is_some_and(|l| l.starts_with(prefix));
+            if !found {
                 return None;
             }
             let bounds = node.bounds()?;
@@ -3010,6 +3217,104 @@ mod tests {
         assert!(
             number.min.x >= headers[1].min.x && number.max.x <= headers[2].min.x,
             "the number is not in the Number column: {number:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_details_of_a_row_are_under_that_row() {
+        // The bug the user reported: the row said "Hide", so it was
+        // expanded, and the details were nowhere to be seen. They were
+        // drawn under the **whole table**, and a history with twenty
+        // calls put the details of the first row below the twentieth.
+        //
+        // The C++ expands the details inside the row
+        // (`src/ui/HistoryPanel.qml`: an "Expanded details panel" that
+        // fills the row's width), and so does this now: the details of
+        // the first row are between the first row and the second.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        let mut rows = Vec::new();
+        for (index, number) in ["6661", "6662", "6663"].into_iter().enumerate() {
+            let mut record = CallRecord::from_incoming(
+                "acct-ui-1",
+                format!("call-{number}"),
+                format!("sip:{number}@sip.example.com"),
+                number,
+                "",
+                1_000 + index as i64 * 1_000,
+                2_000 + index as i64 * 1_000,
+                200,
+                "Normal",
+                true,
+            );
+            record.id = index as i64 + 1;
+            rows.push(record);
+        }
+        app.history_rows = rows;
+        app.history_expanded = Some(1);
+        app.view = View::History;
+
+        let output = frame(&mut app, &ctx);
+
+        let first = text_at(&output, "6661").expect("the first row has no number");
+        let second = text_at(&output, "6662").expect("the second row has no number");
+        let details =
+            text_starting_at(&output, "Started: ").expect("the expanded row shows no details");
+
+        assert!(
+            details.min.y > first.min.y,
+            "the details are not under their own row: {details:?} against {first:?}"
+        );
+        assert!(
+            details.max.y < second.min.y,
+            "the details are under the next row, not under their own: {details:?} against {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_button_that_opens_the_details_is_on_the_page() {
+        // The table is measured against the clip rectangle and not
+        // against the available width: inside the scroll area the
+        // available width runs past the edge of the window — the
+        // panel's own margin is not clipped away — so a table sized
+        // against it put the button that opens the details outside the
+        // window, where it cannot be clicked.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        app.history_rows = vec![CallRecord::from_incoming(
+            "acct-ui-1",
+            "call-in",
+            "sip:6661@sip.example.com",
+            "104",
+            "",
+            1_000,
+            2_000,
+            200,
+            "Normal",
+            true,
+        )];
+        app.view = View::History;
+
+        // A narrow window — the size the user has.
+        let width = 716.0;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(width, 924.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.draw(ui));
+        output.textures_delta.clear();
+
+        let details = button_at(&output, "Details").expect("the row has no details button");
+        assert!(
+            details.max.x <= width,
+            "the details button is outside the window: {details:?}"
         );
     }
 
