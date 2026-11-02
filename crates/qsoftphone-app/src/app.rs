@@ -115,6 +115,16 @@ pub struct QSoftphoneApp {
     /// never answers, the button would sit at "Listening…" for ever,
     /// which looks like a frozen app — so the test is given up on.
     echo_started: Option<std::time::Instant>,
+    /// The live level of the microphone, from 0 to 1.
+    ///
+    /// It is the loudest sample of the last capture callback, and it is
+    /// what the level meter shows. A microphone that never moves it is
+    /// a microphone that is not working.
+    echo_level: f32,
+    /// The loudest the microphone has been during this test.
+    echo_peak: f32,
+    /// Where the live level arrives.
+    echo_levels: Option<std::sync::mpsc::Receiver<f32>>,
     /// The results of the background media work.
     media_updates: Receiver<MediaUpdate>,
     /// The way back to the runtime that does the work.
@@ -156,7 +166,15 @@ enum EchoTest {
     /// The microphone is being played back.
     Running,
     /// The test has finished, with what it heard.
-    Done(String),
+    Done {
+        /// What it heard, in words.
+        text: String,
+        /// The speaker it played through.
+        ///
+        /// A headphone jack is the commonest reason a test is silent,
+        /// and the name is what says so.
+        speaker: String,
+    },
     /// The test could not be run.
     Failed(String),
 }
@@ -343,6 +361,9 @@ impl QSoftphoneApp {
             sound_test: SoundTest::Idle,
             echo_test: EchoTest::Idle,
             echo_started: None,
+            echo_level: 0.0,
+            echo_peak: 0.0,
+            echo_levels: None,
             media_updates,
             media_updates_tx,
         };
@@ -925,17 +946,49 @@ impl QSoftphoneApp {
 
         self.echo_test = EchoTest::Running;
         self.echo_started = Some(std::time::Instant::now());
+        self.echo_level = 0.0;
+        self.echo_peak = 0.0;
         self.status = "The echo test is running — speak now.".to_string();
+
+        // The live level comes on its own channel: it arrives from the
+        // capture thread, twenty times a second, and it must not wait
+        // for the next frame to be drawn.
+        let (level_tx, level_rx) = std::sync::mpsc::channel::<f32>();
+        self.echo_levels = Some(level_rx);
+
         let sender = self.media_updates_tx.clone();
         self.runtime.spawn_blocking(move || {
             let outcome = qsoftphone_media::play_echo_test(
                 microphone.as_deref(),
                 speaker.as_deref(),
                 ECHO_SECONDS,
+                Some(Box::new(move |level: f32| {
+                    // A closed receiver means the app has gone; the
+                    // send fails and nothing else happens.
+                    let _ = level_tx.send(level);
+                })),
             )
             .map_err(|e| e.to_string());
             let _ = sender.send(MediaUpdate::EchoTest(outcome));
         });
+    }
+
+    /// Take the live level of the microphone, if the echo test is
+    /// running.
+    ///
+    /// The level is what tells a live microphone from a dead one: if
+    /// the user speaks and the bar does not move, the microphone is not
+    /// working, and no amount of waiting will change that.
+    fn poll_echo_level(&mut self) {
+        let Some(receiver) = &self.echo_levels else {
+            return;
+        };
+        while let Ok(level) = receiver.try_recv() {
+            self.echo_level = level;
+            if level > self.echo_peak {
+                self.echo_peak = level;
+            }
+        }
     }
 
     /// Give up on the echo test if the sound card does not come back.
@@ -978,13 +1031,18 @@ impl QSoftphoneApp {
                 }
                 MediaUpdate::EchoTest(Ok(report)) => {
                     let text = echo_report_text(&report);
-                    self.echo_test = EchoTest::Done(text.clone());
+                    self.echo_test = EchoTest::Done {
+                        text: text.clone(),
+                        speaker: report.speaker.clone(),
+                    };
                     self.echo_started = None;
+                    self.echo_levels = None;
                     self.status = text;
                 }
                 MediaUpdate::EchoTest(Err(error)) => {
                     self.echo_test = EchoTest::Failed(error.clone());
                     self.echo_started = None;
+                    self.echo_levels = None;
                     self.status = format!("The echo test could not be run: {error}");
                 }
             }
@@ -1102,11 +1160,20 @@ impl QSoftphoneApp {
         //
         // A tenth of a second is quick enough that nothing is noticed
         // and slow enough that an idle window costs nothing.
-        ui.ctx().request_repaint_after(POLL);
-
         // The echo test is on its own thread, but it still has to be
-        // given up on if the sound card never answers.
+        // given up on if the sound card never answers, and its level
+        // has to be picked up while it runs.
         self.check_echo_test_deadline();
+        self.poll_echo_level();
+
+        // The level meter moves, so while the echo test runs the window
+        // is drawn faster. A tenth of a second is too slow for a bar.
+        let poll = if self.echo_test == EchoTest::Running {
+            LEVEL_POLL
+        } else {
+            POLL
+        };
+        ui.ctx().request_repaint_after(poll);
 
         if !self.theme_applied {
             self.theme_applied = true;
@@ -1364,9 +1431,20 @@ impl QSoftphoneApp {
         ui.label(egui::RichText::new("CALLS").strong().size(11.0));
         ui.separator();
 
-        let calls = self.calls();
+        // **Only the calls that are up.**
+        //
+        // A finished call belongs to the history, and the history has
+        // its own page: listing it here as well meant the section was
+        // full of rows nobody could do anything with, and the space
+        // went to what had already happened instead of to what is
+        // happening. A call leaves this list when it is hung up.
+        let calls: Vec<CallView> = self
+            .calls()
+            .into_iter()
+            .filter(|call| !call.ended)
+            .collect();
         if calls.is_empty() {
-            ui.weak("No calls yet.");
+            ui.weak("No calls up.");
             return;
         }
         for call in calls {
@@ -2065,7 +2143,7 @@ impl QSoftphoneApp {
         ui.horizontal(|ui| {
             let label = match &self.echo_test {
                 EchoTest::Running => "Listening…",
-                EchoTest::Done(_) | EchoTest::Failed(_) => "Echo test again",
+                EchoTest::Done { .. } | EchoTest::Failed(_) => "Echo test again",
                 _ => "Echo test",
             };
             let running = self.echo_test == EchoTest::Running;
@@ -2076,8 +2154,8 @@ impl QSoftphoneApp {
                 EchoTest::Failed(why) => {
                     ui.weak(why.clone());
                 }
-                EchoTest::Done(report) => {
-                    ui.weak(report.clone());
+                EchoTest::Done { text, .. } => {
+                    ui.weak(text.clone());
                 }
                 _ => {}
             }
@@ -2086,7 +2164,111 @@ impl QSoftphoneApp {
             "Your own voice, from the microphone, through the speaker. Wear headphones, \
              or the microphone hears the speaker and the test howls.",
         );
+        ui.weak(
+            "Speak during the test and watch the meter: if the bar does not move when \
+             you talk, the microphone is not working.",
+        );
+
+        // The level meter, while the test runs.
+        //
+        // This is the answer to "the microphone does not work": if the
+        // user speaks and the bar does not move, the microphone is not
+        // working, and no amount of waiting will change that.
+        if self.echo_test == EchoTest::Running {
+            ui.add_space(4.0);
+            draw_level_meter(ui, self.echo_level, self.echo_peak);
+            ui.weak(
+                "Speak now. If the bar does not move, the microphone is muted or the \
+                 wrong input is picked.",
+            );
+        }
+
+        // The speaker the test used, and whether it is a headphone
+        // jack — which is the commonest reason a test is silent.
+        if let EchoTest::Done { speaker, .. } = &self.echo_test {
+            if is_headphone(speaker) {
+                ui.add_space(2.0);
+                ui.weak(format!(
+                    "The speaker is '{speaker}'. If nothing is plugged into it, there is no sound."
+                ));
+            }
+        }
     }
+}
+
+/// The level of a signal, in decibels against full scale.
+///
+/// Below the floor it is not a number at all, and saying "-inf dB"
+/// would be a way of dressing up "nothing" as a measurement.
+fn decibels(level: f32) -> Option<f32> {
+    if level <= 1e-6 {
+        None
+    } else {
+        Some(20.0 * level.log10())
+    }
+}
+
+/// The bar that shows how loud the microphone is.
+///
+/// The scale runs from **-60 dB to 0 dB**, because that is the range
+/// a voice lives in: -60 dB is the floor of a quiet room, and 0 dB is
+/// as loud as it can get without clipping.
+fn draw_level_meter(ui: &mut egui::Ui, level: f32, peak: f32) {
+    let height = 14.0;
+    let width = ui.available_width().min(260.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+
+    let to_fill = |value: f32| {
+        let db = decibels(value).unwrap_or(-120.0);
+        ((db + 60.0) / 60.0).clamp(0.0, 1.0)
+    };
+
+    let track = if ui.visuals().dark_mode { 45 } else { 200 };
+    ui.painter()
+        .rect_filled(rect, 2.0, egui::Color32::from_gray(track));
+
+    let fill = to_fill(level);
+    if fill > 0.0 {
+        let bar =
+            egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * fill, rect.height()));
+        let colour = if decibels(level).unwrap_or(-120.0) > -6.0 {
+            egui::Color32::from_rgb(231, 76, 60)
+        } else {
+            egui::Color32::from_rgb(61, 220, 151)
+        };
+        ui.painter().rect_filled(bar, 2.0, colour);
+    }
+
+    // The peak hold: where the loudest moment was.
+    let hold = to_fill(peak);
+    if hold > 0.0 {
+        let x = rect.min.x + rect.width() * hold;
+        ui.painter().line_segment(
+            [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+            egui::Stroke::new(1.5, egui::Color32::from_gray(220)),
+        );
+    }
+
+    let text = match decibels(level) {
+        Some(db) => format!("{db:.0} dB"),
+        None => "-inf dB".to_string(),
+    };
+    ui.painter().text(
+        rect.left_center() + egui::vec2(width + 8.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        &text,
+        egui::FontId::proportional(12.0),
+        ui.visuals().text_color(),
+    );
+}
+
+/// Whether a device name is a headphone jack.
+///
+/// It is a guess from the name, and it is only used to say something
+/// helpful: a headphone jack with nothing plugged into it is the
+/// commonest reason a test is silent.
+fn is_headphone(name: &str) -> bool {
+    name.to_lowercase().contains("headphone")
 }
 
 /// What the echo test heard, in words.
@@ -2094,17 +2276,30 @@ impl QSoftphoneApp {
 /// The **device names** are in the text: a test that is quiet is usually
 /// a test that ran on a device the user did not mean to use, and the
 /// only way to know which device it was is to say so.
+///
+/// The **level** is in the text too, in decibels. A yes/no answer is
+/// not enough: "the microphone was silent" and "the microphone heard a
+/// whisper at -58 dB" are the same word and completely different
+/// problems, and only the number tells them apart.
+///
+/// What the number cannot do is say *whose* voice it was: a quiet room
+/// and a voice two metres away are at the same level. That is what the
+/// **meter** is for — the user speaks, and watches it move.
 fn echo_report_text(report: &qsoftphone_media::EchoReport) -> String {
     let devices = format!("{} into {}", report.microphone, report.speaker);
     if report.samples == 0 {
-        return format!("The microphone sent nothing at all — {devices}.");
+        return format!("The microphone sent nothing at all — it never ran ({devices}).");
     }
-    if report.peak < 0.005 {
+    let Some(db) = decibels(report.peak) else {
         return format!("The microphone was silent — nothing came in ({devices}).");
+    };
+    if db < -55.0 {
+        return format!(
+            "The microphone heard nothing: it stayed at {db:.0} dB ({devices}). \
+             If you spoke, the microphone is muted or the wrong input is picked."
+        );
     }
-    // The peak in decibels, against full scale.
-    let db = 20.0 * report.peak.max(1e-6).log10();
-    format!("Your voice came in; the loudest moment was {db:.0} dB ({devices}).")
+    format!("Something came in; the loudest moment was {db:.0} dB ({devices}).")
 }
 
 /// The size of a keypad button.
@@ -2234,6 +2429,12 @@ impl eframe::App for QSoftphoneApp {
 
 /// How often the app looks at itself when nothing else is happening.
 const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How often the app looks at itself while the echo test is running.
+///
+/// The level meter has to move, and a tenth of a second is too slow for
+/// a bar to look like a bar.
+const LEVEL_POLL: std::time::Duration = std::time::Duration::from_millis(30);
 
 /// When the process started.
 ///
@@ -3129,6 +3330,118 @@ mod tests {
         assert!(
             text.contains("Microphone Array") && text.contains("Headphone"),
             "the echo report does not say which devices it used:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_echo_report_says_the_level_in_decibels() {
+        // "The microphone was silent" and "the microphone heard a
+        // whisper at -58 dB" are the same word and completely different
+        // problems. Only the number tells them apart.
+        let quiet = qsoftphone_media::EchoReport {
+            peak: 0.000_465,
+            samples: 240_128,
+            microphone: "Microphone Array".to_string(),
+            speaker: "Speaker".to_string(),
+        };
+        let text = echo_report_text(&quiet);
+        assert!(
+            text.contains("-67 dB"),
+            "the report does not say how quiet the microphone was:\n{text}"
+        );
+        assert!(
+            text.contains("heard nothing"),
+            "the report does not say that nothing was heard:\n{text}"
+        );
+
+        let voice = qsoftphone_media::EchoReport {
+            peak: 0.125,
+            samples: 240_128,
+            microphone: "Microphone Array".to_string(),
+            speaker: "Speaker".to_string(),
+        };
+        let text = echo_report_text(&voice);
+        assert!(
+            text.contains("-18 dB") && text.contains("came in"),
+            "the report does not say what it heard:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_echo_test_says_when_the_speaker_is_a_headphone() {
+        // A headphone jack with nothing plugged into it is the
+        // commonest reason a test is silent.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        app.view = View::Settings;
+        app.echo_test = EchoTest::Done {
+            text: "Your voice came in; the loudest moment was -18 dB.".to_string(),
+            speaker: "Headphone (Realtek(R) Audio)".to_string(),
+        };
+        let output = frame(&mut app, &ctx);
+
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Headphone") && text.contains("plugged into it"),
+            "the echo test does not warn about a headphone speaker:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_level_meter_is_there_while_the_echo_test_runs() {
+        // The meter is the answer to "the microphone does not work":
+        // if the user speaks and the bar does not move, the microphone
+        // is not working.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        app.view = View::Settings;
+        app.echo_test = EchoTest::Running;
+        let output = frame(&mut app, &ctx);
+
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Speak now"),
+            "the echo test does not ask the user to speak:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_call_list_holds_only_the_calls_that_are_up() {
+        // A finished call belongs to the history, and the history has
+        // its own page.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        // A call that is up: it is in the list.
+        let mut incoming = incoming_event();
+        incoming.call_id = "call-1".to_string();
+        bus.publish("acct-ui-1", incoming);
+        frame(&mut app, &ctx);
+        let output = frame(&mut app, &ctx);
+        assert!(
+            screen_text(&output).contains("6666"),
+            "the call that is up is not in the call list"
+        );
+
+        // It is hung up: it leaves the list.
+        let mut ended = CallEvent::new(CallEventType::CallEnded);
+        ended.call_id = "call-1".to_string();
+        ended.call_direction = Some(Direction::Incoming);
+        ended.call_state = "ended".to_string();
+        ended.hangup_cause = "Normal".to_string();
+        bus.publish("acct-ui-1", ended);
+        frame(&mut app, &ctx);
+        let output = frame(&mut app, &ctx);
+
+        let text = screen_text(&output);
+        assert!(
+            text.contains("No calls up."),
+            "the call list still holds a call that was hung up:\n{text}"
         );
     }
 

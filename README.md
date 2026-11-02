@@ -9,7 +9,7 @@ identity resolution, the call event contract, the history rules and
 the transfer construction all have to behave identically, including the
 bugs that have already been fixed there.
 
-**Status: M4.8 complete.** The workspace builds, the test suite passes, the
+**Status: M4.9 complete.** The workspace builds, the test suite passes, the
 app starts and exits cleanly, an account can be registered against a SIP
 registrar with digest authentication (MD5 and SHA-256), and calls can be
 placed and received over that registration — outbound INVITE, inbound
@@ -38,7 +38,12 @@ keeps running and the call does not die. The window now **wakes up**:
 the app asks egui to draw again ten times a second, so the registration,
 the calls and the history appear when they happen instead of when the
 mouse moves. The settings page has an **echo test**: the microphone,
-played back through the speaker, with the device names in the report. See
+played back through the speaker — and it now **measures** rather than
+guesses: a live level meter, the level in decibels, the names of the
+devices it used, and a warning when the speaker is a headphone jack.
+A call says how many frames it **sent**, and how many of those were
+silence the sender had to make for itself. The call page holds **only
+the calls that are up**. See
 [Milestones](#milestones).
 
 ---
@@ -2113,6 +2118,172 @@ the error type the calls already use.
 
 ---
 
+## M4.9 — The microphone tells the truth, and the calls are the ones that are up
+
+Two things were asked for:
+
+> 1) Mic does nort work
+> 2) can we keep that size on the screenshot.
+>    a) remove calls section - it just waste the space.
+
+And the log line that came with it:
+
+```text
+WARN qsoftphone_media::audio: the microphone reported an error error=A buffer underrun or overrun occurred.
+```
+
+### What "the microphone does not work" turned out to be
+
+The complaint was that the **echo test showed nothing and no sound came
+out**. The app could not say why, because it had nothing to say: it
+counted the frames the peer sent and never counted the frames it sent,
+and it reported the microphone as "silent" without saying how silent.
+
+So it was measured, on this machine, with the real function:
+
+| What was measured | What it says |
+|---|---|
+| The capture endpoint's state | **active**, not muted, 92 % |
+| Windows' microphone permission | **Allow** (for console apps) |
+| The samples the microphone delivered | **96,000 a second** — the right rate |
+| The loudest sample it ever carried | **−48 dBFS** — and **−67 dBFS** at other moments |
+| A full-scale tone on `Speaker (Realtek(R) Audio)` | the microphone's peak moved by **0.4 dB** |
+| A full-scale tone on `Headphone (Realtek(R) Audio)` | the microphone's peak moved by **0.1 dB** |
+| The speaker the app is using | `Headphone (Realtek(R) Audio)` — **a headphone jack** |
+
+So: nothing is blocking the microphone, the microphone is delivering
+samples at the right rate, and it is hearing **nothing**. And the
+speaker the app is playing into is a **headphone jack**, which is
+silent unless something is plugged into it.
+
+That is two different things, and the app said neither of them.
+
+### The echo test now shows the level
+
+The report was a yes/no — "the microphone was silent" — which is the
+one answer that helps nobody. A quiet room and a voice two metres away
+are at the same level, and "silent" says nothing about which one it was.
+
+It is now a **number**, in decibels:
+
+```text
+The microphone heard nothing: it stayed at -67 dB (Microphone Array (AMD Audio Device) into Headphone (Realtek(R) Audio)).
+If you spoke, the microphone is muted or the wrong input is picked.
+```
+
+```text
+Something came in; the loudest moment was -18 dB (Microphone Array (AMD Audio Device) into Speaker (Realtek(R) Audio)).
+```
+
+And while the test runs there is a **level meter** — the live level of
+the microphone, with the peak held beside it:
+
+```text
+Listening…
+▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░|  -21 dB
+Speak now. If the bar does not move, the microphone is muted or the wrong input is picked.
+```
+
+The meter is the actual test. The number cannot say *whose* voice it
+was; the meter can, because the user speaks and watches it move. **If
+the bar does not move when you talk, the microphone is not working** —
+and no amount of waiting will change that.
+
+The scale is **−60 dB to 0 dB**, because that is the range a voice
+lives in: −60 dB is the floor of a quiet room, and 0 dB is as loud as
+it can get without clipping.
+
+### The headphone jack is named
+
+A headphone endpoint with nothing plugged into it is the commonest
+reason a test is silent, and the name is what says so:
+
+```text
+The speaker is 'Headphone (Realtek(R) Audio)'. If nothing is plugged into it, there is no sound.
+```
+
+It is a guess from the name, and it is only used to say something
+helpful.
+
+### The overrun is not an error
+
+The line the user pasted:
+
+```text
+the microphone reported an error error=A buffer underrun or overrun occurred.
+```
+
+is cpal's way of saying that Windows' audio engine flagged the capture
+buffer with `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`. On this machine
+it arrives **once, when the stream starts, on every device** — the
+engine's buffer was already full before the client attached to it — and
+the audio carries on.
+
+It was logged as a warning about a device, which is what it looks like
+when something is wrong and is not what it is. It is now said as what
+it is:
+
+```text
+INFO qsoftphone_media::audio: the device reported a buffer overrun; the audio carries on
+```
+
+### The frames that went out are counted
+
+The call's summary counted what came **in** and said nothing about what
+went out, so a call in which the microphone produced nothing looked
+exactly like a call in which the microphone worked:
+
+```text
+the call's media stopped received=1358 concealed=12 underruns=3714
+```
+
+It now says both, and it says which of them was silence the sender had
+to make for itself:
+
+```text
+the call's media stopped received=1358 sent=1358 sent_silence=0 concealed=12 underruns=3714
+```
+
+`sent_silence` is the one that matters: it is the number of frames the
+sender made **because there was no microphone to make them**. A call
+with `sent_silence=0` had a microphone, whatever the levels say.
+
+### The calls section holds the calls that are up
+
+The call page listed **every call it had ever seen**, finished ones
+included, which is why it was a section that wasted space: a row of a
+call that ended ten minutes ago cannot be answered or hung up, and the
+history — which can be searched, expanded and redialled — has its own
+page.
+
+It now holds **only the calls that are up**, and a call leaves it when
+it is hung up:
+
+```text
+CALLS
+No calls up.
+```
+
+The dialpad stays in the horizontal centre of the page, and the window
+size is left as it is.
+
+### The dependency cost: nothing
+
+No new crate.
+
+### What is *not* in M4.9
+
+* **The microphone is not fixed.** It is *measured* now: the app says
+  what the level was, which devices were used, and whether the frames
+  went out. If the machine's microphone is dead, the app says so — it
+  cannot make it work.
+* **The call page does not show the microphone's level during a call.**
+  The meter is for the echo test; a live meter during a call is the
+  same idea and is not built yet.
+* **Two concurrent calls still open two sound cards** — see M4.5.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -2150,6 +2321,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M4.6** | The history row, the legend, and the remote session: the redial is in the row, the rows have a key, and a call with no microphone still sends | **done** |
 | **M4.7** | The history as a table, the dialpad, and the timestamps: the history has a header row, the timestamps carry the seconds, the status line goes back to "Ready.", and the dialpad is in the header of the call page | **done** |
 | **M4.8** | The keypad in the middle, the window that wakes up, and the echo test: the dialpad is centred in the call page, the app asks egui to redraw ten times a second, and the microphone is played back through the speaker with the device names in the report | **done** |
+| **M4.9** | The microphone tells the truth, and the calls are the ones that are up: the echo test has a level meter and says the level in decibels, a call says how many frames it sent, and the call page lists only the calls that are up | **done** |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
@@ -2214,7 +2386,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 305 tests, all passing.
+* `cargo test --workspace` — 311 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -2485,6 +2657,21 @@ player lands.
   run against this machine's microphone: 240,128 samples in five
   seconds, which is exactly the microphone's rate, and the peak was the
   room's noise floor. The capture half is proven on hardware.
+* **The echo test publishes a live level.** The capture callback hands
+  the level of the last callback to the caller — measured on the real
+  sound card, 176 updates in four seconds — and the level meter shows
+  it.
+* **The echo report says the level in decibels.** "The microphone was
+  silent" and "the microphone heard a whisper at -58 dB" are the same
+  word and completely different problems; only the number tells them
+  apart.
+* **The echo test warns about a headphone speaker.** A headphone jack
+  with nothing plugged into it is the commonest reason a test is
+  silent.
+* **The frames that went out are counted**, and the silence the sender
+  had to make for itself is counted separately.
+* **The call page holds only the calls that are up.** A call leaves the
+  list when it is hung up.
 
 **Verified against a real Asterisk:**
 
@@ -2558,14 +2745,22 @@ player lands.
   cannot be proved here.** The capture half *is* proved on this
   machine's real sound card: the real function was run against the real
   microphone and took 240,128 samples in five seconds, which is exactly
-  the microphone's rate, with the peak at the room's noise floor. The
-  **playback** half runs at the right rate too — the output callback
-  delivered 96,000 samples a second — but the acoustic loop could not be
-  closed: this machine's desktop is locked, and the microphone did not
-  pick up the speaker even with a full-scale tone playing into it. So
-  **whether the sound comes out of the speaker is the one thing in M4.8
-  that only a person at an unlocked machine can say** — and it is a
-  single press of the "Echo test" button, with headphones on.
+  the microphone's rate, with the peak at the room's noise floor
+  (−48 dBFS to −67 dBFS, depending on the moment). The **playback**
+  half runs at the right rate too — the output callback delivered
+  96,000 samples a second — but the acoustic loop could not be closed:
+  a full-scale tone on the speaker moved the microphone's peak by
+  **0.4 dB**, and the speaker the app is configured to use is
+  `Headphone (Realtek(R) Audio)`, which is silent unless something is
+  plugged into it. So **whether the sound comes out of the speaker is
+  the one thing in M4.9 that only a person at the machine can say** —
+  and it is a single press of the "Echo test" button, with headphones
+  on, and a watch of the meter.
+* **The microphone's level has not been heard either.** The app
+  measures it (−48 dBFS to −67 dBFS here) and says it, but a number is
+  not a voice: whether the machine's microphone hears anything at all
+  is a thing a person has to answer by speaking into it and watching
+  the meter.
 * **The media has not been tested against a NAT.** The SDP advertises
   the public address, but the RTP port is the local one, and a NAT
   that rewrites it will break the call. This is the first thing to

@@ -231,6 +231,17 @@ pub struct AudioState {
     playout_underruns: AtomicUsize,
     /// How many frames the peer sent.
     frames_received: AtomicUsize,
+    /// How many frames went out to the peer.
+    ///
+    /// The **sent** count is what proves that the microphone reached
+    /// the other end: a call that received plenty and sent nothing is a
+    /// call the peer heard silence on, and a call that sent silence
+    /// because it had no microphone is a different thing again. The two
+    /// are counted separately, because they are different problems.
+    frames_sent: AtomicUsize,
+    /// How many of the frames that went out were the sender's own
+    /// silence — that is, there was no microphone to make them.
+    frames_sent_silence: AtomicUsize,
     /// How many frames never arrived and had to be concealed.
     ///
     /// These two, with the underruns, are what a call's end says about
@@ -275,6 +286,8 @@ impl AudioState {
             frame_samples: AtomicUsize::new(FRAME_SAMPLES),
             playout_underruns: AtomicUsize::new(0),
             frames_received: AtomicUsize::new(0),
+            frames_sent: AtomicUsize::new(0),
+            frames_sent_silence: AtomicUsize::new(0),
             frames_concealed: AtomicUsize::new(0),
             has_microphone: AtomicBool::new(false),
             #[cfg(test)]
@@ -477,6 +490,24 @@ impl AudioState {
     /// Count a frame that never arrived.
     pub(crate) fn count_frame_concealed(&self) {
         self.frames_concealed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many frames went out to the peer.
+    pub fn frames_sent(&self) -> usize {
+        self.frames_sent.load(Ordering::Relaxed)
+    }
+
+    /// How many of those were the sender's own silence.
+    pub fn frames_sent_silence(&self) -> usize {
+        self.frames_sent_silence.load(Ordering::Relaxed)
+    }
+
+    /// Count a frame that went out.
+    pub(crate) fn count_frame_sent(&self, silence: bool) {
+        self.frames_sent.fetch_add(1, Ordering::Relaxed);
+        if silence {
+            self.frames_sent_silence.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Whether there is a microphone to capture from.
@@ -865,6 +896,13 @@ struct EchoQueue {
     limit: usize,
     /// The loudest sample that came in, as the bits of an `f32`.
     peak: AtomicU32,
+    /// The loudest sample of the **last** callback, as the bits of an
+    /// `f32`.
+    ///
+    /// This is the live level, and it is what the level meter shows. It
+    /// is an atomic and not a lock, so the capture callback can read it
+    /// without waiting on anything.
+    level: AtomicU32,
     /// How many samples came in.
     count: AtomicUsize,
 }
@@ -875,8 +913,14 @@ impl EchoQueue {
             samples: Mutex::new(VecDeque::new()),
             limit: (rate as usize) * 2,
             peak: AtomicU32::new(0),
+            level: AtomicU32::new(0),
             count: AtomicUsize::new(0),
         }
+    }
+
+    /// The live level: the loudest sample of the last callback.
+    fn level(&self) -> f32 {
+        f32::from_bits(self.level.load(Ordering::Relaxed))
     }
 
     /// The captured samples, for the playback.
@@ -889,14 +933,22 @@ impl EchoQueue {
     /// The captured samples, for the capture side.
     fn push(&self, samples: &[f32]) {
         let mut queue = self.samples.lock().expect("echo queue lock");
+        // The level of **this** callback: the loudest sample in it. It
+        // is what the level meter shows, and it is what tells a live
+        // microphone from a dead one.
+        let mut level = 0.0f32;
         for sample in samples {
-            let level = sample.abs();
+            let value = sample.abs();
+            if value > level {
+                level = value;
+            }
             let peak = f32::from_bits(self.peak.load(Ordering::Relaxed));
-            if level > peak {
-                self.peak.store(level.to_bits(), Ordering::Relaxed);
+            if value > peak {
+                self.peak.store(value.to_bits(), Ordering::Relaxed);
             }
             queue.push_back(*sample);
         }
+        self.level.store(level.to_bits(), Ordering::Relaxed);
         self.count.fetch_add(samples.len(), Ordering::Relaxed);
         while queue.len() > self.limit {
             queue.pop_front();
@@ -945,13 +997,43 @@ impl EchoPlayback {
     }
 }
 
+/// Where the echo test publishes the live level.
+///
+/// The sink is called from the **capture callback**, so it must not
+/// block: it is on a real-time thread.
+pub type LevelSink = Box<dyn Fn(f32) + Send + Sync>;
+
+/// Say what a device error means.
+///
+/// The one that looks like a failure and is not: an **xrun** is the
+/// Windows audio engine saying that a buffer was not consumed in time.
+/// On this machine it arrives once, when the stream starts, on every
+/// device — the engine's buffer was already full before the client
+/// attached to it. The audio carries on, so it is said as what it is
+/// rather than as an error the user has to worry about.
+fn report_device_error(device: &str, error: cpal::Error) {
+    if error.kind() == cpal::ErrorKind::Xrun {
+        tracing::info!(
+            device = device,
+            "the device reported a buffer overrun; the audio carries on"
+        );
+        return;
+    }
+    tracing::warn!(device = device, error = %error, "the device reported an error");
+}
+
 /// Build the capture stream for the echo test.
 fn build_echo_input<T: DeviceSample + cpal::SizedSample>(
     device: &Device,
     config: StreamConfig,
     channels: u16,
     queue: Arc<EchoQueue>,
+    on_level: Option<LevelSink>,
 ) -> Result<Stream, AudioError> {
+    // The level is published every second callback: the device's buffer
+    // is about ten milliseconds, and the meter does not need more than
+    // twenty milliseconds to look smooth.
+    let mut tick = 0u8;
     device
         .build_input_stream::<T, _, _>(
             config,
@@ -967,9 +1049,16 @@ fn build_echo_input<T: DeviceSample + cpal::SizedSample>(
                     mono.push(sum / channels as f32);
                 }
                 queue.push(&mono);
+
+                tick = tick.wrapping_add(1);
+                if tick % 2 == 0 {
+                    if let Some(sink) = &on_level {
+                        sink(queue.level());
+                    }
+                }
             },
             |error| {
-                tracing::warn!(error = %error, "the microphone reported an error");
+                report_device_error("microphone", error);
             },
             None,
         )
@@ -996,7 +1085,7 @@ fn build_echo_output<T: FromNormalised + cpal::SizedSample>(
                 fill_output(data, channels, || playback.next());
             },
             |error| {
-                tracing::warn!(error = %error, "the speaker reported an error");
+                report_device_error("speaker", error);
             },
             None,
         )
@@ -1016,10 +1105,15 @@ fn build_echo_output<T: FromNormalised + cpal::SizedSample>(
 /// The sound card is a shared resource: the microphone and the speaker
 /// of a call must be closed before this runs, or the two clients on
 /// one endpoint miss their deadlines and the audio breaks up.
+///
+/// `on_level` is called with the **live** level — the loudest sample of
+/// the last capture callback — so that a caller can show a meter. It is
+/// called from the capture thread, so it must not block.
 pub fn play_echo_test(
     microphone: Option<&str>,
     speaker: Option<&str>,
     seconds: f64,
+    on_level: Option<LevelSink>,
 ) -> Result<EchoReport, AudioError> {
     let host = cpal::default_host();
     let input = find_device(&host, microphone, true)
@@ -1049,36 +1143,76 @@ pub fn play_echo_test(
 
     let capture_queue = queue.clone();
     let input_stream = match input_format {
-        SampleFormat::I8 => {
-            build_echo_input::<i8>(&input, input_config, input_channels, capture_queue)
-        }
-        SampleFormat::I16 => {
-            build_echo_input::<i16>(&input, input_config, input_channels, capture_queue)
-        }
-        SampleFormat::I32 => {
-            build_echo_input::<i32>(&input, input_config, input_channels, capture_queue)
-        }
-        SampleFormat::I64 => {
-            build_echo_input::<i64>(&input, input_config, input_channels, capture_queue)
-        }
-        SampleFormat::U8 => {
-            build_echo_input::<u8>(&input, input_config, input_channels, capture_queue)
-        }
-        SampleFormat::U16 => {
-            build_echo_input::<u16>(&input, input_config, input_channels, capture_queue)
-        }
-        SampleFormat::U32 => {
-            build_echo_input::<u32>(&input, input_config, input_channels, capture_queue)
-        }
-        SampleFormat::U64 => {
-            build_echo_input::<u64>(&input, input_config, input_channels, capture_queue)
-        }
-        SampleFormat::F32 => {
-            build_echo_input::<f32>(&input, input_config, input_channels, capture_queue)
-        }
-        SampleFormat::F64 => {
-            build_echo_input::<f64>(&input, input_config, input_channels, capture_queue)
-        }
+        SampleFormat::I8 => build_echo_input::<i8>(
+            &input,
+            input_config,
+            input_channels,
+            capture_queue,
+            on_level,
+        ),
+        SampleFormat::I16 => build_echo_input::<i16>(
+            &input,
+            input_config,
+            input_channels,
+            capture_queue,
+            on_level,
+        ),
+        SampleFormat::I32 => build_echo_input::<i32>(
+            &input,
+            input_config,
+            input_channels,
+            capture_queue,
+            on_level,
+        ),
+        SampleFormat::I64 => build_echo_input::<i64>(
+            &input,
+            input_config,
+            input_channels,
+            capture_queue,
+            on_level,
+        ),
+        SampleFormat::U8 => build_echo_input::<u8>(
+            &input,
+            input_config,
+            input_channels,
+            capture_queue,
+            on_level,
+        ),
+        SampleFormat::U16 => build_echo_input::<u16>(
+            &input,
+            input_config,
+            input_channels,
+            capture_queue,
+            on_level,
+        ),
+        SampleFormat::U32 => build_echo_input::<u32>(
+            &input,
+            input_config,
+            input_channels,
+            capture_queue,
+            on_level,
+        ),
+        SampleFormat::U64 => build_echo_input::<u64>(
+            &input,
+            input_config,
+            input_channels,
+            capture_queue,
+            on_level,
+        ),
+        SampleFormat::F32 => build_echo_input::<f32>(
+            &input,
+            input_config,
+            input_channels,
+            capture_queue,
+            on_level,
+        ),
+        SampleFormat::F64 => build_echo_input::<f64>(
+            &input,
+            input_config,
+            input_channels,
+            capture_queue,
+            on_level,
+        ),
         other => {
             return Err(AudioError::UnsupportedFormat(format!(
                 "{other} is not a format this build can read"
@@ -1284,7 +1418,7 @@ fn build_tone_output<T: FromNormalised + cpal::SizedSample>(
                 fill_output(data, channels, || tone.next());
             },
             |error| {
-                tracing::warn!(error = %error, "the speaker reported an error");
+                report_device_error("speaker", error);
             },
             None,
         )
@@ -1502,7 +1636,7 @@ fn build_input<T: DeviceSample + cpal::SizedSample>(
                 }
             },
             |error| {
-                tracing::warn!(error = %error, "the microphone reported an error");
+                report_device_error("microphone", error);
             },
             None,
         )
@@ -1538,7 +1672,7 @@ fn build_output<T: FromNormalised + cpal::SizedSample>(
                 fill_output(data, channels, || playback.next(&state));
             },
             |error| {
-                tracing::warn!(error = %error, "the speaker reported an error");
+                report_device_error("speaker", error);
             },
             None,
         )
@@ -1808,6 +1942,29 @@ mod tests {
     }
 
     #[test]
+    fn the_frames_that_went_out_are_counted() {
+        // The **sent** count is what proves that the microphone
+        // reached the other end: a call that received plenty and sent
+        // nothing is a call the peer heard silence on.
+        let state = AudioState::default();
+        assert_eq!(state.frames_sent(), 0);
+
+        state.count_frame_sent(false);
+        state.count_frame_sent(false);
+        assert_eq!(state.frames_sent(), 2);
+        assert_eq!(
+            state.frames_sent_silence(),
+            0,
+            "a frame from the microphone is not silence"
+        );
+
+        // A frame the sender made itself — there was no microphone.
+        state.count_frame_sent(true);
+        assert_eq!(state.frames_sent(), 3);
+        assert_eq!(state.frames_sent_silence(), 1);
+    }
+
+    #[test]
     fn the_inbound_queue_is_bounded() {
         let state = AudioState::default();
         let limit = MAX_INBOUND_FRAMES * 160;
@@ -1824,6 +1981,37 @@ mod tests {
         let limit = MAX_INBOUND_FRAMES * 320;
         state.push_inbound(&vec![0i16; limit + 500]);
         assert_eq!(state.inbound_samples(), limit);
+    }
+
+    #[test]
+    fn the_live_level_is_the_level_of_the_last_callback() {
+        // The level is what tells a live microphone from a dead one: if
+        // the user speaks and the bar does not move, the microphone is
+        // not working.
+        let queue = EchoQueue::new(8_000);
+
+        queue.push(&[0.01, 0.02, 0.03]);
+        assert!(
+            (queue.level() - 0.03).abs() < 0.0001,
+            "the live level is wrong: {}",
+            queue.level()
+        );
+
+        // A quiet callback brings the level down with it — the meter
+        // shows now, not the loudest moment ever.
+        queue.push(&[0.001]);
+        assert!(
+            (queue.level() - 0.001).abs() < 0.0001,
+            "the live level did not follow the last callback: {}",
+            queue.level()
+        );
+
+        // The peak still remembers the loudest moment.
+        assert!(
+            (queue.report().peak - 0.03).abs() < 0.0001,
+            "the peak was forgotten: {}",
+            queue.report().peak
+        );
     }
 
     #[test]

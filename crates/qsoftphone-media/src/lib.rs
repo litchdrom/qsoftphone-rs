@@ -62,8 +62,8 @@ pub mod jitter;
 pub mod rtp;
 
 pub use audio::{
-    AudioError, AudioState, DeviceInfo, EchoReport, REMOTE_SESSION_HINT, REMOTE_SESSION_MIC_HINT,
-    devices, is_remote_session, play_echo_test, play_test_sound,
+    AudioError, AudioState, DeviceInfo, EchoReport, LevelSink, REMOTE_SESSION_HINT,
+    REMOTE_SESSION_MIC_HINT, devices, is_remote_session, play_echo_test, play_test_sound,
 };
 pub use codec::Codec;
 pub use rtp::RtpSocket;
@@ -602,17 +602,28 @@ impl Drop for MediaInner {
 /// sent, how many never arrived, and how many samples of silence the
 /// speaker had to play. Without this, a broken call is a thing that has
 /// to be guessed at from the outside.
+///
+/// The **sent** count is here for the same reason: a call that received
+/// plenty and sent nothing is a call the peer heard silence on, and
+/// that is the difference between a broken microphone and a broken
+/// network.
 fn log_the_call(state: &AudioState) {
     let received = state.frames_received();
     let concealed = state.frames_concealed();
     let underruns = state.playout_underruns();
+    let sent = state.frames_sent();
+    let sent_silence = state.frames_sent_silence();
 
-    if received == 0 && concealed == 0 && underruns == 0 {
-        // Nothing was ever played: the call had no media at all.
+    if received == 0 && concealed == 0 && underruns == 0 && sent == 0 {
+        // Nothing was ever played and nothing was ever sent: the call
+        // had no media at all.
         return;
     }
 
-    info!(received, concealed, underruns, "the call's media stopped");
+    info!(
+        received,
+        sent, sent_silence, concealed, underruns, "the call's media stopped"
+    );
 }
 
 /// The sending thread: the captured frames, onto the wire.
@@ -642,6 +653,8 @@ fn sender_loop(
             Some(frame) => {
                 if let Err(e) = sender.send_frame(&frame) {
                     warn!(error = %e, "an RTP packet could not be sent");
+                } else {
+                    state.count_frame_sent(false);
                 }
             }
             None => {
@@ -655,6 +668,8 @@ fn sender_loop(
                 let frame = encoder.encode_silence();
                 if let Err(e) = sender.send_frame(&frame) {
                     warn!(error = %e, "an RTP packet could not be sent");
+                } else {
+                    state.count_frame_sent(true);
                 }
             }
         }
