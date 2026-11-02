@@ -77,6 +77,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let sessions = qsoftphone_sip::SessionRegistry::new();
     let (bus, call_events) = qsoftphone_sip::CallBus::new();
 
+    // The `--call` diagnostic: a call without a window. It registers,
+    // calls, and says what the media did — the only way to find out
+    // what a call carried when there is nobody at the machine to
+    // listen to it.
+    if let Some((number, seconds)) = diagnostic_call() {
+        let mut config = config;
+        if let Some(codec) = diagnostic_codec() {
+            config.media.codecs = vec![codec.name().to_string()];
+        }
+        let mut app = app::QSoftphoneApp::new(
+            paths.clone(),
+            db,
+            config.clone(),
+            handle.clone(),
+            sessions.clone(),
+            bus.clone(),
+            call_events,
+        );
+        diagnostic_run(&mut app, &number, seconds);
+        return Ok(());
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([config.ui.window_width, config.ui.window_height]),
@@ -102,4 +124,104 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("qsoftphone-rs exited cleanly");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The `--call` diagnostic: a call without a window.
+// ---------------------------------------------------------------------------
+
+/// `--call <number> [--seconds N] [--codec NAME]`
+fn diagnostic_call() -> Option<(String, u64)> {
+    let mut args = std::env::args().skip(1);
+    let mut number = None;
+    let mut seconds = 20u64;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--call" => number = args.next(),
+            "--seconds" => seconds = args.next().and_then(|s| s.parse().ok()).unwrap_or(seconds),
+            _ => {}
+        }
+    }
+    number.map(|number| (number, seconds))
+}
+
+/// The codec the diagnostic call should offer.
+fn diagnostic_codec() -> Option<qsoftphone_media::Codec> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--codec" {
+            let name = args.next()?;
+            return qsoftphone_media::Codec::from_name(&name);
+        }
+    }
+    None
+}
+
+/// Register, call, wait, hang up — with no window.
+///
+/// The log is the output: the levels of the call, once a second, and
+/// the numbers of the media when it stops.
+fn diagnostic_run(app: &mut app::QSoftphoneApp, number: &str, seconds: u64) {
+    let ctx = egui::Context::default();
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1100.0, 700.0),
+        )),
+        ..Default::default()
+    };
+
+    let frame = |app: &mut app::QSoftphoneApp| {
+        let mut output = ctx.run_ui(input.clone(), |ui| app.draw(ui));
+        output.textures_delta.clear();
+        output
+    };
+
+    app.start_registration();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline && !app.is_registered() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        frame(app);
+    }
+    if !app.is_registered() {
+        tracing::error!("the account did not register");
+        return;
+    }
+    tracing::info!("registered; calling {number}");
+
+    app.call_now(number);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline && !app.call_is_up() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        frame(app);
+    }
+    if !app.call_is_up() {
+        tracing::error!("the call did not connect");
+        app.hangup_now();
+        return;
+    }
+    tracing::info!("the call is up; letting it run for {seconds}s");
+    if let Some(media) = app.media_of_active() {
+        tracing::info!("the media of the call: {media}");
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let mut last_report = std::time::Instant::now();
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        frame(app);
+        if last_report.elapsed() >= std::time::Duration::from_secs(1) {
+            last_report = std::time::Instant::now();
+            if let Some(levels) = app.levels_of_active() {
+                tracing::info!("the levels of the call: {levels}");
+            }
+        }
+    }
+
+    app.hangup_now();
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        frame(app);
+    }
+    tracing::info!("the diagnostic call is over");
 }

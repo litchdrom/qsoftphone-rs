@@ -149,6 +149,27 @@ pub struct MediaStatus {
     pub mic_muted: bool,
     /// Whether the speaker is muted.
     pub speaker_muted: bool,
+    /// The loudest sample the **peer** sent, from 0.0 to 1.0.
+    ///
+    /// Zero means the peer sent silence for the whole call. That is a
+    /// fact about the peer, and it is the difference between "the sound
+    /// card is broken" and "there was nothing to hear".
+    pub incoming_peak: f32,
+    /// The level of the **last** frame the peer sent, from 0.0 to 1.0.
+    ///
+    /// This is the live level: it is what the meter on the call page
+    /// shows.
+    pub incoming_level: f32,
+    /// The loudest sample the **microphone** picked up, from 0.0 to 1.0.
+    ///
+    /// Zero means the peer heard nothing from us.
+    pub outgoing_peak: f32,
+    /// The loudest sample the **speaker** was given, from 0.0 to 1.0.
+    ///
+    /// This is after the gain and after the resampler: the last number
+    /// before the sound card. Zero means the audio stopped somewhere
+    /// between the peer's packet and the speaker.
+    pub played_peak: f32,
 }
 
 impl MediaStatus {
@@ -569,6 +590,10 @@ impl MediaSession {
             problem: self.inner.problem.lock().expect("problem lock").clone(),
             mic_muted: self.mic_muted(),
             speaker_muted: self.speaker_muted(),
+            incoming_peak: self.inner.state.inbound_peak(),
+            incoming_level: self.inner.state.inbound_level(),
+            outgoing_peak: self.inner.state.outbound_peak(),
+            played_peak: self.inner.state.played_peak(),
         }
     }
 }
@@ -613,6 +638,13 @@ fn log_the_call(state: &AudioState) {
     let underruns = state.playout_underruns();
     let sent = state.frames_sent();
     let sent_silence = state.frames_sent_silence();
+    // How loud it was, in both directions. A call that received plenty
+    // and heard nothing is a call the peer was silent on, and a call
+    // that sent plenty and was heard as nothing is a call our
+    // microphone was silent on.
+    let incoming = state.inbound_peak();
+    let outgoing = state.outbound_peak();
+    let played = state.played_peak();
 
     if received == 0 && concealed == 0 && underruns == 0 && sent == 0 {
         // Nothing was ever played and nothing was ever sent: the call
@@ -622,7 +654,14 @@ fn log_the_call(state: &AudioState) {
 
     info!(
         received,
-        sent, sent_silence, concealed, underruns, "the call's media stopped"
+        sent,
+        sent_silence,
+        concealed,
+        underruns,
+        incoming_peak = incoming,
+        outgoing_peak = outgoing,
+        played_peak = played,
+        "the call's media stopped"
     );
 }
 
@@ -784,8 +823,7 @@ fn drain_jitter(
     }
 }
 
-/// Turn an address and a port into a socket address.
-///
+/// Turn an address and a port into a socket address.///
 /// The address may be a name — `example.com` — which is resolved
 /// here. The peer may sit behind a NAT, and then the name in its SDP
 /// is the one that resolves to the public address.

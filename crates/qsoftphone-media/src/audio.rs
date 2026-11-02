@@ -256,6 +256,34 @@ pub struct AudioState {
     /// that no frame is ever going to arrive from the capture side and
     /// that it has to make the silence itself.
     has_microphone: AtomicBool,
+    /// The loudest sample the **peer** sent, as the bits of an `f32`.
+    ///
+    /// This is the number that settles "there is no sound": a call
+    /// whose loudest incoming sample is zero is a call the peer was
+    /// silent on, and no amount of debugging the sound card will change
+    /// that.
+    inbound_peak: AtomicU32,
+    /// The level of the **last** frame the peer sent, as the bits of an
+    /// `f32`.
+    ///
+    /// This is the live level, and it is what the meter on the call page
+    /// shows: a peer that is talking now and a peer that was talking ten
+    /// seconds ago are different things.
+    inbound_level: AtomicU32,
+    /// The loudest sample the **microphone** picked up, as the bits of an
+    /// `f32`.
+    ///
+    /// The other half of the same question: a call we send silence on
+    /// is a call the peer hears nothing on.
+    outbound_peak: AtomicU32,
+    /// The loudest sample the **speaker** was given, as the bits of an
+    /// `f32`.
+    ///
+    /// This is what came out of the playout, after the gain and after
+    /// the resampler. It is the last number before the sound card, and
+    /// it is what says whether the audio reached the card or stopped
+    /// somewhere on the way to it.
+    played_peak: AtomicU32,
     /// How many times the queue has been taken.
     ///
     /// The sound card's callback must take it **once per callback**,
@@ -290,6 +318,10 @@ impl AudioState {
             frames_sent_silence: AtomicUsize::new(0),
             frames_concealed: AtomicUsize::new(0),
             has_microphone: AtomicBool::new(false),
+            inbound_peak: AtomicU32::new(0),
+            inbound_level: AtomicU32::new(0),
+            outbound_peak: AtomicU32::new(0),
+            played_peak: AtomicU32::new(0),
             #[cfg(test)]
             inbound_takes: AtomicUsize::new(0),
         }
@@ -427,6 +459,27 @@ impl AudioState {
 
     /// Queue PCM for playing.
     pub(crate) fn push_inbound(&self, samples: &[i16]) {
+        // How loud the peer is.
+        //
+        // This is the peak of the **decoded** audio — of what the
+        // speaker is about to be given — and it is the number that says
+        // whether the peer is sending anything at all.
+        let mut frame_peak = 0.0f32;
+        for sample in samples {
+            let level = sample.unsigned_abs() as f32 / 32768.0;
+            if level > frame_peak {
+                frame_peak = level;
+            }
+        }
+        self.inbound_level
+            .store(frame_peak.to_bits(), Ordering::Relaxed);
+
+        let peak = self.inbound_peak.load(Ordering::Relaxed);
+        if frame_peak.to_bits() > peak {
+            self.inbound_peak
+                .store(frame_peak.to_bits(), Ordering::Relaxed);
+        }
+
         let mut queue = self.inbound.lock().expect("inbound lock");
         let limit = self.max_inbound_samples();
         for sample in samples {
@@ -438,6 +491,51 @@ impl AudioState {
                 queue.pop_front();
             }
             queue.push_back(*sample);
+        }
+    }
+
+    /// The loudest sample the peer sent.
+    pub fn inbound_peak(&self) -> f32 {
+        f32::from_bits(self.inbound_peak.load(Ordering::Relaxed))
+    }
+
+    /// The level of the last frame the peer sent.
+    pub fn inbound_level(&self) -> f32 {
+        f32::from_bits(self.inbound_level.load(Ordering::Relaxed))
+    }
+
+    /// The loudest sample the microphone picked up.
+    pub fn outbound_peak(&self) -> f32 {
+        f32::from_bits(self.outbound_peak.load(Ordering::Relaxed))
+    }
+
+    /// The loudest sample the speaker was given.
+    pub fn played_peak(&self) -> f32 {
+        f32::from_bits(self.played_peak.load(Ordering::Relaxed))
+    }
+
+    /// Note how loud the speaker is being driven.
+    ///
+    /// The peak of the whole call, after the gain and after the
+    /// resampler: the last number before the sound card.
+    pub(crate) fn note_played_level(&self, level: f32) {
+        let level = level.clamp(0.0, 1.0).to_bits();
+        let peak = self.played_peak.load(Ordering::Relaxed);
+        if level > peak {
+            self.played_peak.store(level, Ordering::Relaxed);
+        }
+    }
+
+    /// Note how loud the microphone is.
+    ///
+    /// The peak of the whole call, and not the level of the moment: the
+    /// question is whether the microphone heard **anything**, and the
+    /// loudest moment is the answer.
+    pub(crate) fn note_outbound_level(&self, level: f32) {
+        let level = level.clamp(0.0, 1.0).to_bits();
+        let peak = self.outbound_peak.load(Ordering::Relaxed);
+        if level > peak {
+            self.outbound_peak.store(level, Ordering::Relaxed);
         }
     }
 
@@ -1646,6 +1744,12 @@ fn build_input<T: DeviceSample + cpal::SizedSample>(
 /// The capture side: the device's samples become encoded frames.
 impl Capture {
     fn push(&mut self, mono: f32, state: &AudioState) {
+        // How loud the microphone is.
+        //
+        // The peak of the call, not the level of the moment: what this
+        // answers is whether the microphone heard **anything** at all.
+        state.note_outbound_level(mono.abs());
+
         self.resampler.push(mono);
         while let Some(value) = self.resampler.next_output() {
             self.builder.push(value, state);
@@ -1761,7 +1865,11 @@ impl Playback {
 
         loop {
             if let Some(value) = self.resampler.next_output() {
-                return if muted { 0.0 } else { value * gain };
+                let out = if muted { 0.0 } else { value * gain };
+                // How loud the speaker is being driven. This is the last
+                // number before the sound card.
+                state.note_played_level(out.abs());
+                return out;
             }
             match self.pending.pop_front() {
                 Some(sample) => self.resampler.push(sample),
@@ -1970,6 +2078,62 @@ mod tests {
         let limit = MAX_INBOUND_FRAMES * 160;
         state.push_inbound(&vec![0i16; limit + 500]);
         assert_eq!(state.inbound_samples(), limit);
+    }
+
+    #[test]
+    fn the_peak_of_what_the_peer_sent_is_remembered() {
+        // "There is no sound" is not a diagnosis. This is the number
+        // that says whether the peer sent anything at all: a call whose
+        // loudest incoming sample is zero is a call the peer was silent
+        // on, and no amount of debugging the sound card will change
+        // that.
+        let state = AudioState::default();
+        assert_eq!(state.inbound_peak(), 0.0, "nothing has arrived yet");
+
+        state.push_inbound(&[0i16; 160]);
+        assert_eq!(state.inbound_peak(), 0.0, "silence is silence");
+        assert_eq!(state.inbound_level(), 0.0);
+
+        // 6016 of 32768 is -14.7 dBFS: a voice.
+        state.push_inbound(&[0, 6016, -6016]);
+        let peak = state.inbound_peak();
+        assert!(
+            (peak - 6016.0 / 32768.0).abs() < 1e-6,
+            "the peak is wrong: {peak}"
+        );
+
+        // The live level is the **last** frame, not the peak of the
+        // call: a peer that is talking now and a peer that was talking
+        // ten seconds ago are different things.
+        state.push_inbound(&[0i16; 160]);
+        assert_eq!(state.inbound_level(), 0.0, "the peer went quiet");
+        assert!(
+            state.inbound_peak() > 0.0,
+            "the peak of the call is remembered"
+        );
+    }
+
+    #[test]
+    fn the_level_the_speaker_was_given_is_remembered() {
+        // The last number before the sound card. If this is zero and
+        // the peer's audio is not, the audio stopped somewhere between
+        // the packet and the speaker.
+        let state = AudioState::default();
+        state.set_frame_samples(160);
+        let mut playback = Playback::new(8000, 8000);
+
+        // Enough to prime the playout.
+        state.push_inbound(&vec![8192i16; 800]);
+        playback.begin(&state);
+        for _ in 0..100 {
+            playback.next(&state);
+        }
+
+        let played = state.played_peak();
+        assert!(
+            played > 0.2,
+            "the speaker was not driven with the audio: {played}"
+        );
     }
 
     #[test]

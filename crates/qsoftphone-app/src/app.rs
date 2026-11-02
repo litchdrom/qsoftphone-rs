@@ -1548,6 +1548,44 @@ impl QSoftphoneApp {
                     .color(egui::Color32::GRAY),
             );
 
+            // The levels.
+            //
+            // "There is no sound" is not a diagnosis. A call has two
+            // directions and three places a thing can go wrong between
+            // the microphone and the ear: the peer may be sending
+            // silence, our microphone may be picking up nothing, or the
+            // audio may be arriving and never reaching the speaker.
+            // The numbers say which.
+            if let Some(status) = &status {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Peer")
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
+                    // The bar is the level as it is now; the numbers
+                    // beside it are where it got to.
+                    draw_level_meter(ui, status.incoming_level, status.incoming_peak, 140.0, true);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "peaks: peer {} · you {} · speaker {}",
+                            level_text(status.incoming_peak),
+                            level_text(status.outgoing_peak),
+                            level_text(status.played_peak)
+                        ))
+                        .small()
+                        .color(egui::Color32::GRAY),
+                    );
+                });
+                if let Some(diagnosis) = silence_diagnosis(status) {
+                    ui.label(
+                        egui::RichText::new(diagnosis)
+                            .small()
+                            .color(egui::Color32::from_rgb(231, 176, 60)),
+                    );
+                }
+            }
+
             // The mute buttons. A muted microphone still sends RTP —
             // it sends silence — because the peer has to see the
             // stream keep going or it tears the call down.
@@ -2316,7 +2354,7 @@ impl QSoftphoneApp {
         // working, and no amount of waiting will change that.
         if self.echo_test == EchoTest::Running {
             ui.add_space(4.0);
-            draw_level_meter(ui, self.echo_level, self.echo_peak);
+            draw_level_meter(ui, self.echo_level, self.echo_peak, 260.0, true);
             ui.weak(
                 "Speak now. If the bar does not move, the microphone is muted or the \
                  wrong input is picked.",
@@ -2336,6 +2374,68 @@ impl QSoftphoneApp {
     }
 }
 
+/// The parts of the app the `--call` diagnostic drives.
+///
+/// The diagnostic is a call without a window: it registers, calls, and
+/// says what the media did — which is the only way to find out what a
+/// call carried when there is nobody at the machine to listen to it.
+impl QSoftphoneApp {
+    /// Start registering the selected account.
+    pub fn start_registration(&mut self) {
+        self.register_selected();
+    }
+
+    /// Whether the selected account is registered.
+    pub fn is_registered(&self) -> bool {
+        self.selected_account()
+            .is_some_and(|account| self.registration_state(&account.id).is_registered())
+    }
+
+    /// Place a call to this number.
+    pub fn call_now(&mut self, number: &str) {
+        self.place_call_to(number);
+    }
+
+    /// Whether a call is up.
+    pub fn call_is_up(&self) -> bool {
+        self.calls().iter().any(|call| call.state == "connected")
+    }
+
+    /// The levels of the active call.
+    ///
+    /// The peer, what we send, and what the speaker was given: the
+    /// three numbers that say where a silence is.
+    pub fn levels_of_active(&self) -> Option<String> {
+        let call = self.active_call()?;
+        let status = self.calls.media_status(&call.account_id, &call.call_id)?;
+        Some(format!(
+            "peer={:.5} peer_peak={:.5} you={:.5} speaker={:.5}",
+            status.incoming_level, status.incoming_peak, status.outgoing_peak, status.played_peak
+        ))
+    }
+
+    /// What the media of the active call is doing.
+    pub fn media_of_active(&self) -> Option<String> {
+        let call = self.active_call()?;
+        let status = self.calls.media_status(&call.account_id, &call.call_id)?;
+        Some(format!(
+            "codec={} pt={} port={} remote={:?} mic={:?} speaker={:?} problem={:?}",
+            status.codec.name(),
+            status.payload_type,
+            status.port,
+            status.remote,
+            status.microphone,
+            status.speaker,
+            status.problem
+        ))
+    }
+
+    /// Hang the active call up.
+    pub fn hangup_now(&mut self) {
+        self.hangup_call();
+    }
+}
+
 /// The level of a signal, in decibels against full scale.
 ///
 /// Below the floor it is not a number at all, and saying "-inf dB"
@@ -2348,15 +2448,119 @@ fn decibels(level: f32) -> Option<f32> {
     }
 }
 
+/// A level, as the user reads it.
+fn level_text(level: f32) -> String {
+    match decibels(level) {
+        Some(db) => format!("{db:.0} dB"),
+        None => "silent".to_string(),
+    }
+}
+
+/// The level below which there is nothing to hear: -40 dB.
+///
+/// A voice is well above this. A line that carries less carries room
+/// noise, and saying so is a true thing to say.
+const TOO_QUIET: f32 = 0.01;
+
+/// Where the silence is, in a call.
+///
+/// The three numbers — what the peer sent, what the microphone picked
+/// up and what the speaker was given — say which of the three things
+/// went wrong. Saying "there is no sound" and stopping there is what
+/// makes a call like this take an afternoon.
+///
+/// The peer is judged on the level **now** and not on the peak: a
+/// line that carried a beep in the first second and room noise ever
+/// since is quiet, and the peak would say the opposite.
+fn silence_diagnosis(status: &qsoftphone_media::MediaStatus) -> Option<String> {
+    if status.mic_muted {
+        return Some("The microphone is muted: the peer hears silence.".to_string());
+    }
+    if status.speaker_muted {
+        return Some("The speaker is muted.".to_string());
+    }
+    if status.incoming_peak <= 1e-6 {
+        return Some(
+            "The peer is sending silence — there is nothing on the line to hear.".to_string(),
+        );
+    }
+    if status.incoming_level < TOO_QUIET {
+        return Some(
+            "The peer is sending, but it is too quiet to hear — their microphone is muted, \
+             too far away, or turned down."
+                .to_string(),
+        );
+    }
+    if status.played_peak <= 1e-6 {
+        return Some(
+            "The peer is sending audio, but the speaker is getting silence — the sound card is not playing it."
+                .to_string(),
+        );
+    }
+    if status.played_peak < TOO_QUIET {
+        return Some(
+            "The audio reached the speaker, but it is too quiet to hear — turn the speaker \
+             volume up."
+                .to_string(),
+        );
+    }
+    if status.outgoing_peak <= 1e-6 {
+        return Some(
+            "The peer hears nothing: the microphone picked up nothing at all.".to_string(),
+        );
+    }
+    if status.outgoing_peak < TOO_QUIET {
+        return Some(
+            "The microphone is picking up almost nothing — the peer will hear silence.".to_string(),
+        );
+    }
+    None
+}
+
 /// The bar that shows how loud the microphone is.
 ///
 /// The scale runs from **-60 dB to 0 dB**, because that is the range
 /// a voice lives in: -60 dB is the floor of a quiet room, and 0 dB is
 /// as loud as it can get without clipping.
-fn draw_level_meter(ui: &mut egui::Ui, level: f32, peak: f32) {
+///
+/// `max_width` is how much of the row the bar may take: the settings
+/// page gives it the whole width, and a call row has numbers to put
+/// beside it.
+///
+/// `readout` says whether the number in decibels is painted next to
+/// the bar. When it is, the number is given room in the layout: a
+/// number painted outside the space the bar was given lands on top of
+/// whatever comes next, and two pieces of text on top of each other
+/// are two unreadable pieces of text.
+fn draw_level_meter(ui: &mut egui::Ui, level: f32, peak: f32, max_width: f32, readout: bool) {
     let height = 14.0;
-    let width = ui.available_width().min(260.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let text = match decibels(level) {
+        Some(db) => format!("{db:.0} dB"),
+        None => "-inf dB".to_string(),
+    };
+    let font = egui::FontId::proportional(12.0);
+    let colour = ui.visuals().text_color();
+
+    // The number belongs to the meter, so it has to be given room in
+    // the layout and not painted over whatever the meter does not
+    // cover.
+    let gap = 8.0;
+    let text_width = if readout {
+        ui.ctx()
+            .fonts_mut(|f| f.layout_no_wrap(text.clone(), font.clone(), colour))
+            .rect
+            .width()
+    } else {
+        0.0
+    };
+
+    // The bar gets what is left of the row.
+    let bar_width = (ui.available_width() - text_width - gap).clamp(24.0, max_width.max(24.0));
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(bar_width + text_width + gap, height),
+        egui::Sense::hover(),
+    );
+    let bar = egui::Rect::from_min_size(rect.min, egui::vec2(bar_width, height));
 
     let to_fill = |value: f32| {
         let db = decibels(value).unwrap_or(-120.0);
@@ -2365,41 +2569,39 @@ fn draw_level_meter(ui: &mut egui::Ui, level: f32, peak: f32) {
 
     let track = if ui.visuals().dark_mode { 45 } else { 200 };
     ui.painter()
-        .rect_filled(rect, 2.0, egui::Color32::from_gray(track));
+        .rect_filled(bar, 2.0, egui::Color32::from_gray(track));
 
     let fill = to_fill(level);
     if fill > 0.0 {
-        let bar =
-            egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * fill, rect.height()));
+        let filled =
+            egui::Rect::from_min_size(bar.min, egui::vec2(bar.width() * fill, bar.height()));
         let colour = if decibels(level).unwrap_or(-120.0) > -6.0 {
             egui::Color32::from_rgb(231, 76, 60)
         } else {
             egui::Color32::from_rgb(61, 220, 151)
         };
-        ui.painter().rect_filled(bar, 2.0, colour);
+        ui.painter().rect_filled(filled, 2.0, colour);
     }
 
     // The peak hold: where the loudest moment was.
     let hold = to_fill(peak);
     if hold > 0.0 {
-        let x = rect.min.x + rect.width() * hold;
+        let x = bar.min.x + bar.width() * hold;
         ui.painter().line_segment(
-            [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+            [egui::pos2(x, bar.min.y), egui::pos2(x, bar.max.y)],
             egui::Stroke::new(1.5, egui::Color32::from_gray(220)),
         );
     }
 
-    let text = match decibels(level) {
-        Some(db) => format!("{db:.0} dB"),
-        None => "-inf dB".to_string(),
-    };
-    ui.painter().text(
-        rect.left_center() + egui::vec2(width + 8.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        &text,
-        egui::FontId::proportional(12.0),
-        ui.visuals().text_color(),
-    );
+    if readout {
+        ui.painter().text(
+            rect.left_center() + egui::vec2(bar_width + gap, 0.0),
+            egui::Align2::LEFT_CENTER,
+            &text,
+            font,
+            colour,
+        );
+    }
 }
 
 /// Whether a device name is a headphone jack.
@@ -3273,6 +3475,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_app_says_where_the_silence_is() {
+        // "There is no sound" is not a diagnosis, and a call has three
+        // places a silence can be. The numbers say which one it is.
+        let quiet = media_status(0.0, 0.0, 0.0);
+        assert!(
+            silence_diagnosis(&quiet)
+                .expect("a quiet call says something")
+                .contains("peer is sending silence"),
+            "the peer was silent and the app did not say so"
+        );
+
+        let blocked = media_status(0.18, 0.0, 0.02);
+        assert!(
+            silence_diagnosis(&blocked)
+                .expect("a call says something")
+                .contains("the speaker is getting silence"),
+            "the audio never reached the speaker and the app did not say so"
+        );
+
+        let mute = media_status(0.18, 0.14, 0.0);
+        assert!(
+            silence_diagnosis(&mute)
+                .expect("a call says something")
+                .contains("peer hears nothing"),
+            "the microphone picked up nothing and the app did not say so"
+        );
+
+        let muted = qsoftphone_media::MediaStatus {
+            mic_muted: true,
+            ..media_status(0.18, 0.14, 0.02)
+        };
+        assert!(
+            silence_diagnosis(&muted)
+                .expect("a call says something")
+                .contains("muted"),
+            "the microphone was muted and the app did not say so"
+        );
+
+        // A call in which everything works says nothing at all.
+        let good = media_status(0.18, 0.14, 0.02);
+        assert!(
+            silence_diagnosis(&good).is_none(),
+            "a working call complained: {:?}",
+            silence_diagnosis(&good)
+        );
+    }
+
+    #[test]
+    fn a_level_is_read_in_decibels() {
+        assert_eq!(level_text(0.0), "silent");
+        assert_eq!(level_text(0.1836), "-15 dB");
+        assert_eq!(level_text(1.0), "0 dB");
+    }
+
+    /// A media status with the levels the test cares about.
+    fn media_status(incoming: f32, played: f32, outgoing: f32) -> qsoftphone_media::MediaStatus {
+        media_status_live(incoming, incoming, played, outgoing)
+    }
+
+    /// A media status where the peer's loudest moment and the peer's
+    /// level right now are not the same thing.
+    ///
+    /// That is the shape of a line that carried a beep in the first
+    /// second and room noise ever since.
+    fn media_status_live(
+        incoming_peak: f32,
+        incoming_level: f32,
+        played: f32,
+        outgoing: f32,
+    ) -> qsoftphone_media::MediaStatus {
+        qsoftphone_media::MediaStatus {
+            codec: qsoftphone_media::Codec::G722,
+            payload_type: 9,
+            port: 4000,
+            remote: Some("10.0.0.1:4000".to_string()),
+            running: true,
+            microphone: Some("Microphone".to_string()),
+            speaker: Some("Speaker".to_string()),
+            problem: None,
+            mic_muted: false,
+            speaker_muted: false,
+            incoming_peak,
+            incoming_level,
+            outgoing_peak: outgoing,
+            played_peak: played,
+        }
+    }
+
     #[tokio::test]
     async fn the_button_that_opens_the_details_is_on_the_page() {
         // The table is measured against the clip rectangle and not
@@ -3940,6 +4231,23 @@ mod tests {
         text
     }
 
+    /// Where a piece of text is painted, left and right.
+    ///
+    /// Two pieces of text on top of each other are two unreadable
+    /// pieces of text, so this is how they are caught.
+    fn text_box(output: &egui::FullOutput, text: &str) -> Option<(f32, f32)> {
+        for clipped in &output.shapes {
+            if let egui::epaint::Shape::Text(text_shape) = &clipped.shape {
+                if text_shape.galley.job.text == text {
+                    let left = text_shape.pos.x;
+                    let right = left + text_shape.galley.rect.width();
+                    return Some((left, right));
+                }
+            }
+        }
+        None
+    }
+
     #[tokio::test]
     async fn the_call_page_offers_no_codec_picker() {
         // M5: the codec picker is off the call page. It was in the
@@ -4100,5 +4408,81 @@ mod tests {
         assert!(text.contains("Media:"), "no media line:\n{text}");
         assert!(text.contains("Mute mic"), "no microphone button:\n{text}");
         assert!(text.contains("Mute speaker"), "no speaker button:\n{text}");
+    }
+
+    // TEMPORARY PROBE — what does egui lay out for the level row?
+    #[tokio::test]
+    async fn the_meters_number_does_not_land_on_the_next_thing() {
+        // The meter painted its number outside the space the layout had
+        // given it, so the number landed on top of the text that came
+        // after it: two pieces of text on top of each other, and
+        // neither of them readable.
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1100.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    draw_level_meter(ui, 0.18, 0.2, 140.0, true);
+                    ui.label("after the meter");
+                });
+            });
+        });
+        output.textures_delta.clear();
+
+        let number = text_box(&output, "-15 dB").expect("the meter has no number");
+        let after = text_box(&output, "after the meter").expect("the label is gone");
+        assert!(
+            number.1 <= after.0,
+            "the meter's number is painted over the next thing: {number:?} and {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_that_is_too_quiet_says_so() {
+        // "No sound" is not always silence: a line can carry room
+        // noise and nothing else, and the user hears nothing for that
+        // reason.
+        let quiet = media_status(0.004, 0.004, 0.02);
+        let said = silence_diagnosis(&quiet).expect("a quiet call says something");
+        assert!(
+            said.contains("too quiet to hear"),
+            "the line was quiet and the app did not say so: {said}"
+        );
+
+        // The same for the other two directions.
+        let quiet_out = media_status(0.2, 0.2, 0.004);
+        let said = silence_diagnosis(&quiet_out).expect("a quiet call says something");
+        assert!(
+            said.contains("picking up almost nothing"),
+            "the microphone was quiet and the app did not say so: {said}"
+        );
+    }
+
+    #[test]
+    fn a_line_that_carried_a_beep_and_then_went_quiet_is_called_quiet() {
+        // The user's line: a burst in the first second and then almost
+        // nothing. The peak says the peer was loud, the level says
+        // there is nothing to hear — and the level is the one the
+        // ear is given.
+        let beeped = media_status_live(0.23, 0.002, 0.18, 0.012);
+        let said = silence_diagnosis(&beeped).expect("a quiet call says something");
+        assert!(
+            said.contains("too quiet to hear"),
+            "the line went quiet and the app did not say so: {said}"
+        );
+
+        // And a line that is loud right now is not complained about.
+        let talking = media_status_live(0.23, 0.2, 0.18, 0.012);
+        assert!(
+            silence_diagnosis(&talking).is_none(),
+            "a call with a voice on it was complained about: {:?}",
+            silence_diagnosis(&talking)
+        );
     }
 }

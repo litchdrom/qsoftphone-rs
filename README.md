@@ -64,6 +64,12 @@ cargo run   -p qsoftphone-app               # the GUI
 database) and exits 0 without opening a window. It is what CI and the
 "does it start and exit cleanly" check use.
 
+`--call <number>` places a call **without a window** and writes the
+levels of the call to the log, once a second, and the numbers of the
+media when it stops — for when there is nobody at the machine to listen
+to it. `--seconds N` says how long the call should last and `--codec
+NAME` forces the codec. See [M4.11](#m411--where-the-silence-is).
+
 Set `QSOFTPHONE_HOME` to put every file under one directory — handy
 for a portable install, and for testing without touching your real
 profile:
@@ -2388,6 +2394,161 @@ No new crate.
 
 ---
 
+## M4.11 — Where the silence is
+
+The report was:
+
+> Hello, Thanks. No sound
+> `INFO qsoftphone_media::audio: the device reported a buffer overrun; the
+> audio carries on device="microphone"`
+> echo test working fine. I hear myself.
+
+Two things in it: no sound on a call, and a log line about an overrun. The
+second one is a red herring — it is the **microphone**, it has been `INFO`
+since M4.9, and the audio carries on. The first one is the report.
+
+"No sound" is not a diagnosis. A call has two directions and three places
+a thing can go wrong between the microphone and the ear, and each of them
+looks exactly the same from the user's chair.
+
+### What was measured, on the user's own PBX
+
+Everything below was measured against the real Asterisk, on the user's
+own account, with the user's own devices. The build's media path was
+read end to end first — the codec framing, the negotiation order, the
+jitter buffer, the resampler, the gain — and **nothing was wrong with
+it**. The audio does reach the sound card.
+
+The peer's RTP payload was then decoded and looked at, and that is where
+the answer was:
+
+```text
+the first ~400 ms      -23 dBFS RMS, -18.5 dBFS peak
+the rest of the call   -45 … -66 dBFS
+the live level, once a second     -57 … -81 dBFS
+```
+
+There **is** audio on the line, and there is almost none of it: a burst
+in the first second and then a signal that is barely above the noise
+floor. The line is quiet, and the decoder was right to decode it.
+
+Our own side, in the same call:
+
+```text
+the peer's audio, at the speaker      0.1469   (-16.7 dBFS)
+the microphone picked up               0.0020 … 0.0123   (-54 … -38 dBFS)
+```
+
+The first number is exactly the peer's peak (0.1836) times the speaker
+gain (0.8) — the audio arrives at the sound card at the level it should.
+The second is a room with nobody in it: the measurement was taken with
+no one at the machine.
+
+### The app now says where the silence is
+
+The call row carries a **live meter** for the peer, **three numbers** and
+**one sentence**:
+
+```text
+Peer [▓░░░░░░░░░░░░░░░░░░] -60 dB   peaks: peer -15 dB · you -66 dB · speaker -17 dB
+The peer is sending, but it is too quiet to hear — their microphone is muted, too far away, or turned down.
+```
+
+* the **bar** is the level *now* — the peer as they are at this moment;
+* the **number** beside it is the same thing in decibels;
+* the **peaks** are where each of the three got to during the call — what
+  the peer sent, what the microphone picked up, and what the speaker was
+  given;
+* the **sentence** names the place the silence is in, in words.
+
+The sentences are the ones that can be true:
+
+| | |
+|---|---|
+| The microphone is muted | the peer hears silence |
+| The speaker is muted | nothing comes out of it |
+| The peer is sending silence | there is nothing on the line to hear |
+| The peer is sending, but it is too quiet to hear | their microphone is muted, too far away, or turned down |
+| The peer is sending audio, but the speaker is getting silence | the sound card is not playing it |
+| The audio reached the speaker, but it is too quiet to hear | turn the speaker volume up |
+| The peer hears nothing | the microphone picked up nothing at all |
+| The microphone is picking up almost nothing | the peer will hear silence |
+
+**The peer is judged on the level now, and not on the peak.** A line that
+carried a beep in the first second and room noise ever since is quiet,
+and the peak would say the opposite — the peak was -15 dB in the call
+above, and there was nothing to hear.
+
+### The bug the picture found
+
+The first picture of the new row showed the numbers **on top of each
+other**: "peer -66 dB" printed over "-66 dB", both unreadable.
+
+It was not the font and not the separator. The level meter painted its
+own number in decibels **outside the space the layout had given it** —
+the bar was allocated 140 points, the number was painted at 148 — so the
+number landed on whatever came next, which was the text with the three
+levels in it. Two pieces of text on top of each other are two unreadable
+pieces of text.
+
+The number is now **measured and given room in the layout**
+(`layout_no_wrap` → the galley's width → the space the widget takes), so
+it can never land on its neighbour. The test
+`the_meters_number_does_not_land_on_the_next_thing` reads the two boxes
+out of the frame and compares them, and it fails if the number is put
+back where it was:
+
+```text
+the number              198.2 … 232.4
+the text after it       198.2 … 287.6      <- the same x: on top of it
+```
+
+### The `--call` diagnostic
+
+A call without a window, for when there is nobody at the machine to
+listen to it:
+
+```powershell
+cargo run -p qsoftphone-app -- --call 559 --seconds 15
+cargo run -p qsoftphone-app -- --call 559 --seconds 15 --codec PCMA
+```
+
+It registers, calls, and writes the levels of the call once a second and
+the numbers of the media when it stops:
+
+```text
+the media of the call: codec=G722 pt=9 port=61123 remote=Some("193.178.169.164:50056")
+                         mic=Some("Microphone Array (AMD Audio Device)")
+                         speaker=Some("Headphone (Realtek(R) Audio)") problem=None
+the levels of the call: peer=0.00119 peer_peak=0.18365 you=0.00026 speaker=0.14692
+the call's media stopped received=504 sent=663 sent_silence=0 concealed=312
+                          underruns=16194 incoming_peak=0.2296 outgoing_peak=0.0123
+                          played_peak=0.1837
+```
+
+`--codec` forces the codec, which is how a call is checked against one
+PBX codec at a time.
+
+### The dependency cost: nothing
+
+No new crate.
+
+### What is *not* in M4.11
+
+* **The sentence is not a diagnosis of the far end.** It can say that the
+  peer's audio is too quiet to hear; it cannot say whether their
+  microphone is muted, far away, or turned down. The user knows which
+  it is.
+* **The levels are not per-codec.** A G.722 call and a G.711 call are
+  measured the same way, and the decibel figures are comparable because
+  both are full-scale floats.
+* **The peaks are never reset.** They are the peaks of the call, and a
+  call that had one loud moment keeps that number until it ends.
+* **The meter shows one direction.** The peer's level is the one that is
+  a bar; the microphone and the speaker are numbers only.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -2427,6 +2588,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M4.8** | The keypad in the middle, the window that wakes up, and the echo test: the dialpad is centred in the call page, the app asks egui to redraw ten times a second, and the microphone is played back through the speaker with the device names in the report | **done** |
 | **M4.9** | The microphone tells the truth, and the calls are the ones that are up: the echo test has a level meter and says the level in decibels, a call says how many frames it sent, and the call page lists only the calls that are up | **done** |
 | **M4.10** | The details are under the row they belong to: the history table is drawn by hand with fixed columns, an expanded row opens its details **under itself** instead of below the whole table, and the table fits the window | **done** |
+| **M4.11** | Where the silence is: the call row carries a live peer meter, the three levels in decibels, and a sentence that names the place the silence is in; the media path is measured end to end against the real PBX | **done** |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
@@ -2491,7 +2653,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 313 tests, all passing.
+* `cargo test --workspace` — 320 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -2790,6 +2952,25 @@ player lands.
 * **The history's columns line up.** The row's number is under the
   "Number" header — the same x — and every column of the header is to
   the right of the one before it.
+* **The call row says where the silence is.** The row carries the peer's
+  level as it is now, the three peaks in decibels, and a sentence that
+  names the place the silence is in: the microphone is muted, the speaker
+  is muted, the peer is sending silence, the peer is sending something
+  too quiet to hear, the sound card is not playing it, or the microphone
+  picked up nothing.
+* **A line that carried a beep and then went quiet is called quiet.** The
+  peer is judged on the level now and not on the peak — a peak of -15 dB
+  from the first second of a call does not make the rest of it audible.
+* **The meter's number is given room in the layout.** It used to be
+  painted outside the space the bar was given, and it landed on top of
+  the text after it. The test reads both boxes out of the frame and
+  checks that they do not overlap — and it fails if the number is put
+  back where it was.
+* **The levels are measured where it matters.** The peak of what the peer
+  sent is measured on the **decoded** audio, the microphone's peak on
+  the captured frame, and the speaker's peak on the samples **after** the
+  gain and the resampler — which is the number that says whether the
+  sound card was given anything at all.
 
 **Verified against a real Asterisk:**
 
@@ -2808,6 +2989,14 @@ player lands.
   `<sip:104@181.28.198.57:…>` — learned from the `received` and `rport`
   parameters the registrar echoes back, and the Request-URI keeps the
   registrar's port.
+* **A call to the user's own extension is answered, and carries audio.**
+  The call comes up on G.722 (`200 OK`, payload type 9), RTP flows both
+  ways, and the media stops with `received=504 sent=663 concealed=312`.
+  The audio is **quiet**, and that is now measured rather than guessed:
+  the peer's payload decodes to -23 dBFS RMS for the first 400 ms and
+  -45 … -66 dBFS after it, while our side delivers the peer's audio to
+  the sound card at -16.7 dBFS — exactly the peer's peak times the 0.8
+  speaker gain. See [M4.11](#m411--where-the-silence-is).
 
 **Not verified:**
 
@@ -2816,16 +3005,17 @@ player lands.
   Asterisk run above ended in a `404`. The SIP messages on the wire are
   the real ones, but no call has yet been *answered* by a peer this
   repository did not write.
-* **No call has been heard by a human.** The RTP path is proved
-  end to end between two sessions in this repository, the G.711 codec
-  is proved against its own tables, the jitter buffer and the channel
-  handling are proved in simulation, and the audio's **fidelity** is
-  measured (a purity of 1.000 through the whole path) — but no call
-  has yet been made to Asterisk and listened to. The desktop was locked
-  for most of the M4 build, so the sound card could not be exercised by
-  a person. **The dithering that M4.3, M4.4 and M4.5 fix has not been
-  heard fixed on a call** — it has been proved wrong on the numbers,
-  which is not the same thing, and the next call is the real test.
+* **A call has now been made and listened to, and it was silent.** The
+  user placed calls from this build to their own Asterisk extension,
+  answered them, and reported **"no sound"**. The call is answered, RTP
+  flows both ways, and the numbers say the line is quiet: the peer's
+  payload is -45 … -66 dBFS after the first 400 ms, while our side hands
+  the sound card -16.7 dBFS. What is *not* yet proved by a human ear is
+  the other direction — what the far end hears from us — because every
+  measurement of our microphone was taken with nobody at the machine.
+  The call row now shows all three numbers while the call is up, so the
+  next call answers the question without an argument with a log. See
+  [M4.11](#m411--where-the-silence-is).
 * **The stale call has been proved by reading the code, not by
   hearing it.** The chain is in [M4.5](#m45--the-stale-call-and-the-real-time-callback)
   and every link is checkable: the media was only ever released by the
@@ -2869,11 +3059,12 @@ player lands.
   and the playback half now has a human ear behind it. What it does
   **not** prove is a call: the echo test is a loopback through the
   sound card, not an RTP session to a peer.
-* **The microphone's level has not been heard either.** The app
-  measures it (−48 dBFS to −67 dBFS here) and says it, but a number is
-  not a voice: whether the machine's microphone hears anything at all
-  is a thing a person has to answer by speaking into it and watching
-  the meter.
+* **The microphone has been heard — by the user, through the echo test.**
+  "I hear myself" is the microphone working: the capture side picks the
+  user up and the playback side plays it back. What a call cannot yet
+  show is what the **far end** hears: the microphone measured
+  -38 … -54 dBFS in the automated runs, which is a room with nobody in
+  it.
 * **The media has not been tested against a NAT.** The SDP advertises
   the public address, but the RTP port is the local one, and a NAT
   that rewrites it will break the call. This is the first thing to
