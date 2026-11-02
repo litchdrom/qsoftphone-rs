@@ -9,7 +9,7 @@ identity resolution, the call event contract, the history rules and
 the transfer construction all have to behave identically, including the
 bugs that have already been fixed there.
 
-**Status: M4.7 complete.** The workspace builds, the test suite passes, the
+**Status: M4.8 complete.** The workspace builds, the test suite passes, the
 app starts and exits cleanly, an account can be registered against a SIP
 registrar with digest authentication (MD5 and SHA-256), and calls can be
 placed and received over that registration — outbound INVITE, inbound
@@ -29,12 +29,16 @@ its media did. The history is a **table** — `dir | Number | Duration |
 Time | code | status`, with the legend above it — and its timestamps
 carry the seconds, so a call that lasted twenty seconds no longer reads
 as if it started and ended at the same instant. The status line goes
-back to "Ready." when the call is over. The dialpad is in the header of
-the call page, and it does both jobs: it dials the number when the app
+back to "Ready." when the call is over. The dialpad is in the **middle**
+of the call page, and it does both jobs: it dials the number when the app
 is idle and it sends the DTMF tones during a call. And a call with **no
 microphone** — a remote session without a microphone redirection, a
 machine with no sound card — still sends RTP silence, so the clock
-keeps running and the call does not die. See
+keeps running and the call does not die. The window now **wakes up**:
+the app asks egui to draw again ten times a second, so the registration,
+the calls and the history appear when they happen instead of when the
+mouse moves. The settings page has an **echo test**: the microphone,
+played back through the speaker, with the device names in the report. See
 [Milestones](#milestones).
 
 ---
@@ -1881,6 +1885,10 @@ dials numbers when idle and sends DTMF tones during the call"*. When a
 call is up, the same keys send the tones; when the app is idle, they
 dial the number.
 
+(The header was the wrong place for it; **M4.8** moves it into the
+middle of the page, where the C++ has it. See
+[M4.8](#m48--the-keypad-in-the-middle-the-window-that-did-not-wake-up-and-the-echo-test).)
+
 The separate DTMF keypad that used to live inside the call panel is
 gone — there is one keypad now, not two.
 
@@ -1921,8 +1929,186 @@ No new crate, and no new file in the tree.
 
 * **The expanded row's details are not in the row.** They are under the
   table, because a grid's columns are sized by their contents.
-* **The keypad is only on the call page**, like the C++'s, so the
-  header row is taller on that page than on the others.
+* **The keypad is only on the call page**, like the C++'s. It was in the
+  header of that page in M4.7; **M4.8 moved it into the middle of the
+  page**, where the C++ has it.
+* **Two concurrent calls still open two sound cards** — see M4.5.
+
+---
+
+## M4.8 — The keypad in the middle, the window that did not wake up, and the echo test
+
+Three things were asked for:
+
+> The keypad is nice but why its not in the middle of the window?
+> Also it starts working really slow.
+> No my audio in echo test.
+
+### The keypad is in the middle
+
+It was in the **header** of the page, on the right, next to the page
+buttons — which is where a status widget belongs, not a dialpad. The C++
+has it in the middle of the dialer page, between the number and the
+recent-calls list (`src/ui/Dialer.qml`), and that is where it is now:
+
+```text
+  Number  [6666            ]  [ Call ]
+
+              [ 1 ] [ 2 ] [ 3 ]
+              [ 4 ] [ 5 ] [ 6 ]
+              [ 7 ] [ 8 ] [ 9 ]
+              [ * ] [ 0 ] [ # ]
+
+  CALLS
+```
+
+The centring is in the **content area**, not the whole window: the window
+has an accounts panel down the left, and a keypad in the middle of the
+*window* would sit under that panel. It is centred in the page the user
+is looking at.
+
+The header row is now the same height on every page, and the keypad only
+exists on the call page — as in the C++.
+
+### "It starts working really slow"
+
+The complaint was not about the start. It was about the window **not
+waking up**.
+
+egui only draws when something asks it to. The things that change in this
+app all arrive from **outside** egui — the registration state, the
+incoming call, the call state, the media state, the history rows — and
+nothing was ever asking egui to draw again. So the window sat on the
+picture it had until the user happened to move the mouse: the status
+line lagged behind the app, an incoming call did not appear until the
+mouse moved, and the whole thing looked slow.
+
+The app now asks to be drawn again, ten times a second:
+
+```rust
+ui.ctx().request_repaint_after(POLL);
+```
+
+A tenth of a second is quick enough that nothing is noticed and slow
+enough that an idle window costs nothing. The request is made in
+`draw()`, so the headless tests exercise it too — there is a test that
+asserts the app asks for a repaint.
+
+The **start** was measured rather than guessed, because "it starts
+slowly" is a complaint that needs a number behind it. The app records
+when it was started and logs the time to the first frame:
+
+```text
+the first frame was drawn millis=49
+```
+
+Forty-nine milliseconds — the window is up in a twentieth of a second. The
+log line is in the log file from then on, so "it feels slow" can be
+checked against a number instead of argued about.
+
+### The echo test
+
+> No my audio in echo test.
+
+The settings page had a **test sound**: a 440 Hz tone through the
+speaker, which says that the speaker works and nothing else. There was no
+way to test the **microphone** at all, and the C++ has none either — its
+`SettingsWindow.qml` offers a "Loopback self-test" and that is all.
+
+The echo test is the microphone, played back through the speaker: you
+speak, and you hear yourself. It is the only test of the sound card
+that checks the microphone, the speaker **and** the two together, and it
+is the only one a user can do alone — nobody has to be at the other end
+to answer.
+
+How it works:
+
+* The capture callback takes the samples, mixes the channels down to one
+  and pushes them into a queue.
+* The playback callback takes them out of the queue and writes them to
+  the speaker, resampling if the two devices do not run at the same rate
+  — the same resampler a call's audio goes through.
+* **The lock is taken once per callback**, never per sample. A real-time
+  callback that takes a lock waits on a kernel object, and the wait
+  shows up in the audio as an overrun.
+* The queue holds **two seconds**. A playback that falls behind does not
+  make the echo longer and later.
+* The test runs for five seconds, on the runtime — never on the
+  interface thread.
+
+The sound card is a **shared resource**, and that is the rule the test
+runs under: a call holds the microphone and the speaker, and a second
+client on one endpoint is exactly what makes cpal report
+`A buffer underrun or overrun occurred`. So the echo test **refuses to
+run during a call**, and a call **refuses to start** while the echo test
+is holding the card.
+
+What it reports:
+
+```text
+Your voice came in; the loudest moment was -18 dB (Microphone Array into Headphone).
+```
+
+The **device names** are in the answer, and they are the point. A quiet
+echo test is usually a test that ran on a device the user did not mean
+to use: a laptop whose default speaker is called "Headphone" while the
+headphones are unplugged plays into nothing at all, and the microphone
+hears the room instead of the test. On the machine this was built on,
+the default output is `Headphone (Realtek(R) Audio)` and the speakers
+are `Speaker (Realtek(R) Audio)` — a difference that is invisible until
+the report says which one it used.
+
+The report has three cases, and they are different problems:
+
+| The report says | What it means |
+|---|---|
+| "The microphone sent nothing at all" | the capture never ran — no microphone, or it was unplugged |
+| "The microphone was silent — nothing came in" | the capture ran, and the room was quiet — you did not speak, or the microphone is muted |
+| "Your voice came in; the loudest moment was −18 dB" | it worked |
+
+If the card never answers at all, the button does **not** sit at
+"Listening…" for ever: the test is given up on after thirty seconds and
+says so.
+
+Wear headphones. Without them the microphone hears the speaker and the
+test howls — which is the loopback of a loopback.
+
+### What was measured, on this machine
+
+The sound card of this machine was exercised directly, with the real
+function, not a mock:
+
+```text
+echo test finished in 5.37s: peak=0.007190 samples=240128 (-42.9 dBFS)
+```
+
+240,128 samples in five seconds is exactly the microphone's rate (48 kHz),
+and the peak is the room's noise floor, because nobody was talking to
+it. The capture half of the test is therefore **proven on real
+hardware**.
+
+The playback half runs at the right rate too — the output callback
+delivered 96,000 samples a second (48,000 frames, two channels) — but
+**the acoustic loop could not be closed here**: this machine's desktop
+is locked, and the microphone did not pick up the speaker even with a
+full-scale tone playing into it. Whether the sound actually comes out of
+the speaker is therefore the one thing in this milestone that only a
+person at an unlocked machine can say.
+
+### The dependency cost: nothing
+
+No new crate. The echo test reuses the resampler, the device picker and
+the error type the calls already use.
+
+### What is *not* in M4.8
+
+* **The echo test does not loop the playback back into the microphone.**
+  It is the user's own ears that judge the speaker, which is what makes
+  it a test a user can do alone.
+* **The settings page still offers "System default" as the speaker**, and
+  on this machine that means the *headphone* endpoint. Choosing the
+  speaker explicitly is the fix, and the report now shows which device
+  was used.
 * **Two concurrent calls still open two sound cards** — see M4.5.
 
 ---
@@ -1963,6 +2149,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M4.5** | The stale call and the real-time callback: unregistering ends the call and closes the sound card, and the callback no longer takes a lock | **done** |
 | **M4.6** | The history row, the legend, and the remote session: the redial is in the row, the rows have a key, and a call with no microphone still sends | **done** |
 | **M4.7** | The history as a table, the dialpad, and the timestamps: the history has a header row, the timestamps carry the seconds, the status line goes back to "Ready.", and the dialpad is in the header of the call page | **done** |
+| **M4.8** | The keypad in the middle, the window that wakes up, and the echo test: the dialpad is centred in the call page, the app asks egui to redraw ten times a second, and the microphone is played back through the speaker with the device names in the report | **done** |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
@@ -2027,7 +2214,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 297 tests, all passing.
+* `cargo test --workspace` — 305 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -2267,11 +2454,37 @@ player lands.
   test compares the two stamps of a call 22 seconds long.
 * **A hung-up call leaves the status line at "Ready."** The status line
   used to stay on "Hanging up…" for ever.
-* **The dialpad is in the header of the call page**, it is not on the
-  other pages, it dials the number when the app is idle, and the same
-  key sends a tone during a call.
+* **The dialpad is on the call page**, it is not on the other pages, it
+  dials the number when the app is idle, and the same key sends a tone
+  during a call.
 * **The build's own bookkeeping is not on the screen.** "M5 — settings"
   is gone from every page.
+* **The dialpad is in the middle of the call page.** The headless frame
+  puts the keypad between the number and the calls list, and the keypad
+  is centred in the page's content area — not in the header, and not
+  under the accounts panel.
+* **The app asks to be drawn again.** egui only draws when something
+  asks it to, and everything that changes in this app arrives from
+  outside egui: the headless frame asks for a repaint, and the test
+  fails if it does not. This is what made the window look slow.
+* **The first frame is timed.** The app logs how long it took to get
+  there — 49 ms on this machine — so "it starts slowly" can be checked
+  against a number.
+* **The echo test is on the settings page**, it says that it plays the
+  microphone, and it **will not run during a call** — the sound card is
+  a shared resource, and a second client on one endpoint is what makes
+  cpal report an overrun.
+* **The echo test reports what it heard and which devices it used**, and
+  it distinguishes "the microphone sent nothing" from "the microphone was
+  silent" from "your voice came in".
+* **The echo test does not sit at "Listening…" for ever.** If the sound
+  card never answers, the test is given up on and says so.
+* **The echo test's queue keeps its bound and remembers its peak** — two
+  seconds of samples at most, and the loudest sample that came in.
+* **The echo test works on the real sound card.** The real function was
+  run against this machine's microphone: 240,128 samples in five
+  seconds, which is exactly the microphone's rate, and the peak was the
+  room's noise floor. The capture half is proven on hardware.
 
 **Verified against a real Asterisk:**
 
@@ -2341,6 +2554,18 @@ player lands.
 * **The test sound has not been heard either.** It is played on the
   runtime and the result comes back, but a locked desktop has no
   speaker to play it on.
+* **The echo test has not been heard either — and its playback half
+  cannot be proved here.** The capture half *is* proved on this
+  machine's real sound card: the real function was run against the real
+  microphone and took 240,128 samples in five seconds, which is exactly
+  the microphone's rate, with the peak at the room's noise floor. The
+  **playback** half runs at the right rate too — the output callback
+  delivered 96,000 samples a second — but the acoustic loop could not be
+  closed: this machine's desktop is locked, and the microphone did not
+  pick up the speaker even with a full-scale tone playing into it. So
+  **whether the sound comes out of the speaker is the one thing in M4.8
+  that only a person at an unlocked machine can say** — and it is a
+  single press of the "Echo test" button, with headphones on.
 * **The media has not been tested against a NAT.** The SDP advertises
   the public address, but the RTP port is the local one, and a NAT
   that rewrites it will break the call. This is the first thing to

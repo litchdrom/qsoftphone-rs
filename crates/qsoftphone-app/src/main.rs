@@ -22,6 +22,10 @@ use qsoftphone_core::storage::{AccountStore, Db};
 use qsoftphone_core::{logging, paths::AppPaths};
 
 fn main() -> ExitCode {
+    // The clock for the startup timing: the first frame says how long
+    // the app took to get there.
+    app::mark_started();
+
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

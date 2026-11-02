@@ -89,6 +89,8 @@ pub struct QSoftphoneApp {
     status: String,
     /// The theme is applied once, on the first frame.
     theme_applied: bool,
+    /// Whether the first frame has been drawn — the startup timing.
+    first_frame_drawn: bool,
     /// The audio devices of this machine.
     ///
     /// They are read on the runtime (§3): opening a device is a slow
@@ -105,6 +107,14 @@ pub struct QSoftphoneApp {
     remote_session: bool,
     /// What the test sound is doing.
     sound_test: SoundTest,
+    /// What the echo test is doing.
+    echo_test: EchoTest,
+    /// When the echo test started.
+    ///
+    /// The test opens the sound card on another thread. If the card
+    /// never answers, the button would sit at "Listening…" for ever,
+    /// which looks like a frozen app — so the test is given up on.
+    echo_started: Option<std::time::Instant>,
     /// The results of the background media work.
     media_updates: Receiver<MediaUpdate>,
     /// The way back to the runtime that does the work.
@@ -117,6 +127,8 @@ enum MediaUpdate {
     Devices(Vec<DeviceInfo>),
     /// The test sound has finished — or could not be played.
     SoundTest(Result<(), String>),
+    /// The echo test has finished — or could not be run.
+    EchoTest(Result<qsoftphone_media::EchoReport, String>),
 }
 
 /// What the test sound is doing.
@@ -129,6 +141,23 @@ enum SoundTest {
     /// The tone has been played.
     Done,
     /// The tone could not be played.
+    Failed(String),
+}
+
+/// What the echo test is doing.
+///
+/// The echo test is the microphone, played back through the speaker:
+/// speak, and hear yourself. It is the only test of the sound card
+/// that a user can do alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EchoTest {
+    /// Nothing has been asked for.
+    Idle,
+    /// The microphone is being played back.
+    Running,
+    /// The test has finished, with what it heard.
+    Done(String),
+    /// The test could not be run.
     Failed(String),
 }
 
@@ -307,10 +336,13 @@ impl QSoftphoneApp {
             editing_id: None,
             status: "Ready.".to_string(),
             theme_applied: false,
+            first_frame_drawn: false,
             devices: Vec::new(),
             devices_loaded: false,
             remote_session: qsoftphone_media::is_remote_session(),
             sound_test: SoundTest::Idle,
+            echo_test: EchoTest::Idle,
+            echo_started: None,
             media_updates,
             media_updates_tx,
         };
@@ -507,6 +539,13 @@ impl QSoftphoneApp {
     fn place_call_on(&mut self, account: &Account, target: &str) {
         let target = target.trim().to_string();
         if target.is_empty() {
+            return;
+        }
+        // The echo test is holding the sound card. A call that starts
+        // now would open the microphone a second time, and two clients
+        // on one endpoint is what makes the audio break up.
+        if self.echo_test == EchoTest::Running {
+            self.status = "The echo test is running — wait for it to finish.".to_string();
             return;
         }
         // The dialer shows what is being called, so a redial from the
@@ -851,6 +890,76 @@ impl QSoftphoneApp {
         });
     }
 
+    /// Play the microphone back through the speaker.
+    ///
+    /// The echo test: speak, and hear yourself. It checks the
+    /// microphone, the speaker and the two together, and it is the
+    /// only test of the sound card that a user can do alone.
+    ///
+    /// It opens the sound card, so it happens on the runtime (§3).
+    fn play_echo_test(&mut self) {
+        if self.echo_test == EchoTest::Running {
+            return;
+        }
+        // The sound card is a shared resource: a call is holding the
+        // microphone and the speaker, and a second client on the same
+        // endpoint is what makes cpal report an overrun.
+        if self.active_call().is_some() {
+            self.echo_test =
+                EchoTest::Failed("a call is up — the sound card is in use.".to_string());
+            return;
+        }
+
+        let microphone = self.config.media.microphone.clone();
+        let microphone = if microphone.trim().is_empty() {
+            None
+        } else {
+            Some(microphone)
+        };
+        let speaker = self.config.media.speaker.clone();
+        let speaker = if speaker.trim().is_empty() {
+            None
+        } else {
+            Some(speaker)
+        };
+
+        self.echo_test = EchoTest::Running;
+        self.echo_started = Some(std::time::Instant::now());
+        self.status = "The echo test is running — speak now.".to_string();
+        let sender = self.media_updates_tx.clone();
+        self.runtime.spawn_blocking(move || {
+            let outcome = qsoftphone_media::play_echo_test(
+                microphone.as_deref(),
+                speaker.as_deref(),
+                ECHO_SECONDS,
+            )
+            .map_err(|e| e.to_string());
+            let _ = sender.send(MediaUpdate::EchoTest(outcome));
+        });
+    }
+
+    /// Give up on the echo test if the sound card does not come back.
+    ///
+    /// The test runs on its own thread, so a sound card that never
+    /// answers cannot freeze the window — but the button would sit at
+    /// "Listening…" for ever, which looks like a frozen app. This says
+    /// what happened instead.
+    fn check_echo_test_deadline(&mut self) {
+        let Some(started) = self.echo_started else {
+            return;
+        };
+        if self.echo_test != EchoTest::Running {
+            return;
+        }
+        if started.elapsed() < ECHO_DEADLINE {
+            return;
+        }
+        self.echo_test = EchoTest::Failed(
+            "the sound card did not answer — the test was given up on.".to_string(),
+        );
+        self.status = "The echo test did not finish.".to_string();
+    }
+
     /// Drain what the background media work has to say.
     fn drain_media(&mut self) {
         while let Ok(update) = self.media_updates.try_recv() {
@@ -866,6 +975,17 @@ impl QSoftphoneApp {
                 MediaUpdate::SoundTest(Err(error)) => {
                     self.sound_test = SoundTest::Failed(error.clone());
                     self.status = format!("The test sound could not be played: {error}");
+                }
+                MediaUpdate::EchoTest(Ok(report)) => {
+                    let text = echo_report_text(&report);
+                    self.echo_test = EchoTest::Done(text.clone());
+                    self.echo_started = None;
+                    self.status = text;
+                }
+                MediaUpdate::EchoTest(Err(error)) => {
+                    self.echo_test = EchoTest::Failed(error.clone());
+                    self.echo_started = None;
+                    self.status = format!("The echo test could not be run: {error}");
                 }
             }
         }
@@ -955,6 +1075,39 @@ impl QSoftphoneApp {
     /// [`eframe::App::ui`] so that a test can drive it headlessly —
     /// egui does not need a window to lay the widgets out.
     pub fn draw(&mut self, ui: &mut egui::Ui) {
+        // How long the app took to get to its first frame.
+        //
+        // "It starts slowly" is a complaint that needs a number
+        // behind it: the window is not up until the first frame is
+        // drawn, and everything before it — the database, the settings,
+        // the font, the graphics device — is part of the wait.
+        if !self.first_frame_drawn {
+            self.first_frame_drawn = true;
+            if let Some(started) = STARTED.get() {
+                tracing::info!(
+                    millis = started.elapsed().as_millis(),
+                    "the first frame was drawn"
+                );
+            }
+        }
+
+        // Ask to be drawn again.
+        //
+        // egui only draws when something asks it to, and the things
+        // that change in this app all arrive from **outside** egui:
+        // the registration, the calls, the media, the history. Without
+        // this the window sits on the last picture until the user
+        // happens to move the mouse — an incoming call would not show
+        // up until then, and the status line would lag behind the app.
+        //
+        // A tenth of a second is quick enough that nothing is noticed
+        // and slow enough that an idle window costs nothing.
+        ui.ctx().request_repaint_after(POLL);
+
+        // The echo test is on its own thread, but it still has to be
+        // given up on if the sound card never answers.
+        self.check_echo_test_deadline();
+
         if !self.theme_applied {
             self.theme_applied = true;
             let visuals = if self.config.ui.theme.eq_ignore_ascii_case("light") {
@@ -1107,21 +1260,6 @@ impl QSoftphoneApp {
                 }
                 ui.separator();
                 ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).small());
-
-                // The keypad, on the right of the page.
-                //
-                // The C++ has one keypad, always on the dialer page,
-                // and it does both jobs: it dials the number when the
-                // app is idle and it sends the DTMF tones during a
-                // call. This is the same keypad in the same place.
-                if self.view == View::Call {
-                    // The keypad's width, so that the spacer pushes it
-                    // to the right of the page.
-                    let width = 3.0 * 30.0 + 2.0 * 4.0;
-                    let spacer = (ui.available_width() - width).max(0.0);
-                    ui.add_space(spacer);
-                    self.draw_keypad(ui);
-                }
             });
             ui.separator();
 
@@ -1206,7 +1344,23 @@ impl QSoftphoneApp {
             ui.weak("Register the account before it can call.");
         }
 
+        // The keypad, in the middle of the page.
+        //
+        // It is between the number card and the calls, as the C++ has
+        // it (`src/ui/Dialer.qml`): the number is above it, the calls
+        // are below, and the keypad is where the eye already is. In
+        // the corner of the window it was in a corner, hard to find
+        // and half off the screen.
+        ui.add_space(10.0);
+        let gap = ui.spacing().item_spacing.x;
+        let width = 3.0 * KEYPAD_BUTTON.x + 2.0 * gap;
+        let spacer = ((ui.available_width() - width) / 2.0).max(0.0);
+        ui.horizontal(|ui| {
+            ui.add_space(spacer);
+            self.draw_keypad(ui);
+        });
         ui.add_space(6.0);
+
         ui.label(egui::RichText::new("CALLS").strong().size(11.0));
         ui.separator();
 
@@ -1226,7 +1380,8 @@ impl QSoftphoneApp {
     /// The C++ has one keypad, always on the dialer page, and it does
     /// both jobs: it dials the number when the app is idle and it
     /// sends the DTMF tones during a call. This is the same keypad in
-    /// the same place — the header, to the right of the page tabs.
+    /// the same place — the middle of the page, between the number
+    /// card and the calls, where the eye is.
     ///
     /// The digits are the C++'s: `*` and `#` are there for the
     /// feature codes a PBX puts in front of a call.
@@ -1247,7 +1402,7 @@ impl QSoftphoneApp {
                 ui.horizontal(|ui| {
                     for digit in row {
                         if ui
-                            .add(egui::Button::new(digit).min_size(egui::vec2(30.0, 20.0)))
+                            .add(egui::Button::new(digit).min_size(KEYPAD_BUTTON))
                             .clicked()
                         {
                             if in_call {
@@ -1904,8 +2059,72 @@ impl QSoftphoneApp {
             }
         });
         ui.weak("A short tone through the speaker, to see that it works.");
+
+        // The echo test: the microphone, through the speaker.
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let label = match &self.echo_test {
+                EchoTest::Running => "Listening…",
+                EchoTest::Done(_) | EchoTest::Failed(_) => "Echo test again",
+                _ => "Echo test",
+            };
+            let running = self.echo_test == EchoTest::Running;
+            if ui.add_enabled(!running, egui::Button::new(label)).clicked() {
+                self.play_echo_test();
+            }
+            match &self.echo_test {
+                EchoTest::Failed(why) => {
+                    ui.weak(why.clone());
+                }
+                EchoTest::Done(report) => {
+                    ui.weak(report.clone());
+                }
+                _ => {}
+            }
+        });
+        ui.weak(
+            "Your own voice, from the microphone, through the speaker. Wear headphones, \
+             or the microphone hears the speaker and the test howls.",
+        );
     }
 }
+
+/// What the echo test heard, in words.
+///
+/// The **device names** are in the text: a test that is quiet is usually
+/// a test that ran on a device the user did not mean to use, and the
+/// only way to know which device it was is to say so.
+fn echo_report_text(report: &qsoftphone_media::EchoReport) -> String {
+    let devices = format!("{} into {}", report.microphone, report.speaker);
+    if report.samples == 0 {
+        return format!("The microphone sent nothing at all — {devices}.");
+    }
+    if report.peak < 0.005 {
+        return format!("The microphone was silent — nothing came in ({devices}).");
+    }
+    // The peak in decibels, against full scale.
+    let db = 20.0 * report.peak.max(1e-6).log10();
+    format!("Your voice came in; the loudest moment was {db:.0} dB ({devices}).")
+}
+
+/// The size of a keypad button.
+///
+/// The keypad is in the middle of the page now, so the buttons can be
+/// the size a keypad's buttons are.
+const KEYPAD_BUTTON: egui::Vec2 = egui::vec2(46.0, 32.0);
+
+/// How long the echo test listens.
+///
+/// Long enough to say a word in, short enough not to be a nuisance.
+const ECHO_SECONDS: f64 = 5.0;
+
+/// How long the echo test may take before it is given up on.
+///
+/// The test opens the sound card, and a sound card can fail to answer:
+/// a device that was unplugged, a driver that is wedged. The test runs
+/// on its own thread, so the window stays alive — but the button must
+/// not sit at "Listening…" for ever.
+const ECHO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The colour the history list shows a result in.
 ///
@@ -2011,6 +2230,23 @@ impl eframe::App for QSoftphoneApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.draw(ui);
     }
+}
+
+/// How often the app looks at itself when nothing else is happening.
+const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// When the process started.
+///
+/// The first frame says how long it took to get there.
+static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Say when the process started.
+///
+/// The first thing [`main`] does, so that the time to the first frame
+/// includes everything: the database, the settings, the font and the
+/// graphics device.
+pub fn mark_started() {
+    let _ = STARTED.set(std::time::Instant::now());
 }
 
 /// The media settings, read out of the settings file.
@@ -2652,30 +2888,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_keypad_is_in_the_header_of_the_call_page() {
-        // The C++ has one keypad, always on the dialer page, and it
-        // does both jobs. This is the same keypad, in the header.
+    async fn the_keypad_is_only_on_the_call_page() {
+        // The C++ has one keypad, always on the dialer page. So is
+        // this one.
         let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
 
         app.view = View::Call;
         let output = frame(&mut app, &ctx);
-
-        let mut keys = Vec::new();
         for digit in ["1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#"] {
-            let rect =
-                button_at(&output, digit).unwrap_or_else(|| panic!("the keypad has no {digit:?}"));
-            keys.push(rect);
+            assert!(
+                button_at(&output, digit).is_some(),
+                "the keypad has no {digit:?}"
+            );
         }
-
-        // It is on the right of the window: the header is the tabs on
-        // the left and the keypad on the right.
-        let rightmost = keys.iter().map(|r| r.max.x).fold(0.0f32, f32::max);
-        assert!(
-            rightmost > 900.0,
-            "the keypad is not on the right of the window: {rightmost}"
-        );
 
         // And it is only on the call page.
         app.view = View::History;
@@ -2725,6 +2952,183 @@ mod tests {
             app.status.starts_with("Could not send the digit"),
             "the key did not send a tone during the call: {:?}",
             app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn the_keypad_is_in_the_middle_of_the_call_page() {
+        // "Why is it not in the middle of the window?" — it is now
+        // between the number card and the calls, in the middle of the
+        // page, as the C++ has it.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        app.view = View::Call;
+        let output = frame(&mut app, &ctx);
+
+        let five = button_at(&output, "5").expect("the keypad has no 5");
+        let number = text_at(&output, "Number").expect("the page has no number card");
+        let calls = text_at(&output, "CALLS").expect("the page has no call list");
+
+        // Between the number and the calls.
+        assert!(
+            five.min.y > number.max.y,
+            "the keypad is above the number: {five:?} against {number:?}"
+        );
+        assert!(
+            five.min.y < calls.min.y,
+            "the keypad is below the calls: {five:?} against {calls:?}"
+        );
+
+        // And in the middle of the page, not in a corner.
+        //
+        // The call list starts at the left edge of the page's content,
+        // so the middle of the content is halfway between it and the
+        // right edge of the window.
+        let content_left = calls.min.x;
+        let content_middle = (content_left + 1100.0) / 2.0;
+        assert!(
+            (five.center().x - content_middle).abs() < 25.0,
+            "the keypad is not in the middle: {five:?} against {content_middle}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_app_asks_to_be_drawn_again() {
+        // egui only draws when something asks it to, and everything
+        // that changes in this app arrives from outside egui: the
+        // registration, the calls, the media, the history. Without
+        // this the window sits on the last picture until the user
+        // happens to move the mouse.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        frame(&mut app, &ctx);
+
+        assert!(
+            ctx.has_requested_repaint(),
+            "the app does not ask to be drawn again: the window would sit on a stale picture"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_echo_test_will_not_run_during_a_call() {
+        // The sound card is a shared resource: a second client on one
+        // endpoint is what makes cpal report an overrun and the audio
+        // break up.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        run_a_call(&bus, "call-1", true).await;
+        frame(&mut app, &ctx);
+
+        app.play_echo_test();
+
+        assert!(
+            matches!(app.echo_test, EchoTest::Failed(_)),
+            "the echo test ran during a call: {:?}",
+            app.echo_test
+        );
+    }
+
+    #[tokio::test]
+    async fn the_echo_test_is_given_up_on_if_the_sound_card_does_not_answer() {
+        // The test runs on its own thread, so a sound card that never
+        // answers cannot freeze the window — but the button must not sit
+        // at "Listening…" for ever.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.echo_test = EchoTest::Running;
+        app.echo_started = Some(std::time::Instant::now());
+        frame(&mut app, &ctx);
+        assert!(
+            matches!(app.echo_test, EchoTest::Running),
+            "the echo test was given up on before its time was up"
+        );
+
+        app.echo_started =
+            Some(std::time::Instant::now() - ECHO_DEADLINE - std::time::Duration::from_secs(1));
+        frame(&mut app, &ctx);
+        assert!(
+            matches!(app.echo_test, EchoTest::Failed(_)),
+            "the echo test is still listening after its deadline: {:?}",
+            app.echo_test
+        );
+    }
+
+    #[tokio::test]
+    async fn the_echo_test_is_on_the_settings_page() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        app.view = View::Settings;
+        let output = frame(&mut app, &ctx);
+
+        assert!(
+            button_at(&output, "Echo test").is_some(),
+            "the settings page has no echo test"
+        );
+        let text = screen_text(&output);
+        assert!(
+            text.contains("microphone"),
+            "the echo test does not say it plays the microphone:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_echo_report_says_what_it_heard() {
+        let nothing = qsoftphone_media::EchoReport {
+            peak: 0.0,
+            samples: 0,
+            microphone: "Mic".to_string(),
+            speaker: "Speaker".to_string(),
+        };
+        assert!(
+            echo_report_text(&nothing).contains("nothing"),
+            "a microphone that sent nothing does not say so"
+        );
+
+        let silent = qsoftphone_media::EchoReport {
+            peak: 0.0,
+            samples: 4_800,
+            microphone: "Mic".to_string(),
+            speaker: "Speaker".to_string(),
+        };
+        assert!(
+            echo_report_text(&silent).contains("silent"),
+            "a silent microphone does not say so"
+        );
+
+        let voice = qsoftphone_media::EchoReport {
+            peak: 0.5,
+            samples: 4_800,
+            microphone: "Mic".to_string(),
+            speaker: "Speaker".to_string(),
+        };
+        assert!(
+            echo_report_text(&voice).contains("came in"),
+            "a microphone that heard something does not say so"
+        );
+    }
+
+    #[test]
+    fn the_echo_report_says_which_devices_it_used() {
+        // A quiet echo test is usually a device the user did not mean
+        // to use: a laptop whose default speaker is "Headphone" while
+        // the headphones are unplugged plays into nothing at all.
+        let report = qsoftphone_media::EchoReport {
+            peak: 0.5,
+            samples: 4_800,
+            microphone: "Microphone Array".to_string(),
+            speaker: "Headphone".to_string(),
+        };
+        let text = echo_report_text(&report);
+        assert!(
+            text.contains("Microphone Array") && text.contains("Headphone"),
+            "the echo report does not say which devices it used:\n{text}"
         );
     }
 

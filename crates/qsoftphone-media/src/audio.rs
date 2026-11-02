@@ -826,6 +826,365 @@ const TONE_HZ: f64 = 440.0;
 /// How long the test tone lasts.
 const TONE_SECONDS: f64 = 0.4;
 
+/// What the echo test heard.
+///
+/// The echo test is the one that checks the microphone, the speaker and
+/// the two together — and it is the one a user can do alone, without
+/// anybody at the other end.
+///
+/// The **device names** are part of the report because a quiet test is
+/// usually a device that is not the one the user thinks it is: a laptop
+/// whose default speaker is "Headphone" while the headphones are
+/// unplugged plays into nothing at all.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EchoReport {
+    /// The loudest the microphone got, from 0 to 1.
+    pub peak: f32,
+    /// How many samples came in.
+    ///
+    /// Zero means the microphone was never heard from at all, which is
+    /// a different thing from "it was quiet".
+    pub samples: usize,
+    /// The microphone that was used.
+    pub microphone: String,
+    /// The speaker that was used.
+    pub speaker: String,
+}
+
+/// The queue between the microphone and the speaker in the echo test.
+///
+/// The capture callback pushes into it and the playback callback takes
+/// from it. **The lock is taken once per callback** and never per
+/// sample: a real-time callback that takes a lock waits on a kernel
+/// object, and the wait shows up in the audio as an overrun.
+#[derive(Debug)]
+struct EchoQueue {
+    samples: Mutex<VecDeque<f32>>,
+    /// How many samples may wait. Two seconds: a playback that falls
+    /// behind does not make the echo longer and later.
+    limit: usize,
+    /// The loudest sample that came in, as the bits of an `f32`.
+    peak: AtomicU32,
+    /// How many samples came in.
+    count: AtomicUsize,
+}
+
+impl EchoQueue {
+    fn new(rate: u32) -> Self {
+        Self {
+            samples: Mutex::new(VecDeque::new()),
+            limit: (rate as usize) * 2,
+            peak: AtomicU32::new(0),
+            count: AtomicUsize::new(0),
+        }
+    }
+
+    /// The captured samples, for the playback.
+    fn take(&self, max: usize) -> Vec<f32> {
+        let mut queue = self.samples.lock().expect("echo queue lock");
+        let count = queue.len().min(max);
+        queue.drain(..count).collect()
+    }
+
+    /// The captured samples, for the capture side.
+    fn push(&self, samples: &[f32]) {
+        let mut queue = self.samples.lock().expect("echo queue lock");
+        for sample in samples {
+            let level = sample.abs();
+            let peak = f32::from_bits(self.peak.load(Ordering::Relaxed));
+            if level > peak {
+                self.peak.store(level.to_bits(), Ordering::Relaxed);
+            }
+            queue.push_back(*sample);
+        }
+        self.count.fetch_add(samples.len(), Ordering::Relaxed);
+        while queue.len() > self.limit {
+            queue.pop_front();
+        }
+    }
+
+    /// What came in.
+    ///
+    /// The device names are empty here: the queue does not know them.
+    /// They are filled in by the test that opened the devices.
+    fn report(&self) -> EchoReport {
+        EchoReport {
+            peak: f32::from_bits(self.peak.load(Ordering::Relaxed)),
+            samples: self.count.load(Ordering::Relaxed),
+            microphone: String::new(),
+            speaker: String::new(),
+        }
+    }
+}
+
+/// The playback side of the echo test.
+///
+/// The microphone and the speaker rarely run at the same rate, so the
+/// samples are converted on the way out, exactly as a call's are.
+struct EchoPlayback {
+    resampler: Resampler,
+}
+
+impl EchoPlayback {
+    fn new(from_rate: u32, to_rate: u32) -> Self {
+        Self {
+            resampler: Resampler::new(from_rate, to_rate),
+        }
+    }
+
+    /// The samples for this callback.
+    fn begin(&mut self, chunk: &[f32]) {
+        for sample in chunk {
+            self.resampler.push(*sample);
+        }
+    }
+
+    /// The next sample for the speaker.
+    fn next(&mut self) -> f32 {
+        self.resampler.next_output().unwrap_or(0.0)
+    }
+}
+
+/// Build the capture stream for the echo test.
+fn build_echo_input<T: DeviceSample + cpal::SizedSample>(
+    device: &Device,
+    config: StreamConfig,
+    channels: u16,
+    queue: Arc<EchoQueue>,
+) -> Result<Stream, AudioError> {
+    device
+        .build_input_stream::<T, _, _>(
+            config,
+            move |data: &[T], _| {
+                let channels = channels.max(1) as usize;
+                let frames = data.len() / channels;
+                let mut mono = Vec::with_capacity(frames);
+                for frame in 0..frames {
+                    let mut sum = 0.0f32;
+                    for channel in 0..channels {
+                        sum += data[frame * channels + channel].to_normalised();
+                    }
+                    mono.push(sum / channels as f32);
+                }
+                queue.push(&mono);
+            },
+            |error| {
+                tracing::warn!(error = %error, "the microphone reported an error");
+            },
+            None,
+        )
+        .map_err(|e| AudioError::Backend(e.to_string()))
+}
+
+/// Build the playback stream for the echo test.
+fn build_echo_output<T: FromNormalised + cpal::SizedSample>(
+    device: &Device,
+    config: StreamConfig,
+    channels: u16,
+    queue: Arc<EchoQueue>,
+    playback: EchoPlayback,
+) -> Result<Stream, AudioError> {
+    let mut playback = playback;
+
+    device
+        .build_output_stream::<T, _, _>(
+            config,
+            move |data: &mut [T], _| {
+                let frames = data.len() / channels.max(1) as usize;
+                let chunk = queue.take(frames);
+                playback.begin(&chunk);
+                fill_output(data, channels, || playback.next());
+            },
+            |error| {
+                tracing::warn!(error = %error, "the speaker reported an error");
+            },
+            None,
+        )
+        .map_err(|e| AudioError::Backend(e.to_string()))
+}
+
+/// Play the microphone back through the speaker.
+///
+/// This is the **echo test**: speak, and hear yourself. It is the only
+/// test that checks the microphone, the speaker and the two together,
+/// and it is the one a user can do alone — nobody has to be at the
+/// other end to answer.
+///
+/// It opens a device and waits for it, so it must **not** run on the
+/// interface thread (§6 of the brief).
+///
+/// The sound card is a shared resource: the microphone and the speaker
+/// of a call must be closed before this runs, or the two clients on
+/// one endpoint miss their deadlines and the audio breaks up.
+pub fn play_echo_test(
+    microphone: Option<&str>,
+    speaker: Option<&str>,
+    seconds: f64,
+) -> Result<EchoReport, AudioError> {
+    let host = cpal::default_host();
+    let input = find_device(&host, microphone, true)
+        .ok_or_else(|| AudioError::NoDevice("there is no microphone to open".to_string()))?;
+    let output = find_device(&host, speaker, false)
+        .ok_or_else(|| AudioError::NoDevice("there is no speaker to open".to_string()))?;
+
+    let input_supported = input
+        .default_input_config()
+        .map_err(|e| AudioError::Backend(e.to_string()))?;
+    let input_rate = input_supported.sample_rate();
+    let input_channels = input_supported.channels().max(1);
+    let input_config = input_supported.config();
+    let input_format = input_supported.sample_format();
+
+    let output_supported = output
+        .default_output_config()
+        .map_err(|e| AudioError::Backend(e.to_string()))?;
+    let output_rate = output_supported.sample_rate();
+    let output_channels = output_supported.channels().max(1);
+    let output_config = output_supported.config();
+    let output_format = output_supported.sample_format();
+
+    let microphone_name = device_name(&input);
+    let speaker_name = device_name(&output);
+    let queue = Arc::new(EchoQueue::new(input_rate));
+
+    let capture_queue = queue.clone();
+    let input_stream = match input_format {
+        SampleFormat::I8 => {
+            build_echo_input::<i8>(&input, input_config, input_channels, capture_queue)
+        }
+        SampleFormat::I16 => {
+            build_echo_input::<i16>(&input, input_config, input_channels, capture_queue)
+        }
+        SampleFormat::I32 => {
+            build_echo_input::<i32>(&input, input_config, input_channels, capture_queue)
+        }
+        SampleFormat::I64 => {
+            build_echo_input::<i64>(&input, input_config, input_channels, capture_queue)
+        }
+        SampleFormat::U8 => {
+            build_echo_input::<u8>(&input, input_config, input_channels, capture_queue)
+        }
+        SampleFormat::U16 => {
+            build_echo_input::<u16>(&input, input_config, input_channels, capture_queue)
+        }
+        SampleFormat::U32 => {
+            build_echo_input::<u32>(&input, input_config, input_channels, capture_queue)
+        }
+        SampleFormat::U64 => {
+            build_echo_input::<u64>(&input, input_config, input_channels, capture_queue)
+        }
+        SampleFormat::F32 => {
+            build_echo_input::<f32>(&input, input_config, input_channels, capture_queue)
+        }
+        SampleFormat::F64 => {
+            build_echo_input::<f64>(&input, input_config, input_channels, capture_queue)
+        }
+        other => {
+            return Err(AudioError::UnsupportedFormat(format!(
+                "{other} is not a format this build can read"
+            )));
+        }
+    }?;
+    input_stream
+        .play()
+        .map_err(|e| AudioError::Backend(e.to_string()))?;
+
+    let playback = EchoPlayback::new(input_rate, output_rate);
+    let output_stream = match output_format {
+        SampleFormat::I8 => build_echo_output::<i8>(
+            &output,
+            output_config,
+            output_channels,
+            queue.clone(),
+            playback,
+        ),
+        SampleFormat::I16 => build_echo_output::<i16>(
+            &output,
+            output_config,
+            output_channels,
+            queue.clone(),
+            playback,
+        ),
+        SampleFormat::I32 => build_echo_output::<i32>(
+            &output,
+            output_config,
+            output_channels,
+            queue.clone(),
+            playback,
+        ),
+        SampleFormat::I64 => build_echo_output::<i64>(
+            &output,
+            output_config,
+            output_channels,
+            queue.clone(),
+            playback,
+        ),
+        SampleFormat::U8 => build_echo_output::<u8>(
+            &output,
+            output_config,
+            output_channels,
+            queue.clone(),
+            playback,
+        ),
+        SampleFormat::U16 => build_echo_output::<u16>(
+            &output,
+            output_config,
+            output_channels,
+            queue.clone(),
+            playback,
+        ),
+        SampleFormat::U32 => build_echo_output::<u32>(
+            &output,
+            output_config,
+            output_channels,
+            queue.clone(),
+            playback,
+        ),
+        SampleFormat::U64 => build_echo_output::<u64>(
+            &output,
+            output_config,
+            output_channels,
+            queue.clone(),
+            playback,
+        ),
+        SampleFormat::F32 => build_echo_output::<f32>(
+            &output,
+            output_config,
+            output_channels,
+            queue.clone(),
+            playback,
+        ),
+        SampleFormat::F64 => build_echo_output::<f64>(
+            &output,
+            output_config,
+            output_channels,
+            queue.clone(),
+            playback,
+        ),
+        other => {
+            return Err(AudioError::UnsupportedFormat(format!(
+                "{other} is not a format this build can write"
+            )));
+        }
+    }?;
+    output_stream
+        .play()
+        .map_err(|e| AudioError::Backend(e.to_string()))?;
+
+    // The test runs for its time.
+    std::thread::sleep(Duration::from_secs_f64(seconds.max(0.1)));
+
+    // Dropping the streams closes the devices — a device is a shared
+    // resource, and the next call needs it.
+    drop(input_stream);
+    drop(output_stream);
+
+    let mut report = queue.report();
+    report.microphone = microphone_name;
+    report.speaker = speaker_name;
+    Ok(report)
+}
+
 /// Play a short tone through the speaker.
 ///
 /// This is the "test sound" of the settings page: it says whether the
@@ -1287,6 +1646,31 @@ impl Playback {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_echo_queue_keeps_its_bound_and_the_peak() {
+        // The queue between the microphone and the speaker holds two
+        // seconds, and it remembers how loud it got.
+        let queue = EchoQueue::new(8_000);
+
+        queue.push(&[0.1, -0.5, 0.2]);
+        let report = queue.report();
+        assert_eq!(report.samples, 3);
+        assert!(
+            (report.peak - 0.5).abs() < 0.0001,
+            "the peak is wrong: {}",
+            report.peak
+        );
+
+        // Three seconds of samples do not all stay.
+        queue.push(&vec![0.01f32; 8_000 * 3]);
+        assert_eq!(
+            queue.take(8_000 * 3).len(),
+            8_000 * 2,
+            "the queue grew past its bound"
+        );
+        assert_eq!(queue.report().samples, 3 + 8_000 * 3);
+    }
 
     #[test]
     fn a_resampler_at_the_same_rate_is_a_pass_through() {

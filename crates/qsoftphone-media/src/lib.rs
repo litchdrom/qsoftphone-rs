@@ -62,8 +62,8 @@ pub mod jitter;
 pub mod rtp;
 
 pub use audio::{
-    AudioError, AudioState, DeviceInfo, REMOTE_SESSION_HINT, REMOTE_SESSION_MIC_HINT, devices,
-    is_remote_session, play_test_sound,
+    AudioError, AudioState, DeviceInfo, EchoReport, REMOTE_SESSION_HINT, REMOTE_SESSION_MIC_HINT,
+    devices, is_remote_session, play_echo_test, play_test_sound,
 };
 pub use codec::Codec;
 pub use rtp::RtpSocket;
