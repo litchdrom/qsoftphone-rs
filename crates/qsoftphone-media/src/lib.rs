@@ -52,7 +52,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
@@ -78,9 +78,16 @@ const READ_TIMEOUT: Duration = Duration::from_millis(5);
 
 /// How many frames may wait in the jitter buffer.
 ///
-/// Five frames is 100 ms — a little more than the playout delay, so
-/// that a burst of packets has somewhere to go.
-const MAX_JITTER_FRAMES: usize = 5;
+/// Twelve frames are 240 ms — enough to hold a burst. A peer whose
+/// packets arrive in a clump (a PBX that echoes from a buffer, or a
+/// path that holds them) sends ten or more at once, and a buffer that
+/// is shallower than the burst throws the excess away: the frames are
+/// dropped on our side and have to be concealed, which is a hole in
+/// the audio that no amount of decoding can fill in.
+///
+/// The delay of the call is a different thing — that is the playout
+/// delay, and it is kept small on purpose.
+const MAX_JITTER_FRAMES: usize = 12;
 
 /// How long one frame of audio is.
 ///
@@ -91,6 +98,15 @@ const MAX_JITTER_FRAMES: usize = 5;
 /// The sender waits this long for each frame, so it is the clock the
 /// RTP runs on when there is no microphone to run it.
 const FRAME_PERIOD: Duration = Duration::from_millis(20);
+
+/// How long the sender sleeps when the next frame of silence is not due
+/// yet.
+///
+/// Short on purpose: Windows' timers are coarse, and a long sleep
+/// overshoots the deadline. The sender sends the frames that are due
+/// when it wakes, so the clock stays right either way — but it wakes
+/// more often, and it stops when it is told to.
+const SILENCE_POLL: Duration = Duration::from_millis(2);
 
 /// What the media of a call should be.
 #[derive(Debug, Clone)]
@@ -170,6 +186,19 @@ pub struct MediaStatus {
     /// before the sound card. Zero means the audio stopped somewhere
     /// between the peer's packet and the speaker.
     pub played_peak: f32,
+    /// How many frames the peer never sent.
+    ///
+    /// The holes in the peer's sequence numbers. Zero means the path
+    /// carried everything; a number that grows means the audio is
+    /// being dropped on the way here, which with a stateful codec
+    /// (G.722) is worse than it sounds — every lost frame puts the
+    /// decoder at the other end out of step.
+    pub peer_lost: usize,
+    /// How many frames the peer did send.
+    ///
+    /// The other half of [`MediaStatus::peer_lost`]: the two together
+    /// say how much of the peer's audio the path carried.
+    pub peer_received: usize,
 }
 
 impl MediaStatus {
@@ -594,6 +623,8 @@ impl MediaSession {
             incoming_level: self.inner.state.inbound_level(),
             outgoing_peak: self.inner.state.outbound_peak(),
             played_peak: self.inner.state.played_peak(),
+            peer_lost: self.inner.state.frames_lost(),
+            peer_received: self.inner.state.frames_received(),
         }
     }
 }
@@ -638,6 +669,7 @@ fn log_the_call(state: &AudioState) {
     let underruns = state.playout_underruns();
     let sent = state.frames_sent();
     let sent_silence = state.frames_sent_silence();
+    let lost = state.frames_lost();
     // How loud it was, in both directions. A call that received plenty
     // and heard nothing is a call the peer was silent on, and a call
     // that sent plenty and was heard as nothing is a call our
@@ -657,6 +689,7 @@ fn log_the_call(state: &AudioState) {
         sent,
         sent_silence,
         concealed,
+        lost,
         underruns,
         incoming_peak = incoming,
         outgoing_peak = outgoing,
@@ -687,6 +720,18 @@ fn sender_loop(
     // stays in step with the decoder at the other end.
     let mut encoder = codec.encoder();
 
+    // When the next frame of silence is due.
+    //
+    // This matters more than it looks. Windows' timers are coarse — a
+    // 20 ms wait can take 31 ms — and a sender that simply waits
+    // 20 ms between frames therefore runs the RTP clock at half
+    // speed: the peer hears our voice stretched and full of holes,
+    // and its jitter buffer drops what we send. So the frames are
+    // sent when they are **due**, and a frame that is overdue is sent
+    // at once: the clock then stays in step with the wall clock, even
+    // though the waits are coarse.
+    let mut due = Instant::now() + FRAME_PERIOD;
+
     while !stop.load(Ordering::Relaxed) {
         match state.wait_for_outbound(FRAME_PERIOD) {
             Some(frame) => {
@@ -695,6 +740,9 @@ fn sender_loop(
                 } else {
                     state.count_frame_sent(false);
                 }
+                // The capture is the clock when there is one: its frames
+                // arrive when the sound card hands them over.
+                due = Instant::now() + FRAME_PERIOD;
             }
             None => {
                 if state.has_microphone() {
@@ -703,12 +751,23 @@ fn sender_loop(
                     continue;
                 }
                 // There is no microphone, so no frame is ever coming.
-                // The call still has to send.
-                let frame = encoder.encode_silence();
-                if let Err(e) = sender.send_frame(&frame) {
-                    warn!(error = %e, "an RTP packet could not be sent");
-                } else {
+                // The call still has to send, and it has to send on
+                // time.
+                let now = Instant::now();
+                if now < due {
+                    std::thread::sleep((due - now).min(SILENCE_POLL));
+                    continue;
+                }
+                // Every frame that is due is sent now, so that a coarse
+                // wait does not turn into a slow clock.
+                while due <= Instant::now() {
+                    let frame = encoder.encode_silence();
+                    if let Err(e) = sender.send_frame(&frame) {
+                        warn!(error = %e, "an RTP packet could not be sent");
+                        break;
+                    }
                     state.count_frame_sent(true);
+                    due += FRAME_PERIOD;
                 }
             }
         }
@@ -747,11 +806,19 @@ fn receiver_loop(
                     continue;
                 }
                 state.count_frame_received();
+                let lost_before = jitter.lost();
                 jitter.push(jitter::Frame {
                     sequence: packet.sequence_number,
                     timestamp: packet.timestamp,
                     payload: packet.payload,
                 });
+                // The holes in the peer's sequence numbers are the
+                // frames that never arrived. They are the peer's loss,
+                // and they are told apart from the frames we hid.
+                let lost_after = jitter.lost();
+                if lost_after > lost_before {
+                    state.count_frames_lost(lost_after - lost_before);
+                }
             }
             Ok(None) => {
                 // Not an RTP packet. Ignore it.
@@ -917,6 +984,45 @@ mod tests {
         assert!(
             frames >= 3,
             "only {frames} frames arrived in half a second — the clock is not running"
+        );
+
+        session.stop();
+    }
+
+    #[test]
+    fn a_call_with_no_microphone_runs_the_clock_at_the_right_rate() {
+        // The RTP clock has to run at fifty frames a second. A sender
+        // that waits twenty milliseconds between the frames does not
+        // manage that on Windows, where the timers are coarse and a
+        // twenty millisecond wait can take thirty-one — and then the
+        // peer hears our voice stretched and full of holes.
+        let session = MediaSession::new(&MediaConfig::default()).expect("a session");
+
+        let listener = std::net::UdpSocket::bind("127.0.0.1:0").expect("listener");
+        listener
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("timeout");
+        let port = listener.local_addr().expect("addr").port();
+
+        session.set_remote("127.0.0.1", port).expect("remote");
+        session.start_transport();
+
+        let mut buffer = [0u8; 1500];
+        let mut frames = 0;
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_millis(1000) {
+            if listener.recv_from(&mut buffer).is_ok() {
+                frames += 1;
+            }
+        }
+        let rate = frames as f64 / started.elapsed().as_secs_f64();
+
+        // Fifty frames a second is twenty milliseconds each. Some room
+        // for a machine that is busy, and a rate that a clock running
+        // at half speed could never reach.
+        assert!(
+            rate >= 40.0,
+            "the clock ran at {rate:.1} frames a second — it has to be fifty"
         );
 
         session.stop();

@@ -2549,6 +2549,162 @@ No new crate.
 
 ---
 
+## M4.12 — The codec the peer chose, and the frames that never came
+
+### What the user reported
+
+> Red is sent blue returning from rcho test. It's really weird. For test I
+> use microsip with the same server - nice loud returning from asterisk
+> echo. No issues at all.
+
+MicroSIP, the same PBX, the same machine, the same extension: a loud,
+clean echo. This app: the echo comes back, and it is broken.
+
+### What was measured, on the user's own PBX
+
+Everything below is a measurement. The `--call` diagnostic (M4.11) is
+what made them possible: it places a call, runs for a given number of
+seconds, and prints the numbers.
+
+**Our sending is textbook-correct.** A dump of every packet that went
+out, over twenty seconds: fifty frames a second, the sequence number up
+by one every time, the timestamp up by 160, a hundred and sixty byte
+payload, **zero** sequence gaps.
+
+**The path carries what we send.** A 1 kHz tone injected where the
+microphone's samples go in comes back out of the speaker at the same
+level — correlation 0.999 — so nothing in the app is attenuating the
+audio.
+
+**And yet a quarter of the peer's frames never arrive.** Over a
+twenty-second call: 1050 frames sent, 829 received, 206 lost. The
+peer's own stream has holes in it — the sequence numbers jump by two
+and by three — so the frames are gone before they reach us.
+
+**It is not our receiving thread.** It spends 97 % of its time blocked
+in the socket read, waiting for packets that do not come.
+
+**It is not the codec.** A PCMA call loses the same 20–29 %.
+
+**It is not the marker bit.** RFC 3551 §5.1 reserves it for the first
+packet of a talkspurt and the packetizer sets it on every frame, which
+is wrong — but clearing it changes nothing: 74 % either way.
+
+**It is not our send timing.** A sender paced by a timer instead of by
+the sound card, with a completely different shape of gaps, loses the
+same.
+
+### The bug: the peer chose the codec
+
+`parse_answer` took **the first format in the peer's answer** that this
+build speaks. Asterisk answers `m=audio 50026 RTP/AVP 9 8 0` — G.722
+first — whatever the offer said, so every call landed on G.722, and the
+user's own preference (`PCMA` first) was never consulted.
+
+That matters because **G.722 is a stateful codec**. It is ADPCM, and it
+keeps a state: the decoder at the other end has to see every frame, in
+order, from the first one. A frame the network loses does not leave a
+hole in the audio — it leaves the decoder out of step, and **everything
+after it is noise** for the rest of the call.
+
+G.711 does not have that problem. It is a lookup table: a lost frame is
+a lost frame, and the next one is fine.
+
+So the same 20 % of frames that the path drops costs a G.711 call a
+dropout every half second, and costs a G.722 call a ruined conversation.
+**MicroSIP asks for G.711 and gets a loud, clean echo; this app was
+being pushed onto G.722 and was getting noise.**
+
+The fix is one loop: the codec we use is the one **we** prefer among the
+answer's formats.
+
+```rust
+for wanted in codecs {
+    for format in &media.formats {
+        ...
+        if codec != *wanted { continue; }
+        return Some(Answer { codec, ... });
+    }
+}
+```
+
+RFC 3264 §5.1 says the offer lists the formats in order of preference
+and §6.1 asks the answerer to keep that order — but a peer that does
+not keep it must not take the choice away from us. pjsip does the same
+thing, and so does the C++: its comment says it, "the codec priority is
+the single mechanism pjsip uses to decide which codec to put first in
+the SDP offer/answer".
+
+**The call now negotiates PCMA against the user's own Asterisk**, and
+the echo comes back at the level we sent it.
+
+### The bursts, and the jitter buffer
+
+The peer's packets do not arrive one at a time every 20 ms. They arrive
+in **clumps** — the median gap between two arriving packets is under a
+millisecond — with gaps of up to half a second in between.
+
+The jitter buffer held **five** frames. A clump of ten overflows it, and
+the overflow drops the oldest frames *on our side*: they have to be
+concealed, and a concealment is a hole in the audio that no amount of
+decoding fills in.
+
+It holds **twelve** frames now, which is enough for a clump, and the
+number of concealed frames fell from 435 to 233 — the frames that are
+genuinely missing, and no more. The *playout* delay went from 80 ms to
+120 ms, which is the delay of the call; the holding area for a clump is
+a different thing, and it costs nothing.
+
+### The frames that never came are now counted
+
+The holes in the peer's sequence numbers are counted, and they are told
+apart from the frames we hid ourselves. The call row says so:
+
+> The path is dropping the audio: 206 of the peer's 1035 frames never
+> arrived (20 %).
+
+And with G.722 it adds why that is worse than it sounds:
+
+> G.722 keeps a state, so every lost frame leaves the peer's decoder
+> out of step — G.711 would only drop out.
+
+A quiet peer and a path that drops the audio sound the same to the ear.
+Now they do not look the same on the screen.
+
+### The clock, when there is no microphone
+
+A call with no microphone has to send anyway: the RTP clock is what
+tells the peer the call is alive. The sender made the silence itself,
+on the frame clock — and it ran at **31 frames a second instead of 50**.
+
+Windows' timers are coarse: a twenty millisecond wait can take
+thirty-one. The sender waited twenty milliseconds between the frames,
+so the RTP clock ran at half speed, and the peer heard our voice
+stretched and full of holes.
+
+The frames are now sent when they are **due**, and a frame that is
+overdue is sent at once, so the clock stays in step with the wall clock
+even though the waits are coarse. Measured: fifty frames a second.
+
+### The dependency cost: nothing
+
+No new crate.
+
+### What is *not* in M4.12
+
+* **The lost frames are not repaired.** They are gone, and no amount of
+  buffering brings them back. The app says how many there were.
+* **The peer's codec is still the peer's business.** We ask for G.711
+  first and use it when the answer allows it; a PBX that answers with
+  G.722 only gets G.722.
+* **The diagnosis does not blame the network.** It says the frames did
+  not arrive; whether the path dropped them or the PBX never sent them
+  is not something this side of the call can tell.
+* **The microphone is still not fixed by this.** A silent microphone is
+  still a silent microphone — the call row says so in its own words.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -2589,6 +2745,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M4.9** | The microphone tells the truth, and the calls are the ones that are up: the echo test has a level meter and says the level in decibels, a call says how many frames it sent, and the call page lists only the calls that are up | **done** |
 | **M4.10** | The details are under the row they belong to: the history table is drawn by hand with fixed columns, an expanded row opens its details **under itself** instead of below the whole table, and the table fits the window | **done** |
 | **M4.11** | Where the silence is: the call row carries a live peer meter, the three levels in decibels, and a sentence that names the place the silence is in; the media path is measured end to end against the real PBX | **done** |
+| **M4.12** | The codec the peer chose, and the frames that never came: our own codec preference decides the session, the jitter buffer holds a peer's bursts, the frames that never arrived are counted and said out loud, and the clock runs at fifty frames a second even with no microphone | **done** |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
@@ -2653,7 +2810,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 320 tests, all passing.
+* `cargo test --workspace` — 326 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -2997,6 +3154,24 @@ player lands.
   -45 … -66 dBFS after it, while our side delivers the peer's audio to
   the sound card at -16.7 dBFS — exactly the peer's peak times the 0.8
   speaker gain. See [M4.11](#m411--where-the-silence-is).
+* **The codec we use is the one we prefer.** Measured against the
+  user's own Asterisk: the offer says `RTP/AVP 8 9 0` (PCMA first) and
+  the answer says `RTP/AVP 9 8 0` (G.722 first). Before M4.12 the
+  answer won, and every call was G.722. Now the offer's preference
+  wins, and the same call comes up as **PCMA, payload type 8**.
+* **Our RTP on the wire is textbook.** A dump of every packet over a
+  twenty-second call: fifty frames a second, the sequence number up by
+  one every time, the timestamp up by 160, a hundred and sixty byte
+  payload, **zero** gaps.
+* **The frames the peer never sent are counted, and told apart from the
+  ones we hid.** A call on the user's PBX ends with `received=829
+  sent=1050 lost=206 concealed=233`: 206 frames never arrived, and the
+  233 concealed are the gaps that had to be filled — the two numbers
+  are not the same thing.
+* **The clock runs at fifty frames a second with no microphone.** The
+  test measures the rate over a second and asks for at least forty: a
+  sender that waits twenty milliseconds between the frames runs at
+  thirty-one on Windows, and it did.
 
 **Not verified:**
 
@@ -3016,6 +3191,27 @@ player lands.
   The call row now shows all three numbers while the call is up, so the
   next call answers the question without an argument with a log. See
   [M4.11](#m411--where-the-silence-is).
+* **The echo comes back broken, and the reason is known — but the last
+  step of it is not.** The user's report was that the echo from their
+  Asterisk echo extension arrives garbled, while MicroSIP on the same
+  machine and the same PBX gets a loud, clean one. The cause is
+  measured: the path drops about a fifth of the peer's frames, and this
+  app was being pushed onto **G.722**, whose decoder cannot survive a
+  lost frame. With G.711 — what MicroSIP asks for — the same loss is a
+  dropout, and the echo is clean. See
+  [M4.12](#m412--the-codec-the-peer-chose-and-the-frames-that-never-came).
+  What is **not** settled is *who* drops those frames: the PBX's own
+  jitter buffer gives up on some of ours, and the path may drop the
+  rest. This side cannot tell the two apart — the frames are gone
+  before they reach the socket, and the peer's stream already has the
+  holes in it. **The user's pcap would settle it**, and so would
+  `rtp set debug` on the Asterisk side.
+* **The user's microphone is still silent in every measurement.** The
+  levels say so — `you=0.0015`, about -56 dBFS — and the echo of it
+  comes back at the same level, which is the proof that the path is
+  sound. Whether the microphone is muted in Windows, or the machine
+  picked the wrong device, or the room was simply quiet, is not
+  something this build can see.
 * **The stale call has been proved by reading the code, not by
   hearing it.** The chain is in [M4.5](#m45--the-stale-call-and-the-real-time-callback)
   and every link is checkable: the media was only ever released by the

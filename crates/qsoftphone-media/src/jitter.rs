@@ -71,6 +71,10 @@ pub struct JitterBuffer {
     expected: Option<u16>,
     /// How many frames may wait.
     capacity: usize,
+    /// The highest sequence number that arrived.
+    highest: Option<u16>,
+    /// How many frames never arrived: the gaps in the sequence numbers.
+    lost: usize,
 }
 
 impl JitterBuffer {
@@ -80,6 +84,8 @@ impl JitterBuffer {
             frames: VecDeque::new(),
             expected: None,
             capacity: capacity.max(1),
+            highest: None,
+            lost: 0,
         }
     }
 
@@ -94,6 +100,7 @@ impl JitterBuffer {
             Some(expected) => expected,
             None => {
                 self.expected = Some(frame.sequence);
+                self.highest = Some(frame.sequence);
                 self.insert(frame);
                 return true;
             }
@@ -111,6 +118,28 @@ impl JitterBuffer {
             .any(|held| held.sequence == frame.sequence)
         {
             return false;
+        }
+
+        // A frame that is ahead of everything we have: the frames in
+        // between never arrived. That is the peer's loss, and it is
+        // worth counting — it is the difference between a quiet peer
+        // and a path that is dropping the audio on the floor.
+        //
+        // A frame that fills one of those holes takes the count back
+        // again: it was late, not lost, and the playout is still
+        // waiting for it.
+        match self.highest {
+            Some(highest) if is_after(frame.sequence, highest) => {
+                self.lost += frame.sequence.wrapping_sub(highest).wrapping_sub(1) as usize;
+                self.highest = Some(frame.sequence);
+            }
+            Some(highest) if frame.sequence != highest => {
+                self.lost = self.lost.saturating_sub(1);
+            }
+            Some(_) => {}
+            None => {
+                self.highest = Some(frame.sequence);
+            }
         }
 
         self.insert(frame);
@@ -162,6 +191,17 @@ impl JitterBuffer {
     /// How many frames are waiting.
     pub fn depth(&self) -> usize {
         self.frames.len()
+    }
+
+    /// How many frames the peer never sent.
+    ///
+    /// The gaps in the sequence numbers: the peer numbered every frame
+    /// it sends, so a hole is a frame that was lost on the way here.
+    /// This is the number that says whether a call is quiet because
+    /// the other end is quiet, or because the path is dropping the
+    /// audio on the floor.
+    pub fn lost(&self) -> usize {
+        self.lost
     }
 
     /// The sequence number that comes next, if it is known.
@@ -226,6 +266,31 @@ mod tests {
             assert_eq!(f.sequence, expected);
         }
         assert!(buffer.take().is_none(), "the buffer is empty");
+    }
+
+    #[test]
+    fn the_frames_the_peer_never_sent_are_counted() {
+        // The holes in the peer's sequence numbers. This is what says
+        // that the path is dropping the audio, as opposed to the peer
+        // having nothing to say.
+        let mut buffer = JitterBuffer::new(10);
+        buffer.push(frame(1));
+        buffer.push(frame(4));
+        assert_eq!(buffer.lost(), 2, "the frames 2 and 3 were not counted");
+        buffer.push(frame(5));
+        assert_eq!(buffer.lost(), 2, "a frame that arrived was counted as lost");
+    }
+
+    #[test]
+    fn a_frame_that_is_late_is_not_a_frame_that_was_lost() {
+        // The frame that turns up after the playout moved on was late,
+        // not lost: the peer sent it, and nothing is missing.
+        let mut buffer = JitterBuffer::new(10);
+        buffer.push(frame(1));
+        buffer.push(frame(3));
+        buffer.take().expect("frame 1");
+        buffer.push(frame(2));
+        assert_eq!(buffer.lost(), 0, "a late frame was counted as lost");
     }
 
     #[test]

@@ -2479,6 +2479,30 @@ fn silence_diagnosis(status: &qsoftphone_media::MediaStatus) -> Option<String> {
     if status.speaker_muted {
         return Some("The speaker is muted.".to_string());
     }
+    // The path is losing the audio. This is said before the levels,
+    // because it is the reason the levels are what they are: a peer
+    // whose frames are being dropped is not a quiet peer.
+    //
+    // And with G.722 it is worse than a dropout. That codec is ADPCM
+    // and it keeps a state, so one lost frame leaves the decoder at
+    // the other end out of step, and everything after it is noise.
+    // G.711 loses a frame and carries on.
+    let lost = status.peer_lost;
+    let total = lost + status.peer_received;
+    if total > 0 && lost * 10 >= total {
+        let percent = lost * 100 / total;
+        let mut sentence = format!(
+            "The path is dropping the audio: {lost} of the peer's {total} frames never arrived \
+             ({percent}%)."
+        );
+        if status.codec == qsoftphone_media::Codec::G722 {
+            sentence.push_str(
+                " G.722 keeps a state, so every lost frame leaves the peer's decoder out of \
+                 step — G.711 would only drop out.",
+            );
+        }
+        return Some(sentence);
+    }
     if status.incoming_peak <= 1e-6 {
         return Some(
             "The peer is sending silence — there is nothing on the line to hear.".to_string(),
@@ -3561,6 +3585,8 @@ mod tests {
             incoming_level,
             outgoing_peak: outgoing,
             played_peak: played,
+            peer_lost: 0,
+            peer_received: 0,
         }
     }
 
@@ -4440,6 +4466,36 @@ mod tests {
         assert!(
             number.1 <= after.0,
             "the meter's number is painted over the next thing: {number:?} and {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_that_drops_the_audio_says_so() {
+        // The user's line: the echo comes back, but broken. The frames
+        // the peer sent are not all there, and that is the fact that
+        // explains it — and with G.722 it is worse than a dropout.
+        let mut status = media_status(0.2, 0.2, 0.2);
+        status.peer_lost = 216;
+        status.peer_received = 574;
+        let said = silence_diagnosis(&status).expect("a broken call says something");
+        assert!(
+            said.contains("dropping the audio"),
+            "the path was dropping the audio and the app did not say so: {said}"
+        );
+        assert!(
+            said.contains("G.722"),
+            "the stateful codec was not mentioned: {said}"
+        );
+
+        // A call where the path carries everything says nothing about
+        // it.
+        let mut good = media_status(0.2, 0.2, 0.2);
+        good.peer_lost = 1;
+        good.peer_received = 574;
+        assert!(
+            silence_diagnosis(&good).is_none(),
+            "a call with one lost frame complained: {:?}",
+            silence_diagnosis(&good)
         );
     }
 

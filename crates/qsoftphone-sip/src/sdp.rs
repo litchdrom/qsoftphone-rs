@@ -334,23 +334,37 @@ pub fn parse_answer(answer: &[u8], codecs: &[Codec]) -> Option<Answer> {
         return None;
     }
 
-    // The peer may have chosen a codec this build does not speak.
-    // There is nothing to do about that: the call stays up, and the
-    // media stays silent.
-    for format in &media.formats {
-        let Some(codec) = Codec::from_payload_type(format.payload_type, Some(&format.encoding))
-        else {
-            continue;
-        };
-        if !codecs.contains(&codec) {
-            continue;
+    // The peer may answer with several formats. Which one we use is
+    // **our** choice, and not the peer's: RFC 3264 §5.1 says that the
+    // offer lists the formats in order of preference, and §6.1 asks the
+    // answerer to keep that order — but a peer that does not keep it
+    // must not be allowed to take the choice away from us.
+    //
+    // Asterisk is such a peer: it answers with G.722 first whatever
+    // the offer said, and a G.722 stream is a stateful one — a single
+    // frame the network loses puts the decoder at the other end out of
+    // step for the rest of the call, and everything after it is noise.
+    // G.711 does not have that problem, and it is what every other
+    // phone asks for.
+    //
+    // pjsip does the same thing: the local codec priority is the one
+    // mechanism that decides which codec ends up in the session.
+    for wanted in codecs {
+        for format in &media.formats {
+            let Some(codec) = Codec::from_payload_type(format.payload_type, Some(&format.encoding))
+            else {
+                continue;
+            };
+            if codec != *wanted {
+                continue;
+            }
+            return Some(Answer {
+                codec,
+                payload_type: format.payload_type,
+                address: media.address.clone()?,
+                port: media.port,
+            });
         }
-        return Some(Answer {
-            codec,
-            payload_type: format.payload_type,
-            address: media.address.clone()?,
-            port: media.port,
-        });
     }
 
     None
@@ -742,6 +756,47 @@ a=rtpmap:9 G722/8000\r\n";
         assert_eq!(parsed.codec, Codec::G722);
         assert_eq!(parsed.payload_type, 9);
         assert_eq!(parsed.port, 5000);
+    }
+
+    #[test]
+    fn the_peer_does_not_get_to_choose_the_codec() {
+        // Asterisk answers with G.722 first, whatever the offer said.
+        // Our own preference decides, and G.711 comes first — a G.722
+        // stream is a stateful one, and a single frame the network
+        // loses puts the decoder at the other end out of step for the
+        // rest of the call.
+        let answer = "v=0\r\n\
+o=- 1 1 IN IP4 10.0.0.1\r\n\
+s=-\r\n\
+c=IN IP4 10.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 5000 RTP/AVP 9 8 0\r\n\
+a=rtpmap:9 G722/8000\r\n\
+a=rtpmap:8 PCMA/8000\r\n\
+a=rtpmap:0 PCMU/8000\r\n";
+        let parsed = parse_answer(answer.as_bytes(), &codecs()).expect("an answer");
+        assert_eq!(parsed.codec, Codec::Pcmu);
+        assert_eq!(parsed.payload_type, 0);
+        assert_eq!(parsed.port, 5000);
+    }
+
+    #[test]
+    fn our_own_order_decides_and_not_the_peers() {
+        // The same answer, and a preference that puts G.722 first: now
+        // G.722 is what the call uses.
+        let answer = "v=0\r\n\
+o=- 1 1 IN IP4 10.0.0.1\r\n\
+s=-\r\n\
+c=IN IP4 10.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 5000 RTP/AVP 9 8 0\r\n\
+a=rtpmap:9 G722/8000\r\n\
+a=rtpmap:8 PCMA/8000\r\n\
+a=rtpmap:0 PCMU/8000\r\n";
+        let preference = vec![Codec::G722, Codec::Pcma, Codec::Pcmu];
+        let parsed = parse_answer(answer.as_bytes(), &preference).expect("an answer");
+        assert_eq!(parsed.codec, Codec::G722);
+        assert_eq!(parsed.payload_type, 9);
     }
 
     #[test]

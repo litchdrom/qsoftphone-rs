@@ -63,13 +63,18 @@ const MAX_INBOUND_FRAMES: usize = 100;
 ///
 /// This is the jitter delay: the audio waits in the machine for this
 /// long before it reaches the speaker, so that a late packet does not
-/// leave a hole in it. Four frames are 80 ms — the same range as
-/// Asterisk's own jitter buffer.
+/// leave a hole in it. Six frames are 120 ms — the same range as
+/// Asterisk's own jitter buffer, and a little more than pjsip's
+/// default.
 ///
 /// It is a trade: the deeper the buffer, the more jitter it absorbs,
-/// and the longer the delay. 80 ms of delay in a call is not
+/// and the longer the delay. 120 ms of delay in a call is not
 /// noticeable; a hole in the audio is.
-const PLAYOUT_FRAMES: usize = 4;
+///
+/// The *holding* area for a peer's bursts is a different thing — that
+/// is the jitter buffer, and it is much deeper, because holding a
+/// burst costs nothing and dropping one costs a hole.
+const PLAYOUT_FRAMES: usize = 6;
 
 /// Whether this is a remote session.
 ///
@@ -248,6 +253,13 @@ pub struct AudioState {
     /// itself: a call that ended in silence says so here, instead of
     /// having to be guessed at from the outside.
     frames_concealed: AtomicUsize,
+    /// How many frames the peer never sent.
+    ///
+    /// The gaps in the peer's sequence numbers. A peer that is quiet
+    /// sends silence and this stays at zero; a path that drops the
+    /// audio on the floor leaves holes in the numbering, and this is
+    /// what says so.
+    frames_lost: AtomicUsize,
     /// Whether there is a microphone to capture from.
     ///
     /// A call with no microphone still has to **send**: the RTP clock
@@ -317,6 +329,7 @@ impl AudioState {
             frames_sent: AtomicUsize::new(0),
             frames_sent_silence: AtomicUsize::new(0),
             frames_concealed: AtomicUsize::new(0),
+            frames_lost: AtomicUsize::new(0),
             has_microphone: AtomicBool::new(false),
             inbound_peak: AtomicU32::new(0),
             inbound_level: AtomicU32::new(0),
@@ -588,6 +601,20 @@ impl AudioState {
     /// Count a frame that never arrived.
     pub(crate) fn count_frame_concealed(&self) {
         self.frames_concealed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many frames the peer never sent.
+    ///
+    /// The gaps in the sequence numbers. A peer that is quiet sends
+    /// silence; a path that drops the audio sends nothing at all, and
+    /// the two look the same to the ear — so they are counted apart.
+    pub fn frames_lost(&self) -> usize {
+        self.frames_lost.load(Ordering::Relaxed)
+    }
+
+    /// Count the frames that never arrived.
+    pub(crate) fn count_frames_lost(&self, count: usize) {
+        self.frames_lost.fetch_add(count, Ordering::Relaxed);
     }
 
     /// How many frames went out to the peer.
@@ -2122,8 +2149,10 @@ mod tests {
         state.set_frame_samples(160);
         let mut playback = Playback::new(8000, 8000);
 
-        // Enough to prime the playout.
-        state.push_inbound(&vec![8192i16; 800]);
+        // Enough to prime the playout: the buffer has to reach its target
+        // before the speaker is driven, and then there has to be
+        // something left to play.
+        state.push_inbound(&vec![8192i16; PLAYOUT_FRAMES * 160 + 800]);
         playback.begin(&state);
         for _ in 0..100 {
             playback.next(&state);
@@ -2391,7 +2420,7 @@ mod tests {
 
         let frame = vec![1000i16; 160];
         // Fill the buffer to its target.
-        for _ in 0..4 {
+        for _ in 0..PLAYOUT_FRAMES {
             state.push_inbound(&frame);
         }
 
@@ -2427,7 +2456,7 @@ mod tests {
         let mut playback = Playback::new(8000, 8000);
 
         let frame = vec![1000i16; 160];
-        for _ in 0..4 {
+        for _ in 0..PLAYOUT_FRAMES {
             state.push_inbound(&frame);
         }
 
@@ -2606,7 +2635,7 @@ mod tests {
 
         let frame = vec![1000i16; 160];
         // Fill the buffer to its target.
-        for _ in 0..4 {
+        for _ in 0..PLAYOUT_FRAMES {
             state.push_inbound(&frame);
         }
 
