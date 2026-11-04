@@ -20,3 +20,9 @@ cpal = { workspace = true }
 nanoaudio-g722 = "0.1.1"
 rtc = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# The test that counts the log lines needs a subscriber to write them
+# into. `tracing-subscriber` is already in the tree — the core and the
+# sip crate use it — so naming it here adds no package.
+tracing-subscriber = { workspace = true }

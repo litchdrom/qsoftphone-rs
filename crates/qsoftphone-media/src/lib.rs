@@ -285,6 +285,13 @@ struct MediaInner {
     speaker_name: Mutex<Option<String>>,
     /// The threads and the devices.
     running_parts: Mutex<Option<Running>>,
+    /// Whether the call's numbers have been said.
+    ///
+    /// The call is logged when the media stops, and again when the
+    /// session is dropped — and the session is dropped right after it
+    /// stops. One flag, so the log says what happened **once**: a log
+    /// that says every call ended twice is a log nobody can count.
+    logged: AtomicBool,
 }
 
 /// The threads and the devices of a running session.
@@ -326,6 +333,7 @@ impl MediaSession {
                 microphone_name: Mutex::new(None),
                 speaker_name: Mutex::new(None),
                 running_parts: Mutex::new(None),
+                logged: AtomicBool::new(false),
             }),
         })
     }
@@ -602,8 +610,14 @@ impl MediaSession {
     /// peer sent, how many never arrived, and how many samples of
     /// silence the speaker had to play. Without this, a broken call is
     /// a thing that has to be guessed at from the outside.
+    ///
+    /// It is said **once**: the media stops, and the session is
+    /// dropped right after it, and a log that says every call ended
+    /// twice is a log nobody can count.
     fn log_the_call(&self) {
-        log_the_call(&self.inner.state);
+        if !self.inner.logged.swap(true, Ordering::Relaxed) {
+            log_the_call(&self.inner.state);
+        }
     }
 
     /// Whether the audio is running.
@@ -670,8 +684,11 @@ impl Drop for MediaInner {
         }
         // The session may be dropped without `stop()` being called —
         // when the account is unregistered in the middle of a call —
-        // and the call's numbers have to be said either way.
-        log_the_call(&self.state);
+        // and the call's numbers have to be said either way. When it
+        // was stopped, they have already been said.
+        if !self.logged.swap(true, Ordering::Relaxed) {
+            log_the_call(&self.state);
+        }
     }
 }
 

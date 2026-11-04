@@ -3448,6 +3448,7 @@ dependencies = [
  "nanoaudio-g722",
  "rtc",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -3018,6 +3018,55 @@ gain — it was only never applied.
 
 ---
 
+## M4.16 — The call is said once
+
+### What the log showed
+
+The user's own log, read to see whether the sound card was free after
+a call, said this:
+
+```text
+the call's media stopped received=199 sent=212 ... lost=0 underruns=0
+the call's media stopped received=199 sent=212 ... lost=0 underruns=0
+```
+
+The same call, twice.
+
+### Why
+
+The media says what the call did when it **stops**, and the session is
+**dropped** right after it stops — and the drop says it again, because
+the drop is the safety net for a session that was never stopped (the
+account is unregistered in the middle of a call, and the numbers still
+have to be said).
+
+Both were right on their own and wrong together: `stop()` always runs
+before the drop, so every call was written twice.
+
+### The fix
+
+One flag on the session: the first of the two to speak says it, and
+the other is silent. The safety net is still there — a session that
+was never stopped still says its numbers when it goes.
+
+The test reads the log the way the other logging test in this
+repository does — a subscriber that keeps what it is given — and counts
+the lines.
+
+### The dependency cost: nothing
+
+No new package. `tracing-subscriber` was already in the tree (the core
+and the sip crate use it); naming it as a **dev**-dependency of the
+media crate adds nothing to the build.
+
+### What is *not* in M4.16
+
+* **The log is not a report.** It is what the media saw, and it is
+  said once, at the end. A call that is still up says nothing about
+  itself until it is over.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -3062,6 +3111,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M4.13** | The two captures, side by side: the user's own pcap, read packet by packet, against MicroSIP's call in the same file — the loss was the environment, the echo is faithful, and the one difference left was the marker bit, which is now set only where a talkspurt starts | **done** |
 | **M4.14** | The echo test comes back: the sound card is busy while a call is **up**, not while one is selected — so the test works again after a call, and the test sound waits for the card instead of playing over a call | **done** |
 | **M4.15** | The volume controls, and the preamp: the microphone gain is applied for the first time, it goes above unity, and both directions have a knob — live on the call page, and as the default in the settings | **done** |
+| **M4.16** | The call is said once: the media logged what the call did when it stopped *and* again when the session was dropped, so every call was in the log twice | **done** |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
@@ -3126,7 +3176,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 340 tests, all passing.
+* `cargo test --workspace` — 342 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
