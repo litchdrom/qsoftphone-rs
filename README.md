@@ -9,7 +9,7 @@ identity resolution, the call event contract, the history rules and
 the transfer construction all have to behave identically, including the
 bugs that have already been fixed there.
 
-**Status: M4.13 complete.** The workspace builds, the test suite passes, the
+**Status: M4.15 complete.** The workspace builds, the test suite passes, the
 app starts and exits cleanly, an account can be registered against a SIP
 registrar with digest authentication (MD5 and SHA-256), and calls can be
 placed and received over that registration — outbound INVITE, inbound
@@ -51,7 +51,10 @@ MicroSIP's call in the same file: there was **no loss at all** in either
 direction, the echo that comes back is a faithful copy of the voice that
 goes out, and the one thing that was different was the **marker bit** —
 set on every single packet, where MicroSIP sets it once. It now marks
-the start of a talkspurt, and nothing else. See
+the start of a talkspurt, and nothing else. The **volume knobs** are
+there too: the microphone's gain is applied for the first time, it goes
+above unity as a preamp, and both directions have a knob — live on the
+call page, and as the default in the settings. See
 [Milestones](#milestones).
 
 ---
@@ -2476,8 +2479,8 @@ The sentences are the ones that can be true:
 | The peer is sending, but it is too quiet to hear | their microphone is muted, too far away, or turned down |
 | The peer is sending audio, but the speaker is getting silence | the sound card is not playing it |
 | The audio reached the speaker, but it is too quiet to hear | turn the speaker volume up |
-| The peer hears nothing | the microphone picked up nothing at all |
-| The microphone is picking up almost nothing | the peer will hear silence |
+| The peer hears nothing | nothing is leaving this machine |
+| The microphone is picking up almost nothing | turn the microphone volume up, or the peer will hear silence |
 
 **The peer is judged on the level now, and not on the peak.** A line that
 carried a beep in the first second and room noise ever since is quiet,
@@ -2923,6 +2926,98 @@ No new crate.
 
 ---
 
+## M4.15 — The volume controls, and the preamp
+
+### What was asked for
+
+> Can we add volume control to output and input (optional some kind of
+> preamp)
+
+And the finding that came with it: the microphone gain was **stored and
+never used**.
+
+### The knob that did nothing
+
+The config has carried `microphoneVolume` since the beginning, and so
+has the media state: `AudioState::mic_gain`, set from
+`MediaConfig::microphone_gain`, read by **nobody**. The capture path
+took the samples as they came and encoded them. The speaker's gain was
+applied; the microphone's was not, so the setting was a number in a
+file that changed nothing.
+
+The C++ reference has the same gap — `microphone_volume` is written to
+its config file and read by nobody there either. What the C++ *does*
+have is a **live in-call volume slider** on the dialer's action bar
+(`VolumeController`: a process-wide factor applied in the playback
+callback), and that is what this build was missing.
+
+So the input volume is applied now, and both directions have a knob.
+
+### The preamp
+
+A gain is a multiplier. Below 1.0 it turns the microphone down; above
+1.0 it is a **preamp** — the microphone turned up, which is what a
+quiet microphone needs.
+
+The knob is in **decibels**: 0 dB is no change at all, and the scale is
+the one every mixing desk and every telephone uses. A gain on its own
+("×1.8") means nothing to a user. (The C++ maps its slider with x²
+instead, which is a rough approximation of the same idea; decibels are
+the scale itself, and they go both ways.)
+
+| | the range | why |
+|---|---|---|
+| Microphone | −40 dB … **+24 dB** | a preamp: the voice louder than the room |
+| Speaker | −40 dB … **+12 dB** | a headphone on a quiet machine is quiet |
+
+The gain is applied to the **samples**, before they are encoded — where
+a level is a level. G.722 has no silence code and G.711's silence code
+is not the same thing as a quiet room; the same is true of a gain.
+
+### Where the knobs are
+
+* **The call page**: the two knobs, next to the mute buttons, where
+  the C++ has its slider. They change the call that is up.
+* **The settings page**: the volume every call *starts* with — and it
+  takes effect at once on the call that is up, because a volume that
+  has to be set again for every call is a volume nobody sets.
+
+The settings are written to the file when the drag **ends**, not on
+every step of it: the file is written on the thread that draws the
+window, and a drag that writes a file sixty times a second is a drag
+that stutters.
+
+### Two numbers, not one
+
+The microphone's own level and what we send are two numbers now:
+
+* `outgoing_peak` — what the microphone picked up. It answers "did the
+  microphone hear anything at all".
+* `sent_peak` — what leaves the machine, after the gain. It answers
+  "what does the peer hear".
+
+The difference between them is the preamp, and the diagnosis asks the
+right one for each question: *"The peer hears nothing: nothing is
+leaving this machine"* is about the sent level, and *"The microphone is
+picking up almost nothing — turn the microphone volume up"* is about
+the microphone's own.
+
+### The dependency cost: nothing
+
+No new crate. egui has the slider, and the media crate already had the
+gain — it was only never applied.
+
+### What is *not* in M4.15
+
+* **The ringtone and the ringback have no knob.** Their volumes are in
+  the config and are not applied either.
+* **The preamp turns the room up with the voice.** It is a gain, not a
+  filter: it cannot separate a quiet voice from a quiet room.
+* **The call page's knobs are not remembered.** The next call starts
+  at the setting in the settings page.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -2966,6 +3061,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M4.12** | The codec the peer chose, and the frames that never came: our own codec preference decides the session, the jitter buffer holds a peer's bursts, the frames that never arrived are counted and said out loud, and the clock runs at fifty frames a second even with no microphone | **done** |
 | **M4.13** | The two captures, side by side: the user's own pcap, read packet by packet, against MicroSIP's call in the same file — the loss was the environment, the echo is faithful, and the one difference left was the marker bit, which is now set only where a talkspurt starts | **done** |
 | **M4.14** | The echo test comes back: the sound card is busy while a call is **up**, not while one is selected — so the test works again after a call, and the test sound waits for the card instead of playing over a call | **done** |
+| **M4.15** | The volume controls, and the preamp: the microphone gain is applied for the first time, it goes above unity, and both directions have a knob — live on the call page, and as the default in the settings | **done** |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
@@ -3030,7 +3126,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 333 tests, all passing.
+* `cargo test --workspace` — 340 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -3403,6 +3499,13 @@ player lands.
 * **The marker bit marks a talkspurt, and only a talkspurt.** The test
   reads the bit off the wire: it is set on the first packet of a stream
   and on the first packet after a silence, and on no other packet.
+* **The microphone gain is applied to the samples.** The test measures
+  the frame the microphone produced: half the gain is half the voice,
+  and four times the gain is four times the voice.
+* **The knobs are where they should be.** The call page has the two
+  knobs next to the mute buttons, and the settings page has the volume
+  every call starts with — and the knob is in decibels, because a gain
+  on its own means nothing to a user.
 
 **Not verified:**
 
@@ -3442,6 +3545,11 @@ player lands.
   the PBX sends it back at the same level. What the machine cannot see
   is the microphone's own state: whether it is muted in Windows, or the
   machine picked the wrong device, or the room was simply quiet.
+* **The volume knobs have not been heard by a user.** The gain is
+  proved by the tests — half the gain is half the voice — and the knobs
+  are on the pages, but nobody has turned one up on a real call yet, so
+  what the peer hears with the preamp at +12 dB is a question the
+  numbers answer and the ear has not.
 * **The stale call has been proved by reading the code, not by
   hearing it.** The chain is in [M4.5](#m45--the-stale-call-and-the-real-time-callback)
   and every link is checkable: the media was only ever released by the

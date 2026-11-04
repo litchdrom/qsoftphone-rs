@@ -121,9 +121,15 @@ pub struct MediaConfig {
     pub microphone: Option<String>,
     /// The speaker to use. `None` is the system default.
     pub speaker: Option<String>,
-    /// The microphone gain, 0.0 to 1.0.
+    /// The microphone gain, as a multiplier.
+    ///
+    /// 1.0 is no change. Above 1.0 is a **preamp** — the microphone
+    /// turned up, which is what a quiet microphone needs — up to
+    /// [`audio::MAX_GAIN`].
     pub microphone_gain: f32,
-    /// The speaker gain, 0.0 to 1.0.
+    /// The speaker gain, as a multiplier.
+    ///
+    /// 1.0 is no change; above 1.0 is the speaker turned up.
     pub speaker_gain: f32,
 }
 
@@ -180,6 +186,20 @@ pub struct MediaStatus {
     ///
     /// Zero means the peer heard nothing from us.
     pub outgoing_peak: f32,
+    /// The loudest sample we **sent**, from 0.0 to 1.0.
+    ///
+    /// The microphone's level after the gain: what the peer hears.
+    /// The two numbers differ as soon as the gain is not 1.0, and the
+    /// difference is the preamp.
+    pub sent_peak: f32,
+    /// The microphone gain, as a multiplier.
+    ///
+    /// 1.0 is no change, and above 1.0 is the microphone turned up.
+    pub microphone_gain: f32,
+    /// The speaker gain, as a multiplier.
+    ///
+    /// 1.0 is no change, and above 1.0 is the speaker turned up.
+    pub speaker_gain: f32,
     /// The loudest sample the **speaker** was given, from 0.0 to 1.0.
     ///
     /// This is after the gain and after the resampler: the last number
@@ -622,6 +642,9 @@ impl MediaSession {
             incoming_peak: self.inner.state.inbound_peak(),
             incoming_level: self.inner.state.inbound_level(),
             outgoing_peak: self.inner.state.outbound_peak(),
+            sent_peak: self.inner.state.sent_peak(),
+            microphone_gain: self.inner.state.mic_gain(),
+            speaker_gain: self.inner.state.speaker_gain(),
             played_peak: self.inner.state.played_peak(),
             peer_lost: self.inner.state.frames_lost(),
             peer_received: self.inner.state.frames_received(),

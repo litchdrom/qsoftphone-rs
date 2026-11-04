@@ -761,6 +761,71 @@ impl QSoftphoneApp {
         }
     }
 
+    /// Set the microphone gain of a call.
+    ///
+    /// This is what the **peer** hears, and it is a multiplier: 1.0 is
+    /// no change and above 1.0 is a preamp.
+    fn set_mic_gain(&mut self, call: &CallView, gain: f32) {
+        if let Err(e) = self
+            .calls
+            .set_mic_gain(&call.account_id, &call.call_id, gain)
+        {
+            self.status = format!("Could not change the microphone volume: {e}");
+        }
+    }
+
+    /// Set the speaker gain of a call.
+    ///
+    /// This is what the **user** hears.
+    fn set_speaker_gain(&mut self, call: &CallView, gain: f32) {
+        if let Err(e) = self
+            .calls
+            .set_speaker_gain(&call.account_id, &call.call_id, gain)
+        {
+            self.status = format!("Could not change the speaker volume: {e}");
+        }
+    }
+
+    /// Set the volume the next call starts with.
+    ///
+    /// The setting is the default for every call, and it takes effect
+    /// at once on the call that is up: a volume that has to be set
+    /// again for every call is a volume nobody sets.
+    fn set_default_volume(&mut self, microphone: Option<f32>, speaker: Option<f32>) {
+        if let Some(gain) = microphone {
+            self.config.audio.microphone_volume = gain;
+        }
+        if let Some(gain) = speaker {
+            self.config.audio.speaker_volume = gain;
+        }
+
+        // The registrar and the call layer share the settings, so the
+        // new default has to be pushed into both.
+        let media = media_config_of(&self.config);
+        self.calls.set_media_config(media);
+
+        // And the call that is up takes it now.
+        if let Some(call) = self.active_call().cloned() {
+            if let Some(gain) = microphone {
+                self.set_mic_gain(&call, gain);
+            }
+            if let Some(gain) = speaker {
+                self.set_speaker_gain(&call, gain);
+            }
+        }
+    }
+
+    /// Write the settings to disk.
+    ///
+    /// The knobs call this when the drag ends, not on every step of
+    /// it: the file is written on the interface thread, and a drag
+    /// that writes a file sixty times a second is a drag that stutters.
+    fn save_settings(&mut self) {
+        if let Err(e) = self.config.save(&self.paths.config_file()) {
+            tracing::warn!(error = %e, "could not persist the volume");
+        }
+    }
+
     /// The codecs the offer lists, in the order they are preferred.
     ///
     /// The C++ let the user pick a codec per call, and the pick was
@@ -1635,6 +1700,32 @@ impl QSoftphoneApp {
                 }
             });
 
+            // The volume, both ways.
+            //
+            // The C++ has an in-call volume slider on the dialer's
+            // action bar, and this is where it belongs here too: the
+            // moment you want to turn it up is while you are talking,
+            // and the knob the peer hears is not the knob you hear.
+            //
+            // The knob shows where the call is now, and the setting is
+            // where it starts — so a call whose media has not started
+            // yet still shows the volume the user chose.
+            let (mic_gain, speaker_gain) = match &status {
+                Some(status) => (status.microphone_gain, status.speaker_gain),
+                None => (
+                    self.config.audio.microphone_volume,
+                    self.config.audio.speaker_volume,
+                ),
+            };
+            let mut mic = gain_in_decibels(mic_gain);
+            if draw_volume_knob(ui, "Mic", &mut mic, MIN_DB..=MAX_MIC_DB).changed() {
+                self.set_mic_gain(&call, gain_from_decibels(mic));
+            }
+            let mut speaker = gain_in_decibels(speaker_gain);
+            if draw_volume_knob(ui, "Speaker", &mut speaker, MIN_DB..=MAX_SPEAKER_DB).changed() {
+                self.set_speaker_gain(&call, gain_from_decibels(speaker));
+            }
+
             // The DTMF keypad is in the header, where it is always
             // visible and does double duty: it dials the number when
             // the app is idle and it sends the tones during a call.
@@ -2252,6 +2343,34 @@ impl QSoftphoneApp {
         ui.weak("A PBX has to be told to allow G.722: allow=g722 on the PJSIP endpoint.");
         ui.add_space(10.0);
 
+        ui.label(egui::RichText::new("VOLUME").strong().size(11.0));
+        ui.separator();
+        ui.weak("What every call starts with. The call page has the knobs that change it while you are talking.");
+        ui.add_space(4.0);
+
+        // The microphone, with the preamp.
+        let mut mic = gain_in_decibels(self.config.audio.microphone_volume);
+        let mic_response = draw_volume_knob(ui, "Microphone", &mut mic, MIN_DB..=MAX_MIC_DB);
+        if mic_response.changed() {
+            self.set_default_volume(Some(gain_from_decibels(mic)), None);
+        }
+        // The speaker.
+        let mut speaker = gain_in_decibels(self.config.audio.speaker_volume);
+        let speaker_response =
+            draw_volume_knob(ui, "Speaker", &mut speaker, MIN_DB..=MAX_SPEAKER_DB);
+        if speaker_response.changed() {
+            self.set_default_volume(None, Some(gain_from_decibels(speaker)));
+        }
+        // The file is written when the drag ends: writing it on every
+        // step of a drag would write it sixty times a second, on the
+        // thread that draws the window.
+        if mic_response.drag_stopped() || speaker_response.drag_stopped() {
+            self.save_settings();
+        }
+        ui.add_space(4.0);
+        ui.weak("Above 0 dB is a preamp: the microphone is turned up, and the room with it.");
+        ui.add_space(10.0);
+
         ui.label(egui::RichText::new("SOUND CARD").strong().size(11.0));
         ui.separator();
 
@@ -2493,6 +2612,70 @@ fn level_text(level: f32) -> String {
 /// noise, and saying so is a true thing to say.
 const TOO_QUIET: f32 = 0.01;
 
+/// The quietest a volume knob goes: -40 dB.
+///
+/// A tenth of the level it started at. Below this the knob is off,
+/// and a knob that goes further only makes the first step smaller.
+const MIN_DB: f32 = -40.0;
+
+/// The loudest the microphone goes: +24 dB.
+///
+/// That is a **preamp**: the microphone turned up until the voice is
+/// louder than the room it is in. Further is not better — the room
+/// comes up with the voice.
+const MAX_MIC_DB: f32 = 24.0;
+
+/// The loudest the speaker goes: +12 dB.
+///
+/// Louder than unity, because a headphone on a quiet machine is
+/// quiet, and the sound card's own volume is not under this app's
+/// control.
+const MAX_SPEAKER_DB: f32 = 12.0;
+
+/// A gain, in decibels.
+///
+/// A gain is a multiplier and a knob is in decibels: 0 dB is no
+/// change at all, and the scale is the one every mixing desk and
+/// every telephone uses.
+fn gain_in_decibels(gain: f32) -> f32 {
+    if gain <= 0.0 {
+        return MIN_DB;
+    }
+    (20.0 * gain.log10()).max(MIN_DB)
+}
+
+/// A gain, from decibels.
+fn gain_from_decibels(decibels: f32) -> f32 {
+    10f32.powf(decibels / 20.0)
+}
+
+/// Draw a volume knob: a slider, and the level it is at.
+///
+/// The slider is the knob and the number beside it is where the knob
+/// is: a gain on its own ("×1.8") means nothing to a user, and
+/// decibels mean something to everybody.
+fn draw_volume_knob(
+    ui: &mut egui::Ui,
+    label: &str,
+    decibels: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let response = ui.add_sized(
+            [110.0, 18.0],
+            egui::Slider::new(decibels, range).show_value(false),
+        );
+        ui.label(
+            egui::RichText::new(format!("{decibels:+.0} dB"))
+                .small()
+                .color(egui::Color32::GRAY),
+        );
+        response
+    })
+    .inner
+}
+
 /// Where the silence is, in a call.
 ///
 /// The three numbers — what the peer sent, what the microphone picked
@@ -2559,14 +2742,17 @@ fn silence_diagnosis(status: &qsoftphone_media::MediaStatus) -> Option<String> {
                 .to_string(),
         );
     }
-    if status.outgoing_peak <= 1e-6 {
-        return Some(
-            "The peer hears nothing: the microphone picked up nothing at all.".to_string(),
-        );
+    if status.sent_peak <= 1e-6 {
+        // Nothing is leaving this machine. Either the microphone heard
+        // nothing at all, or what it heard is being turned down so far
+        // that nothing gets through.
+        return Some("The peer hears nothing: nothing is leaving this machine.".to_string());
     }
     if status.outgoing_peak < TOO_QUIET {
         return Some(
-            "The microphone is picking up almost nothing — the peer will hear silence.".to_string(),
+            "The microphone is picking up almost nothing — turn the microphone volume up, or the \
+             peer will hear silence."
+                .to_string(),
         );
     }
     None
@@ -3615,6 +3801,9 @@ mod tests {
             incoming_peak,
             incoming_level,
             outgoing_peak: outgoing,
+            sent_peak: outgoing,
+            microphone_gain: 1.0,
+            speaker_gain: 1.0,
             played_peak: played,
             peer_lost: 0,
             peer_received: 0,
@@ -4002,6 +4191,97 @@ mod tests {
         assert!(
             text.contains("microphone"),
             "the echo test does not say it plays the microphone:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_gain_is_read_in_decibels() {
+        // A gain on its own means nothing to a user. Decibels mean
+        // something to everybody: 0 dB is no change at all.
+        assert_eq!(gain_in_decibels(1.0), 0.0);
+        assert_eq!(gain_in_decibels(0.0), MIN_DB);
+        assert!((gain_in_decibels(0.5) - -6.02).abs() < 0.01);
+        assert!((gain_in_decibels(2.0) - 6.02).abs() < 0.01);
+
+        // And back the other way.
+        assert!((gain_from_decibels(0.0) - 1.0).abs() < 0.0001);
+        assert!((gain_from_decibels(-6.02) - 0.5).abs() < 0.01);
+        assert!((gain_from_decibels(24.0) - 15.85).abs() < 0.1);
+    }
+
+    #[tokio::test]
+    async fn the_volume_knobs_are_on_the_settings_page() {
+        // The settings hold the volume every call starts with.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.config.audio.microphone_volume = 4.0;
+        app.config.audio.speaker_volume = 0.5;
+        app.view = View::Settings;
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+
+        assert!(
+            text.contains("VOLUME"),
+            "the settings page has no volume section:\n{text}"
+        );
+        assert!(
+            text.contains("+12 dB"),
+            "the microphone knob does not say where it is:\n{text}"
+        );
+        assert!(
+            text.contains("-6 dB"),
+            "the speaker knob does not say where it is:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_volume_knobs_are_on_the_call_page() {
+        // The C++ has an in-call volume slider, and this is where it
+        // belongs: the moment you want to turn it up is while you are
+        // talking.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.config.audio.microphone_volume = 4.0;
+        app.config.audio.speaker_volume = 0.5;
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        frame(&mut app, &ctx);
+        app.active_call_id = Some("call-1".to_string());
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+
+        assert!(
+            text.contains("+12 dB"),
+            "the call page has no microphone knob:\n{text}"
+        );
+        assert!(
+            text.contains("-6 dB"),
+            "the call page has no speaker knob:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_volume_knob_moves_the_config() {
+        // The knob in the settings is the volume the next call starts
+        // with, and it is written to the file.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+
+        app.config.audio.microphone_volume = 1.0;
+        app.set_default_volume(Some(4.0), None);
+
+        assert!(
+            (app.config.audio.microphone_volume - 4.0).abs() < 0.0001,
+            "the volume was not taken: {}",
+            app.config.audio.microphone_volume
+        );
+        // And the call layer was told, so the next call starts there.
+        let media = app.calls.media_config();
+        assert!(
+            (media.microphone_gain - 4.0).abs() < 0.0001,
+            "the call layer was not told: {}",
+            media.microphone_gain
         );
     }
 

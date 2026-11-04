@@ -86,6 +86,17 @@ const PLAYOUT_FRAMES: usize = 6;
 /// near-silence is silence as far as a talk is concerned.
 const SILENCE_LEVEL: u16 = 64;
 
+/// The largest gain a knob may be turned to.
+///
+/// Sixteen is about +24 dB: enough to lift a quiet microphone over the
+/// noise of the room it is in. A preamp turned up further than that
+/// amplifies the room with the voice.
+///
+/// A gain below 1.0 is an attenuation and a gain above 1.0 is a
+/// **preamp** — the same knob, and the only difference is which side
+/// of unity it sits on.
+pub const MAX_GAIN: f32 = 16.0;
+
 /// A frame of audio on its way to the peer.
 ///
 /// The payload is the encoded frame — G.711 or G.722, 160 bytes — and
@@ -334,6 +345,12 @@ pub struct AudioState {
     /// The other half of the same question: a call we send silence on
     /// is a call the peer hears nothing on.
     outbound_peak: AtomicU32,
+    /// The loudest sample we **sent**, as the bits of an `f32`.
+    ///
+    /// The microphone's level after the gain: what the peer hears.
+    /// It is a separate number from the one above because the gain
+    /// makes them different, and the difference is the preamp.
+    sent_peak: AtomicU32,
     /// The loudest sample the **speaker** was given, as the bits of an
     /// `f32`.
     ///
@@ -367,8 +384,8 @@ impl AudioState {
             inbound: Mutex::new(VecDeque::new()),
             mic_muted: AtomicBool::new(false),
             speaker_muted: AtomicBool::new(false),
-            mic_gain: AtomicU32::new(mic_gain.clamp(0.0, 1.0).to_bits()),
-            speaker_gain: AtomicU32::new(speaker_gain.clamp(0.0, 1.0).to_bits()),
+            mic_gain: AtomicU32::new(mic_gain.clamp(0.0, MAX_GAIN).to_bits()),
+            speaker_gain: AtomicU32::new(speaker_gain.clamp(0.0, MAX_GAIN).to_bits()),
             frame_samples: AtomicUsize::new(FRAME_SAMPLES),
             playout_underruns: AtomicUsize::new(0),
             frames_received: AtomicUsize::new(0),
@@ -380,6 +397,7 @@ impl AudioState {
             inbound_peak: AtomicU32::new(0),
             inbound_level: AtomicU32::new(0),
             outbound_peak: AtomicU32::new(0),
+            sent_peak: AtomicU32::new(0),
             played_peak: AtomicU32::new(0),
             #[cfg(test)]
             inbound_takes: AtomicUsize::new(0),
@@ -436,26 +454,40 @@ impl AudioState {
         self.speaker_muted.load(Ordering::Relaxed)
     }
 
-    /// The microphone gain, 0.0 to 1.0.
+    /// The microphone gain.
+    ///
+    /// A multiplier: 1.0 is no change, below 1.0 is quieter, and
+    /// above 1.0 is a **preamp** — the microphone turned up, which is
+    /// what a quiet microphone needs.
     pub fn mic_gain(&self) -> f32 {
         f32::from_bits(self.mic_gain.load(Ordering::Relaxed))
     }
 
     /// Set the microphone gain.
+    ///
+    /// This is the gain the capture path applies to the samples, so
+    /// it is heard by the peer — not by the user, who hears the
+    /// speaker.
     pub fn set_mic_gain(&self, gain: f32) {
         self.mic_gain
-            .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+            .store(gain.clamp(0.0, MAX_GAIN).to_bits(), Ordering::Relaxed);
     }
 
-    /// The speaker gain, 0.0 to 1.0.
+    /// The speaker gain.
+    ///
+    /// A multiplier, like the microphone's: 1.0 is no change, and
+    /// above 1.0 is the speaker turned up.
     pub fn speaker_gain(&self) -> f32 {
         f32::from_bits(self.speaker_gain.load(Ordering::Relaxed))
     }
 
     /// Set the speaker gain.
+    ///
+    /// This is the gain the playout applies on its way to the sound
+    /// card, so it is what the user hears.
     pub fn set_speaker_gain(&self, gain: f32) {
         self.speaker_gain
-            .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+            .store(gain.clamp(0.0, MAX_GAIN).to_bits(), Ordering::Relaxed);
     }
 
     /// Queue a frame for sending.
@@ -568,6 +600,16 @@ impl AudioState {
         f32::from_bits(self.outbound_peak.load(Ordering::Relaxed))
     }
 
+    /// The loudest sample we actually sent.
+    ///
+    /// This is the microphone's level **after** the gain — what the
+    /// peer hears, and not what the microphone picked up. The two are
+    /// different numbers as soon as the gain is not 1.0, and the
+    /// difference is the preamp.
+    pub fn sent_peak(&self) -> f32 {
+        f32::from_bits(self.sent_peak.load(Ordering::Relaxed))
+    }
+
     /// The loudest sample the speaker was given.
     pub fn played_peak(&self) -> f32 {
         f32::from_bits(self.played_peak.load(Ordering::Relaxed))
@@ -595,6 +637,19 @@ impl AudioState {
         let peak = self.outbound_peak.load(Ordering::Relaxed);
         if level > peak {
             self.outbound_peak.store(level, Ordering::Relaxed);
+        }
+    }
+
+    /// Note how loud what we send is.
+    ///
+    /// The same peak, but after the gain: this is the level the peer
+    /// gets, and it is the number that says whether the preamp is
+    /// doing anything.
+    pub(crate) fn note_sent_level(&self, level: f32) {
+        let level = level.clamp(0.0, 1.0).to_bits();
+        let peak = self.sent_peak.load(Ordering::Relaxed);
+        if level > peak {
+            self.sent_peak.store(level, Ordering::Relaxed);
         }
     }
 
@@ -890,6 +945,11 @@ struct FrameBuilder {
     /// own, and G.711's silence code is not the same thing as a quiet
     /// room.
     loudest: u16,
+    /// The gain the microphone is played at.
+    ///
+    /// It is read once per frame: it is a knob, and it does not turn
+    /// faster than the frame it is applied to.
+    gain: f32,
 }
 
 impl FrameBuilder {
@@ -899,17 +959,31 @@ impl FrameBuilder {
             buffer: vec![0i16; codec.frame_samples()],
             filled: 0,
             loudest: 0,
+            gain: 1.0,
         }
     }
 
     fn push(&mut self, sample: f32, state: &AudioState) {
+        if self.filled == 0 {
+            self.gain = state.mic_gain();
+        }
         // A muted microphone still sends: the RTP clock has to keep
         // moving, or the peer thinks the stream died and tears the
         // call down. What it sends is silence — and it goes through
         // the encoder like any other frame, so an encoder that keeps
         // state (G.722) stays in step with the decoder at the other
         // end.
-        let sample = if state.mic_muted() { 0.0 } else { sample };
+        //
+        // The gain is applied here, to the samples, and not to the
+        // encoded frame: the samples are where a level is a level.
+        // Above unity it is a preamp — the microphone turned up — and
+        // what it clips is clipped by the codec, which is a log
+        // codec, and forgives a great deal.
+        let sample = if state.mic_muted() {
+            0.0
+        } else {
+            sample * self.gain
+        };
         let scaled = (sample * 32767.0).round().clamp(-32768.0, 32767.0);
         let scaled = scaled as i16;
         self.buffer[self.filled] = scaled;
@@ -917,6 +991,10 @@ impl FrameBuilder {
         // The loudest sample of the frame so far. `unsigned_abs` is
         // used because `i16::MIN` has no positive counterpart.
         self.loudest = self.loudest.max(scaled.unsigned_abs());
+        // How loud what we send is. This is the level **after** the
+        // gain, so it is what the peer hears — and it is the number
+        // that says whether the preamp is doing anything.
+        state.note_sent_level(scaled.unsigned_abs() as f32 / 32767.0);
 
         if self.filled == self.buffer.len() {
             let frame = self.encoder.encode(&self.buffer);
@@ -2297,6 +2375,80 @@ mod tests {
         assert_eq!(frame.payload.len(), 160);
         assert!(frame.payload.iter().any(|&b| b != 0xD5), "not silence");
         assert!(!frame.silent, "a loud microphone does not send silence");
+    }
+
+    /// The loudest sample of a frame the microphone produced.
+    ///
+    /// The input is quiet enough that four times it still fits: a
+    /// frame that clips would measure the clip and not the gain.
+    fn peak_of_frame(state: &AudioState, gain: f32) -> f32 {
+        state.set_mic_gain(gain);
+        let mut builder = FrameBuilder::new(Codec::Pcma);
+        for _ in 0..160 {
+            builder.push(0.1, state);
+        }
+        let frame = state.pop_outbound().expect("a frame");
+        let mut decoder = Codec::Pcma.decoder();
+        let pcm = decoder.decode(&frame.payload);
+        pcm.iter()
+            .map(|sample| sample.abs() as f32 / 32768.0)
+            .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn the_microphone_gain_is_applied_to_the_samples() {
+        // The gain used to be stored and never read: the microphone
+        // was played at unity whatever the setting said, and the
+        // knob did nothing.
+        let state = AudioState::default();
+
+        let at_unity = peak_of_frame(&state, 1.0);
+        let at_half = peak_of_frame(&state, 0.5);
+        assert!(
+            (at_half - at_unity / 2.0).abs() < 0.01,
+            "half the gain did not halve the voice: {at_half} against {at_unity}"
+        );
+    }
+
+    #[test]
+    fn the_preamp_makes_the_microphone_louder() {
+        // Above unity the knob is a **preamp**: the microphone is
+        // turned up, which is what a quiet microphone needs.
+        let state = AudioState::default();
+
+        let at_unity = peak_of_frame(&state, 1.0);
+        let boosted = peak_of_frame(&state, 4.0);
+        assert!(
+            (boosted - at_unity * 4.0).abs() < 0.02,
+            "the preamp did not turn the microphone up: {boosted} against {at_unity}"
+        );
+    }
+
+    #[test]
+    fn what_is_sent_is_louder_than_what_the_microphone_picked_up() {
+        // The two numbers are different on purpose: the microphone's
+        // own level says whether the microphone heard anything, and
+        // the sent level says what the peer hears. The preamp is the
+        // difference between them.
+        let state = AudioState::default();
+        state.note_outbound_level(0.1);
+        let mut builder = FrameBuilder::new(Codec::Pcma);
+        state.set_mic_gain(4.0);
+        for _ in 0..160 {
+            builder.push(0.25, &state);
+        }
+        let _ = state.pop_outbound().expect("a frame");
+
+        assert!(
+            (state.outbound_peak() - 0.1).abs() < 0.0001,
+            "the microphone's own level was changed: {}",
+            state.outbound_peak()
+        );
+        assert!(
+            state.sent_peak() > 0.9,
+            "what we send is not louder than what the microphone picked up: {}",
+            state.sent_peak()
+        );
     }
 
     #[test]

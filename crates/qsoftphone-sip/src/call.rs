@@ -455,6 +455,39 @@ impl CallManager {
         Ok(())
     }
 
+    /// Set the microphone gain of a call.
+    ///
+    /// A multiplier: 1.0 is no change, and above 1.0 is a preamp.
+    ///
+    /// The gain is an atomic, so this is safe to call from the
+    /// interface thread — §6 forbids blocking there, and this does
+    /// not block. The knob is heard by the *peer*, not by the user.
+    pub fn set_mic_gain(
+        &self,
+        account_id: &str,
+        call_id: &str,
+        gain: f32,
+    ) -> Result<(), CallError> {
+        let media = self.media_of(account_id, call_id)?;
+        media.set_microphone_gain(gain);
+        Ok(())
+    }
+
+    /// Set the speaker gain of a call.
+    ///
+    /// A multiplier: 1.0 is no change, and above 1.0 is the speaker
+    /// turned up. This is what the *user* hears.
+    pub fn set_speaker_gain(
+        &self,
+        account_id: &str,
+        call_id: &str,
+        gain: f32,
+    ) -> Result<(), CallError> {
+        let media = self.media_of(account_id, call_id)?;
+        media.set_speaker_gain(gain);
+        Ok(())
+    }
+
     /// What the media of a call is doing.
     pub fn media_status(&self, account_id: &str, call_id: &str) -> Option<MediaStatus> {
         let session = self.sessions.get(account_id)?;
