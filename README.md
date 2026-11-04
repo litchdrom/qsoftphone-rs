@@ -55,13 +55,13 @@ the start of a talkspurt, and nothing else. The **volume knobs** are
 there too: the microphone's gain is applied for the first time, it goes
 above unity as a preamp, and both directions have a knob — live on the
 call page, and as the default in the settings. A call can now be
-**transferred**: the **Transfer** control on the call page sends a
-`REFER` — blind, to a new target, or attended, to a consultation that
-is already up — and the peer reports the progress of the new leg over
-`NOTIFY`s, which the banner on the call turns into words. When the new
-leg is answered the original leg is **released**, so the user is not
-left talking to the old peer under a banner that says "Transferred". See
-[Milestones](#milestones).
+**transferred**: the **Transfer** control on the call page opens a
+popup that sends a `REFER` — blind, to a new target, or attended, to a
+consultation that is already up — and the peer reports the progress of
+the new leg over `NOTIFY`s, which the banner on the call turns into
+words. When the new leg is answered the original leg is **released**, so
+the user is not left talking to the old peer under a banner that says
+"Transferred". See [Milestones](#milestones).
 
 ---
 
@@ -3181,19 +3181,58 @@ in progress. The reason is unambiguous, so it decides here.
 ### The interface
 
 The **Transfer** control is on the call page, under the mute buttons —
-the call the `REFER` goes out from. It opens a small panel: a target, a
-**Blind transfer** button, and an **Attended transfer** button.
+the call the `REFER` goes out from. It opens a **popup**, the way the
+C++ has it (`src/ui/Dialer.qml`, a `Popup` with `modal: true`).
 
-The attended one is three steps, because it has to be: *Attended
-transfer* places the consultation call on the same account as the
-original one, the panel waits for the consultation to be answered, and
-**Complete transfer** sends the `REFER` that points at it. **Cancel**
-hangs the consultation up.
+It is a popup because the transfer is three steps and the button that
+finishes it must not be somewhere the user can lose. The first attempt
+put the controls inline on the call row, and it failed twice over: the
+row sits at the bottom of the page, and the moment the consultation
+dialled it became the active call — so the controls followed the
+*active* call and vanished. The user was left with two calls on the
+screen and no way to finish the transfer.
+
+The popup has the C++'s two phases:
+
+* **input** — "Transfer call to", a number, and **Blind transfer** or
+  **Attended transfer**;
+* **consult** — "Consulting — complete transfer", a sentence saying
+  where the consultation is ("Dialing…", "Ringing the target…",
+  "Consultation answered — speak to the target, then complete the
+  transfer.", "Consultation ended."), and **Complete transfer** /
+  **Cancel consultation**.
+
+The **Complete transfer** button is always there — greyed out until the
+target answers, with the sentence above saying why. A button that is
+not there is a button the user cannot find; a button that is there and
+greyed out, under a sentence that says why, is one they can.
+
+Escape closes the popup, but not while a consultation is in flight:
+closing it then would leave the consultation leg up with nobody able
+to reach it. This is the C++'s rule (`closePolicy: Popup.NoAutoClose`
+in consult mode).
 
 While the consultation is up the original call's microphone is muted: the
 peer must not hear the conversation with the third party. That is a
 **local mute, not a SIP hold** — the peer is not told, and it has no way
 of knowing a hold happened.
+
+### The page does not jump
+
+The user's second report: the transfer field jumped about when the
+microphone level changed.
+
+The cause was the **diagnosis** — the sentence under the meters that
+says what is wrong with the audio ("The peer is sending silence…"). It
+appears and disappears as the levels move, and a line that changes the
+height of the page moves every button under it. The field the user was
+typing into was one of the things that moved.
+
+The diagnosis now has a space of its own that does not change size,
+and the text is clipped to it — a sentence too long for its space says
+the rest on hover. The rule is general: **a control must not move
+while the user is using it**, and a live reading must never decide how
+much room the page takes.
 
 ### The dependency cost: nothing
 
@@ -3324,7 +3363,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 360 tests, all passing.
+* `cargo test --workspace` — 362 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -3383,6 +3422,13 @@ player lands.
 * **A transfer that cannot reach its target leaves the original call
   up.** The peer ends the subscription with `reason=noresource`; the
   progress comes back as a failure, and no `BYE` goes out.
+* **The transfer popup says how the attended transfer is finished.** The
+  popup has the C++'s two phases: one to name a target and pick the
+  method, and one — while the consultation is dialling — that says where
+  the consultation is and offers **Complete transfer**.
+* **The page does not jump when the levels move.** The diagnosis under
+  the meters gets a space of its own that does not change size, so the
+  buttons under it never move.
 * **The answer names a codec the offer listed.** The loopback peer
   offers G.711 A-law and telephone-event — the offer Asterisk sends —
   and the test reads the `200 OK` off the wire and checks that it says

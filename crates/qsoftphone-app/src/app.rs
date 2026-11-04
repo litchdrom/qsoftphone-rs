@@ -255,8 +255,35 @@ struct TransferState {
     consultation_call_id: Option<String>,
     /// What the user typed as the target.
     target: String,
-    /// Whether the panel is open.
+    /// Whether the popup is open.
     open: bool,
+}
+
+/// How far the consultation of an attended transfer has got (§5.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsultationState {
+    /// The consultation is being dialled.
+    Dialling,
+    /// The target is ringing.
+    Ringing,
+    /// The target answered: the transfer can be completed.
+    Answered,
+    /// The consultation is over — it failed, or it was hung up.
+    Ended,
+}
+
+/// What the transfer popup says about the consultation.
+///
+/// The C++'s wording (`src/ui/Dialer.qml`).
+fn consultation_caption(state: ConsultationState) -> &'static str {
+    match state {
+        ConsultationState::Answered => {
+            "Consultation answered — speak to the target, then complete the transfer."
+        }
+        ConsultationState::Ringing => "Ringing the target…",
+        ConsultationState::Dialling => "Dialing…",
+        ConsultationState::Ended => "Consultation ended.",
+    }
 }
 
 /// What the history page asked for when a button was pressed.
@@ -1608,6 +1635,34 @@ impl QSoftphoneApp {
                 });
             });
         }
+
+        // The transfer popup (§5.6).
+        //
+        // It is a popup for the same reason the incoming call is: the
+        // transfer is three steps and the button that finishes it must
+        // not be somewhere the user can lose. Inline on the call row
+        // it was below the fold, and it vanished the moment the
+        // consultation dialled — because the consultation became the
+        // active call, and the panel followed the active call.
+        //
+        // Escape closes it, but not while a consultation is in flight:
+        // closing it then would leave the consultation leg up with
+        // nobody able to reach it. This is the C++'s rule
+        // (`closePolicy: Popup.NoAutoClose` in consult mode).
+        if self.transfer.open {
+            let source_call_id = self.transfer.source_call_id.clone();
+            egui::Modal::new(egui::Id::unique("transfer")).show(ui.ctx(), |ui| {
+                ui.set_width(380.0);
+                self.draw_transfer_popup(ui, &source_call_id);
+            });
+            if self.transfer.consultation_call_id.is_none()
+                && ui
+                    .ctx()
+                    .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            {
+                self.transfer.open = false;
+            }
+        }
     }
 
     /// The call page: the dialer, and the calls.
@@ -1819,13 +1874,14 @@ impl QSoftphoneApp {
                         .color(egui::Color32::GRAY),
                     );
                 });
-                if let Some(diagnosis) = silence_diagnosis(status) {
-                    ui.label(
-                        egui::RichText::new(diagnosis)
-                            .small()
-                            .color(egui::Color32::from_rgb(231, 176, 60)),
-                    );
-                }
+                // The diagnosis gets a space of its own, and that space
+                // does not change size. The sentence appears and
+                // disappears as the levels move — and a line that
+                // changes the height of the page moves every button
+                // under it, which is how the transfer field came to
+                // jump about while the user was typing into it.
+                let diagnosis = silence_diagnosis(status).unwrap_or_default();
+                draw_diagnosis(ui, &diagnosis);
             }
 
             // The mute buttons. A muted microphone still sends RTP —
@@ -1877,62 +1933,125 @@ impl QSoftphoneApp {
             // the app is idle and it sends the tones during a call.
 
             // The transfer (§5.6).
-            self.draw_transfer(ui, &call);
+            self.draw_transfer_button(ui, &call);
         }
     }
 
-    /// The transfer controls of the call the user is looking at (§5.6).
+    /// The transfer button of the call the user is looking at (§5.6).
     ///
-    /// The blind transfer is one button: name a target, and the REFER
-    /// goes out. The attended one needs a consultation first, so it
-    /// is three steps — and the last one only appears once the
-    /// consultation has been answered.
-    fn draw_transfer(&mut self, ui: &mut egui::Ui, call: &CallView) {
-        let open = self.transfer.open && self.transfer.source_call_id == call.call_id;
-
-        if ui.selectable_label(open, "Transfer").clicked() {
-            if open {
-                self.transfer.open = false;
-            } else {
-                self.transfer.open = true;
-                self.transfer.source_call_id = call.call_id.clone();
-                self.transfer.consultation_call_id = None;
-            }
+    /// It only opens the popup. The transfer itself is not done from
+    /// the row: the attended one is three steps, and the button that
+    /// finishes it has to be somewhere the user cannot lose — which is
+    /// why it is a popup, the way the C++ has it
+    /// (`src/ui/Dialer.qml`).
+    fn draw_transfer_button(&mut self, ui: &mut egui::Ui, call: &CallView) {
+        if ui.button("Transfer").clicked() {
+            self.transfer.open = true;
+            self.transfer.source_call_id = call.call_id.clone();
+            self.transfer.consultation_call_id = None;
+            self.transfer.target.clear();
         }
+    }
 
-        if !open {
+    /// The transfer popup (§5.6).
+    ///
+    /// Two phases, the C++'s two phases:
+    ///
+    /// * **input** — name a target and pick the method;
+    /// * **consult** — the consultation is dialled, and the transfer is
+    ///   completed once the target answers.
+    ///
+    /// The second phase says what is happening and where it has got
+    /// to. A button that is not there is a button the user cannot
+    /// find; a button that is there and greyed out, under a sentence
+    /// that says why, is one they can.
+    fn draw_transfer_popup(&mut self, ui: &mut egui::Ui, source_call_id: &str) {
+        let Some(call) = self.call_views.get(source_call_id).cloned() else {
+            // The call is gone: there is nothing left to transfer.
+            self.transfer.open = false;
+            self.transfer.consultation_call_id = None;
             return;
-        }
-
-        ui.horizontal(|ui| {
-            ui.label("Transfer to");
-            ui.text_edit_singleline(&mut self.transfer.target);
-        });
+        };
 
         let consultation = self.transfer.consultation_call_id.clone();
-        let consultation_answered = consultation
-            .as_ref()
-            .and_then(|id| self.call_views.get(id))
-            .map(|view| view.answered)
-            .unwrap_or(false);
 
-        ui.horizontal(|ui| {
-            if ui.button("Blind transfer").clicked() {
-                self.transfer_blind(call);
+        match consultation {
+            None => {
+                ui.heading("Transfer call to");
+                ui.horizontal(|ui| {
+                    ui.label("Number");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.transfer.target)
+                            .desired_width(200.0)
+                            .hint_text("6666"),
+                    );
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Blind transfer").clicked() {
+                        self.transfer_blind(&call);
+                    }
+                    if ui.button("Attended transfer").clicked() {
+                        self.start_consultation(&call);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.transfer.open = false;
+                    }
+                });
             }
-            if consultation.is_none() && ui.button("Attended transfer").clicked() {
-                self.start_consultation(call);
+            Some(consultation_call_id) => {
+                ui.heading("Consulting — complete transfer");
+                let state = self.consultation_state(&consultation_call_id);
+                ui.label(consultation_caption(state));
+                ui.weak("Original call muted.");
+                ui.add_space(6.0);
+                let answered = state == ConsultationState::Answered;
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel consultation").clicked() {
+                        self.cancel_transfer();
+                    }
+                    if ui
+                        .add_enabled(answered, egui::Button::new("Complete transfer"))
+                        .clicked()
+                    {
+                        self.complete_attended_transfer(&call);
+                    }
+                });
+                if !answered {
+                    ui.label(
+                        egui::RichText::new(
+                            "The transfer can be completed once the target answers.",
+                        )
+                        .small()
+                        .color(egui::Color32::GRAY),
+                    );
+                }
             }
-            if consultation.is_some()
-                && consultation_answered
-                && ui.button("Complete transfer").clicked()
-            {
-                self.complete_attended_transfer(call);
-            }
-            if consultation.is_some() && ui.button("Cancel").clicked() {
-                self.cancel_transfer();
-            }
-        });
+        }
+    }
+
+    /// How far the consultation of an attended transfer has got.
+    ///
+    /// The C++ polls the call model for this
+    /// (`transferPopup._consultState`); here the call views carry the
+    /// same thing.
+    fn consultation_state(&self, call_id: &str) -> ConsultationState {
+        let Some(view) = self.call_views.get(call_id) else {
+            return ConsultationState::Ended;
+        };
+        if view.ended {
+            return ConsultationState::Ended;
+        }
+        if view.answered {
+            return ConsultationState::Answered;
+        }
+        match view.state.as_str() {
+            "ringing" => ConsultationState::Ringing,
+            "connected" => ConsultationState::Answered,
+            _ => ConsultationState::Dialling,
+        }
     }
 
     /// The history page: the searchable list of past calls.
@@ -2866,6 +2985,44 @@ fn transfer_status_colour(progress: Option<TransferProgress>) -> egui::Color32 {
     }
 }
 
+/// The number of lines the diagnosis is given.
+///
+/// Every diagnosis fits in two lines except the one about a path that
+/// drops frames, and that one says the same thing more briefly now.
+const DIAGNOSIS_LINES: f32 = 2.0;
+
+/// The diagnosis, in a space of its own that never changes size.
+///
+/// The sentence appears and disappears as the levels move, and a line
+/// that changes the height of the page moves every button under it.
+/// The space is reserved and the text is clipped to it, so the
+/// controls below never move; a sentence too long for its space says
+/// the rest on hover.
+fn draw_diagnosis(ui: &mut egui::Ui, text: &str) {
+    let font = egui::FontId::proportional(12.0);
+    let colour = egui::Color32::from_rgb(231, 176, 60);
+    let width = ui.available_width();
+    let line_height = ui.ctx().fonts_mut(|f| f.row_height(&font));
+
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, line_height * DIAGNOSIS_LINES),
+        egui::Sense::hover(),
+    );
+
+    if text.is_empty() {
+        return;
+    }
+
+    let galley = ui.painter().layout(text.to_string(), font, colour, width);
+    let clipped = galley.rect.height() > rect.height();
+    ui.painter()
+        .with_clip_rect(rect)
+        .galley(rect.min, galley, colour);
+    if clipped {
+        response.on_hover_text(text.to_string());
+    }
+}
+
 /// The level below which there is nothing to hear: -40 dB.
 ///
 /// A voice is well above this. A line that carries less carries room
@@ -2970,10 +3127,8 @@ fn silence_diagnosis(status: &qsoftphone_media::MediaStatus) -> Option<String> {
              ({percent}%)."
         );
         if status.codec == qsoftphone_media::Codec::G722 {
-            sentence.push_str(
-                " G.722 keeps a state, so every lost frame leaves the peer's decoder out of \
-                 step — G.711 would only drop out.",
-            );
+            sentence
+                .push_str(" With G.722 every lost frame leaves the peer's decoder out of step.");
         }
         return Some(sentence);
     }
@@ -5277,8 +5432,8 @@ mod tests {
         let output = frame(&mut app, &ctx);
         let text = screen_text(&output);
         assert!(
-            text.contains("Transfer to"),
-            "the transfer panel does not ask for a target:\n{text}"
+            text.contains("Transfer call to"),
+            "the transfer popup did not open:\n{text}"
         );
         assert!(
             button_at(&output, "Blind transfer").is_some(),
@@ -5287,6 +5442,99 @@ mod tests {
         assert!(
             button_at(&output, "Attended transfer").is_some(),
             "there is no attended transfer:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_attended_transfer_says_how_to_finish_it() {
+        // The user's report: both calls are on the screen and there is
+        // no way to tell how the transfer is finished. The popup says
+        // where the consultation is and offers the button.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        frame(&mut app, &ctx);
+
+        // The transfer is open and the consultation is dialling.
+        app.transfer.open = true;
+        app.transfer.source_call_id = "call-1".to_string();
+        app.transfer.consultation_call_id = Some("call-2".to_string());
+        app.transfer.target = "200".to_string();
+
+        // Two frames: the first one is egui's sizing pass for the
+        // popup, and it is drawn invisible.
+        frame(&mut app, &ctx);
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Consulting"),
+            "the transfer popup did not open:\n{text}"
+        );
+        assert!(
+            text.contains("Complete transfer"),
+            "the popup does not say how the transfer is finished:\n{text}"
+        );
+
+        // The target answers.
+        let mut answered = CallEvent::new(CallEventType::CallAnswered);
+        answered.call_id = "call-2".to_string();
+        answered.call_direction = Some(Direction::Outgoing);
+        answered.call_state = "connected".to_string();
+        bus.publish("acct-ui-1", answered);
+        frame(&mut app, &ctx);
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Consultation answered"),
+            "the popup does not say the target answered:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_diagnosis_does_not_move_the_buttons_under_it() {
+        // The sentence appears and disappears as the levels move, and
+        // the user reported the transfer field jumping about while
+        // they were typing into it. The space the sentence is given
+        // does not change, so nothing under it moves.
+        let ctx = egui::Context::default();
+
+        let height_of = |text: &str| {
+            let mut height = 0.0;
+            // The window has a size: without a screen rect, egui lays
+            // the central panel out with no height at all.
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1100.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    draw_diagnosis(ui, text);
+                    height = ui.min_rect().height();
+                });
+            });
+            // The fonts this frame have to be handed on, or egui
+            // complains that they were dropped.
+            output.textures_delta.clear();
+            height
+        };
+        let empty = height_of("");
+        let short =
+            height_of("The peer is sending silence — there is nothing on the line to hear.");
+        let long = height_of(
+            "The path is dropping the audio: 206 of the peer's 1050 frames never arrived (20%). \
+             With G.722 every lost frame leaves the peer's decoder out of step.",
+        );
+
+        assert_eq!(empty, short, "the diagnosis changed the height of the page");
+        assert_eq!(
+            empty, long,
+            "a long diagnosis changed the height of the page"
         );
     }
 
