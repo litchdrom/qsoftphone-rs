@@ -29,8 +29,15 @@ pub struct TransferUpdate {
     pub code: u16,
     /// The reason the peer gave, when it gave one.
     ///
-    /// The `Subscription-State` reason: `noresource` (the peer could
-    /// not route to the target), `timeout`, `deactivated`, and so on.
+    /// The `Subscription-State` reason: `noresource`, `timeout`,
+    /// `deactivated`, and so on.
+    ///
+    /// **`noresource` says nothing about the transfer.** RFC 3515
+    /// §2.4.7 asks for it on the final NOTIFY of a *successful*
+    /// transfer, and pjsip's own state name for a terminated
+    /// subscription is literally `terminated;reason=noresource` — so
+    /// a server says it on every transfer that ends. The body decides
+    /// whether it worked.
     pub reason: String,
 }
 
@@ -55,39 +62,48 @@ pub fn refer_progress(request: &Request) -> Option<TransferUpdate> {
     }
 
     let reason = subscription_reason(request);
-    let code = status_code_of(&request.body);
+    let terminated = subscription_terminated(request);
 
-    // The subscription ended without a resource being created: the
-    // peer could not route to the target, and no call was ever made.
-    //
-    // This outranks the status line. A `100 Trying` in the body says
-    // the transfer *started*; the reason says that it did not get
-    // anywhere, and a transfer that did not get anywhere is a
-    // transfer that failed.
-    if reason == "noresource" {
-        return Some(TransferUpdate {
-            progress: TransferProgress::Failed,
-            code: code.unwrap_or(0),
-            reason,
-        });
-    }
-
-    match code {
-        Some(code) => Some(TransferUpdate {
-            progress: progress_of(code),
-            code,
-            reason,
-        }),
-        // A NOTIFY with no status line still says something: the
-        // subscription is over. The transfer is over, and it did not
-        // work.
-        None if subscription_terminated(request) => Some(TransferUpdate {
+    let Some(code) = status_code_of(&request.body) else {
+        // A NOTIFY with no status line: the subscription ended, and
+        // there is nothing to say how far it got. The transfer is over,
+        // and it did not work.
+        return terminated.then_some(TransferUpdate {
             progress: TransferProgress::Failed,
             code: 0,
             reason,
-        }),
-        None => None,
-    }
+        });
+    };
+
+    // The body says how far the new leg got; the subscription says
+    // whether the story is over. A story that is over and did not end
+    // in an answer is a failure.
+    //
+    // The **reason** is not the judge. RFC 3515 §2.4.7 says the final
+    // NOTIFY of a *successful* transfer is terminated with
+    // `reason=noresource`, because the subscription was to the state
+    // of the referred request and that state is over. pjsip's own
+    // state name for a terminated subscription is the same string, so
+    // a server says "noresource" on every transfer, successful or
+    // not. Reading it as "no route to the target" reports every
+    // successful transfer as a failure.
+    let progress = match code {
+        // The success code, and the only one that means the new leg
+        // is up.
+        200 => TransferProgress::Answered,
+        // A failure, whether the subscription is over or not.
+        400..=699 => TransferProgress::Failed,
+        // The subscription is over and the body never said the new leg
+        // was answered: the transfer did not work.
+        _ if terminated => TransferProgress::Failed,
+        _ => progress_of(code),
+    };
+
+    Some(TransferUpdate {
+        progress,
+        code,
+        reason,
+    })
 }
 
 /// Whether the request is a NOTIFY about the refer subscription.
@@ -146,9 +162,14 @@ fn subscription_terminated(request: &Request) -> bool {
 /// The `Subscription-State` header's `reason` parameter, if it names
 /// one.
 ///
-/// RFC 3515 §7.1.1: `terminated;reason=noresource` means the peer
-/// could not route to the target — the transfer failed before it
-/// started, and no call was ever made.
+/// The reasons are `noresource`, `timeout`, `deactivated` and so on.
+///
+/// **`noresource` is not a failure.** RFC 3515 §2.4.7 asks for it on
+/// the final NOTIFY of a *successful* transfer — the subscription was
+/// to the state of the referred request, and that state is over — and
+/// pjsip's own state name for a terminated subscription is literally
+/// `terminated;reason=noresource`. A server says it on every
+/// transfer, so it cannot be the judge. The body is.
 fn subscription_reason(request: &Request) -> String {
     let Some(value) = subscription_state_of(request) else {
         return String::new();
@@ -169,11 +190,13 @@ fn subscription_reason(request: &Request) -> String {
 /// The consultation an attended transfer points at.
 ///
 /// The `Replaces` identifier is the consultation dialog's **Call-ID**,
-/// with the `@` percent-encoded (RFC 3891 §3.1). The peer matches it
-/// against the dialog it has to take over, so it has to be the very
-/// Call-ID the peer saw in our INVITE — the local part and the host
-/// are one string, not two, and the host is the one the Call-ID
-/// carries rather than the host of our contact.
+/// with the `@` percent-encoded, plus the dialog's two tags (RFC 3891
+/// §3.1). The peer matches the dialog by all three, so the Call-ID
+/// alone is not enough to find it.
+///
+/// The host is the one the Call-ID carries rather than the host of
+/// our contact: the peer matches the whole Call-ID it saw in our
+/// INVITE.
 pub fn consultation_of(dialog: &InviteDialog) -> Consultation {
     let snapshot = dialog.snapshot();
     let (call_id, host) = split_call_id(&snapshot.id.call_id);
@@ -181,6 +204,16 @@ pub fn consultation_of(dialog: &InviteDialog) -> Consultation {
         uri: snapshot.remote_uri.to_string(),
         call_id: call_id.to_string(),
         host: host.to_string(),
+        // RFC 3891: the to-tag is the tag the **peer** put on its
+        // `To` — our remote tag — and the from-tag is the one we put
+        // on our own `From` — our local tag.
+        //
+        // pjsip's `xferReplaces` puts them in the same places, and
+        // that is not a coincidence: the two ends of a dialog hold
+        // the same two tags the other way round, so the peer looks
+        // the dialog up with exactly this pair.
+        to_tag: snapshot.id.remote_tag.clone(),
+        from_tag: snapshot.id.local_tag.clone(),
     }
 }
 
@@ -262,11 +295,11 @@ mod tests {
     }
 
     #[test]
-    fn a_subscription_that_ended_without_a_resource_is_a_failure() {
-        // RFC 3515 §7.1.1: `terminated;reason=noresource` means the
-        // peer could not route to the target. The body may well say
-        // `100 Trying` — the transfer started and got nowhere, and
-        // that is a failure whatever the status line says.
+    fn a_subscription_that_ended_after_a_trying_is_a_failure() {
+        // The subscription is over and the body only ever said `100
+        // Trying`: the transfer started and got nowhere, and that is a
+        // failure. The **reason** — `noresource` here — is not what
+        // decides it; the body is.
         let update = refer_progress(&notify(
             Some("refer"),
             Some("terminated;reason=noresource"),
@@ -277,6 +310,41 @@ mod tests {
         assert_eq!(update.progress, TransferProgress::Failed);
         assert_eq!(update.code, 100);
         assert_eq!(update.reason, "noresource");
+    }
+
+    #[test]
+    fn noresource_does_not_mean_the_transfer_failed() {
+        // The correction: RFC 3515 §2.4.7 asks for the final NOTIFY of
+        // a **successful** transfer to be terminated with
+        // `reason=noresource`, and pjsip's own state name for a
+        // terminated subscription is the same string. A server says it
+        // on every transfer that ends, so reading it as "no route to
+        // the target" reports every successful transfer as a failure.
+        let update = refer_progress(&notify(
+            Some("refer"),
+            Some("terminated;reason=noresource"),
+            "SIP/2.0 200 OK\r\n",
+        ))
+        .expect("the progress was not read");
+
+        assert_eq!(update.progress, TransferProgress::Answered);
+        assert_eq!(update.code, 200);
+        assert_eq!(update.reason, "noresource");
+    }
+
+    #[test]
+    fn a_subscription_that_ended_after_a_ringing_is_a_failure() {
+        // It rang and was never answered: the transfer did not work,
+        // even though nothing in the body says so.
+        let update = refer_progress(&notify(
+            Some("refer"),
+            Some("terminated;reason=noresource"),
+            "SIP/2.0 180 Ringing\r\n",
+        ))
+        .expect("the progress was not read");
+
+        assert_eq!(update.progress, TransferProgress::Failed);
+        assert_eq!(update.code, 180);
     }
 
     #[test]

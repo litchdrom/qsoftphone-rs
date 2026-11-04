@@ -1466,6 +1466,112 @@ async fn the_attended_transfer_names_the_consultation() {
         refer_to.contains(&expected),
         "the Replaces is not the consultation's Call-ID: {refer_to}"
     );
+
+    // RFC 3891 §3.1: the dialog is named by the Call-ID **and** its
+    // two tags. A server that matches on all three cannot find the
+    // dialog without them — and a server that cannot find it treats
+    // the transfer as one to another machine.
+    assert!(
+        refer_to.contains("%3Bto-tag%3Dpeer-tag%3Bfrom-tag%3D"),
+        "the Replaces does not carry the dialog's tags: {refer_to}"
+    );
+}
+
+/// The DTMF digits the peer received, in order.
+///
+/// The feature code is typed one digit at a time, and the digits come
+/// back as the body of an `INFO` request.
+async fn wait_for_dtmf(observations: &Arc<Mutex<Observations>>) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        {
+            let observations = observations.lock().expect("observations lock");
+            let digits: String = observations
+                .raw
+                .iter()
+                .filter(|message| message.starts_with("INFO "))
+                .filter_map(|message| {
+                    let body = message.split("\r\n\r\n").nth(1)?;
+                    body.lines().find_map(|line| {
+                        line.strip_prefix("Signal=").map(|digit| digit.to_string())
+                    })
+                })
+                .collect();
+            // The `#` ends the sequence.
+            if digits.ends_with('#') {
+                return digits;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("the peer never received the feature code");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A transfer by the PBX's feature code: the code is typed as DTMF
+/// and the server does the work — the way a hardware phone's transfer
+/// key works.
+#[tokio::test]
+async fn a_feature_code_transfer_is_typed_as_dtmf() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+            transfer: None,
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-transfer-feature-code".to_string();
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut seen = Vec::new();
+    let call_id = stack
+        .calls
+        .place_call(&account.id, "100")
+        .expect("the call was placed");
+    let answered = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallAnswered,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(answered.is_some(), "the call was never answered");
+
+    stack
+        .calls
+        .transfer_by_feature_code(&account.id, &call_id, "*2", "6666")
+        .expect("the transfer did not start");
+
+    // The code, the target and the terminator — in that order.
+    let digits = wait_for_dtmf(&observations).await;
+    assert_eq!(
+        digits, "*26666#",
+        "the feature code was not typed as it should be"
+    );
+
+    // And no REFER went out: the server does the transfer.
+    assert!(
+        !observations
+            .lock()
+            .expect("observations lock")
+            .saw_request("REFER"),
+        "the feature-code transfer also sent a REFER"
+    );
 }
 
 /// A transfer that cannot reach its target fails, and the original

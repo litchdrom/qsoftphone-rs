@@ -246,8 +246,10 @@ struct CallView {
 ///
 /// The blind transfer is one action: name a target, and the REFER goes
 /// out. The attended one is three: place a consultation, wait for it
-/// to be answered, and then send the REFER that points at it.
-#[derive(Debug, Clone, Default)]
+/// to be answered, and then send the REFER that points at it. The
+/// third is the **feature code**: the PBX does the transfer and the
+/// app only types, the way a hardware phone's transfer key works.
+#[derive(Debug, Clone)]
 struct TransferState {
     /// The call being transferred.
     source_call_id: String,
@@ -257,6 +259,27 @@ struct TransferState {
     target: String,
     /// Whether the popup is open.
     open: bool,
+    /// Whether the popup is asking for the PBX's feature code.
+    feature_code: bool,
+    /// The PBX's feature code.
+    ///
+    /// Asterisk's `*2` is the blind transfer code and `*3` the
+    /// attended one; both are dialplan extensions, so which one is
+    /// right depends on the server.
+    prefix: String,
+}
+
+impl Default for TransferState {
+    fn default() -> Self {
+        Self {
+            source_call_id: String::new(),
+            consultation_call_id: None,
+            target: String::new(),
+            open: false,
+            feature_code: false,
+            prefix: "*2".to_string(),
+        }
+    }
 }
 
 /// How far the consultation of an attended transfer has got (§5.6).
@@ -498,8 +521,11 @@ impl QSoftphoneApp {
                 CallEventType::TransferProgress => {
                     // §5.6: the banner says what the transfer is doing.
                     view.transfer_progress = event.transfer_progress;
-                    view.transfer_status =
-                        transfer_status_text(event.transfer_code, &event.transfer_reason);
+                    view.transfer_status = transfer_status_text(
+                        event.transfer_progress,
+                        event.transfer_code,
+                        &event.transfer_reason,
+                    );
                 }
                 CallEventType::CallEnded => {
                     view.ended = true;
@@ -665,6 +691,32 @@ impl QSoftphoneApp {
             Ok(()) => {
                 self.transfer.open = false;
                 self.status = format!("Transferring to {target}…");
+            }
+            Err(e) => self.status = format!("The transfer did not start: {e}"),
+        }
+    }
+
+    /// Transfer by the PBX's feature code — the hardware phone's way.
+    ///
+    /// There is no REFER and no consultation: the code is typed and
+    /// the server takes the transfer over. The C++ has the same third
+    /// method (`*2<target>#`), for the same reason — a server that
+    /// does not honour a REFER is a server this gets through.
+    fn transfer_by_code(&mut self, call: &CallView) {
+        let prefix = self.transfer.prefix.trim().to_string();
+        let target = self.transfer.target.trim().to_string();
+        if target.is_empty() {
+            self.status = "A transfer needs a target.".to_string();
+            return;
+        }
+        match self
+            .calls
+            .transfer_by_feature_code(&call.account_id, &call.call_id, &prefix, &target)
+        {
+            Ok(()) => {
+                self.transfer.open = false;
+                self.transfer.feature_code = false;
+                self.status = format!("Transferring to {target} by feature code…");
             }
             Err(e) => self.status = format!("The transfer did not start: {e}"),
         }
@@ -1974,8 +2026,44 @@ impl QSoftphoneApp {
         };
 
         let consultation = self.transfer.consultation_call_id.clone();
+        let feature_code = self.transfer.feature_code;
 
         match consultation {
+            None if feature_code => {
+                // The hardware phone's way: the code is typed and the
+                // server does the work.
+                ui.heading("Transfer by feature code");
+                ui.label(
+                    "The server does the transfer: the code is typed as DTMF and the PBX \
+                     takes over, the way a hardware phone's transfer key works.",
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Code");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.transfer.prefix)
+                            .desired_width(60.0)
+                            .hint_text("*2"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Number");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.transfer.target)
+                            .desired_width(200.0)
+                            .hint_text("6666"),
+                    );
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Send the code").clicked() {
+                        self.transfer_by_code(&call);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.transfer.feature_code = false;
+                    }
+                });
+            }
             None => {
                 ui.heading("Transfer call to");
                 ui.horizontal(|ui| {
@@ -1993,6 +2081,9 @@ impl QSoftphoneApp {
                     }
                     if ui.button("Attended transfer").clicked() {
                         self.start_consultation(&call);
+                    }
+                    if ui.button("PBX feature code").clicked() {
+                        self.transfer.feature_code = true;
                     }
                 });
                 ui.horizontal(|ui| {
@@ -2938,7 +3029,6 @@ fn level_text(level: f32) -> String {
 /// 180, 183       "Transferring… new target ringing"
 /// 200            "Transferring… new target answered"
 /// 400..=699      "Transfer failed: <code> (<reason>)"
-/// noresource     "Transfer failed: no route to target"
 /// any other      "Transfer ended (<reason>)", or "Transferring…"
 /// ```
 ///
@@ -2946,23 +3036,38 @@ fn level_text(level: f32) -> String {
 /// know is still a transfer in flight, and saying "failed" about it
 /// would be a lie.
 ///
-/// One thing is **not** the C++'s: the `noresource` reason is checked
-/// first here, where the C++ checks it last. The C++ wants to say
-/// "no route to target" for it, but its own ordering means a `100
-/// Trying` in the body wins and the banner says the transfer is still
-/// going — a transfer that never reached anybody, reported as a
-/// transfer in progress. The reason is unambiguous, so it decides.
-fn transfer_status_text(code: i32, reason: &str) -> String {
-    if reason == "noresource" {
-        // The subscription ended without a resource being created:
-        // the peer could not route to the target.
-        return "Transfer failed: no route to target".to_string();
+/// One thing is **not** the C++'s: the *progress* decides whether the
+/// transfer failed, not the code on its own, and the `noresource`
+/// reason is dropped rather than shown.
+///
+/// The C++ reads `noresource` as "no route to the target" and says so
+/// on every transfer that ends — including every **successful** one,
+/// because RFC 3515 §2.4.7 asks for `terminated;reason=noresource` on
+/// the final NOTIFY of a successful transfer. The C++'s own ordering
+/// means the `100 Trying` in the body wins and the banner says the
+/// transfer is still going; when the body has a `4xx` or `5xx` the
+/// reason is shown, so the banner reads "Transfer failed: 486
+/// (noresource)" — which says nothing useful.
+///
+/// So: the progress says whether it failed, the code says how far it
+/// got, and `noresource` — which every terminating transfer carries —
+/// is not shown at all.
+fn transfer_status_text(progress: Option<TransferProgress>, code: i32, reason: &str) -> String {
+    if progress == Some(TransferProgress::Failed) {
+        // It failed. The code says how far it got.
+        return match code {
+            // It never got an answer: the transfer started and went
+            // nowhere. That is the C++'s "no route to target".
+            0 | 100..=199 => "Transfer failed: no route to target".to_string(),
+            _ => transfer_failure_text(code, reason),
+        };
     }
+
     match code {
         100 => "Transferring… new target trying".to_string(),
         180 | 183 => "Transferring… new target ringing".to_string(),
         200 => "Transferring… new target answered".to_string(),
-        400..=699 => format!("Transfer failed: {code} ({reason})"),
+        400..=699 => transfer_failure_text(code, reason),
         _ => {
             if !reason.is_empty() {
                 format!("Transfer ended ({reason})")
@@ -2970,6 +3075,19 @@ fn transfer_status_text(code: i32, reason: &str) -> String {
                 "Transferring…".to_string()
             }
         }
+    }
+}
+
+/// What a failed transfer says.
+///
+/// The reason is shown when it says something — but **not** when it is
+/// `noresource`, which every terminating subscription carries and
+/// which says nothing about the transfer at all.
+fn transfer_failure_text(code: i32, reason: &str) -> String {
+    if reason.is_empty() || reason.eq_ignore_ascii_case("noresource") {
+        format!("Transfer failed: {code}")
+    } else {
+        format!("Transfer failed: {code} ({reason})")
     }
 }
 
@@ -5362,35 +5480,65 @@ mod tests {
     fn the_transfer_banner_is_the_cxxs_wording() {
         // The C++'s `CallController::onTransferStatus`, word for word.
         assert_eq!(
-            transfer_status_text(100, ""),
+            transfer_status_text(Some(TransferProgress::Trying), 100, ""),
             "Transferring… new target trying"
         );
         assert_eq!(
-            transfer_status_text(180, ""),
+            transfer_status_text(Some(TransferProgress::Ringing), 180, ""),
             "Transferring… new target ringing"
         );
         assert_eq!(
-            transfer_status_text(183, ""),
+            transfer_status_text(Some(TransferProgress::Ringing), 183, ""),
             "Transferring… new target ringing"
         );
         assert_eq!(
-            transfer_status_text(200, ""),
+            transfer_status_text(Some(TransferProgress::Answered), 200, ""),
             "Transferring… new target answered"
         );
         assert_eq!(
-            transfer_status_text(503, "unavailable"),
+            transfer_status_text(Some(TransferProgress::Failed), 503, "unavailable"),
             "Transfer failed: 503 (unavailable)"
         );
 
         // A code this build does not know is still a transfer in
         // flight — saying "failed" about it would be a lie.
-        assert_eq!(transfer_status_text(202, ""), "Transferring…");
-        assert_eq!(transfer_status_text(0, ""), "Transferring…");
-
-        // And a subscription that ended without a resource says so.
         assert_eq!(
-            transfer_status_text(0, "noresource"),
+            transfer_status_text(Some(TransferProgress::Trying), 202, ""),
+            "Transferring…"
+        );
+        assert_eq!(
+            transfer_status_text(Some(TransferProgress::Trying), 0, ""),
+            "Transferring…"
+        );
+
+        // A transfer that ended without ever being answered says the
+        // C++'s "no route to target".
+        assert_eq!(
+            transfer_status_text(Some(TransferProgress::Failed), 0, "noresource"),
             "Transfer failed: no route to target"
+        );
+        assert_eq!(
+            transfer_status_text(Some(TransferProgress::Failed), 100, "noresource"),
+            "Transfer failed: no route to target"
+        );
+    }
+
+    #[test]
+    fn the_banner_does_not_blame_noresource_for_a_transfer_that_worked() {
+        // `terminated;reason=noresource` is on the final NOTIFY of a
+        // **successful** transfer (RFC 3515 §2.4.7), so it must not
+        // turn a working transfer into a failure.
+        assert_eq!(
+            transfer_status_text(Some(TransferProgress::Answered), 200, "noresource"),
+            "Transferring… new target answered"
+        );
+
+        // And a failure that carries it does not say "noresource" —
+        // the code says what happened, and "noresource" is on every
+        // terminating subscription, so it says nothing.
+        assert_eq!(
+            transfer_status_text(Some(TransferProgress::Failed), 486, "noresource"),
+            "Transfer failed: 486"
         );
     }
 
@@ -5442,6 +5590,49 @@ mod tests {
         assert!(
             button_at(&output, "Attended transfer").is_some(),
             "there is no attended transfer:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_transfer_offers_the_pbx_feature_code() {
+        // The hardware phone's way: the app types the code and the
+        // server does the transfer. The C++ has the same third method,
+        // for the same reason — a server that does not honour a REFER
+        // is a server this gets through.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        frame(&mut app, &ctx);
+
+        let output = frame(&mut app, &ctx);
+        let transfer =
+            button_at(&output, "Transfer").expect("the call page has no transfer button");
+        click_at(&mut app, &ctx, transfer);
+
+        // Two frames: the first one is egui's sizing pass for the
+        // popup, and it is drawn invisible.
+        frame(&mut app, &ctx);
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        let code = button_at(&output, "PBX feature code").expect("there is no feature-code method");
+        assert!(
+            text.contains("Transfer call to"),
+            "the transfer popup did not open:\n{text}"
+        );
+
+        click_at(&mut app, &ctx, code);
+        frame(&mut app, &ctx);
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Transfer by feature code"),
+            "the feature-code phase did not open:\n{text}"
+        );
+        assert!(
+            button_at(&output, "Send the code").is_some(),
+            "there is no button that sends the code:\n{text}"
         );
     }
 

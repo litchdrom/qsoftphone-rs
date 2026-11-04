@@ -50,6 +50,16 @@ pub struct Consultation {
     pub call_id: String,
     /// The consultation dialog's host.
     pub host: String,
+    /// The consultation dialog's **to-tag**: the tag the peer put on
+    /// the `To` header of its answer.
+    ///
+    /// This is the dialog's remote tag — the peer's own tag.
+    pub to_tag: String,
+    /// The consultation dialog's **from-tag**: the tag we put on our
+    /// own `From` header.
+    ///
+    /// This is the dialog's local tag — ours.
+    pub from_tag: String,
 }
 
 /// How a transfer is going.
@@ -145,12 +155,73 @@ pub fn refer_to_attended(target_uri: &str, dialog_id: &str) -> String {
 /// A Call-ID with no host at all is passed through unchanged: a
 /// trailing `%40` with nothing behind it is not an identifier, it is
 /// a fragment.
+///
+/// This is §5.6's shape, and it is **not enough**: a server that
+/// matches a dialog by all three of its identifiers — the Call-ID and
+/// the two tags — cannot match a Call-ID on its own. See
+/// [`replaces_dialog_id_with_tags`], which is what goes on the wire.
 pub fn replaces_dialog_id(call_id: &str, host: &str) -> String {
     if host.is_empty() {
         call_id.to_string()
     } else {
         format!("{call_id}%40{host}")
     }
+}
+
+/// The `Replaces` dialog identifier with the dialog's two tags.
+///
+/// ```text
+/// Replaces=<call-id>%40<host>%3Bto-tag%3D<to-tag>%3Bfrom-tag%3D<from-tag>
+/// ```
+///
+/// RFC 3891 §3.1: a dialog is identified by the **three** things
+/// that name it — the Call-ID, the tag the peer put on its `To`, and
+/// the tag we put on our `From`. Asterisk matches on all three:
+///
+/// ```c
+/// pjsip_ua_find_dialog(&replaces->call_id, &replaces->to_tag, &replaces->from_tag, PJ_TRUE)
+/// ```
+///
+/// A `Replaces` with only the Call-ID is a dialog the server cannot
+/// find, and a server that cannot find it treats the transfer as one
+/// to another machine — which on Asterisk means an `external_replaces`
+/// extension in the dialplan, and a transfer that does not happen.
+///
+/// This is also what pjsip sends — `pjsua_call_xfer_replaces` builds
+/// the same string, with the `;` and `=` percent-encoded because the
+/// value is parsed as a `Replaces` header once the escapes are undone.
+pub fn replaces_dialog_id_with_tags(
+    call_id: &str,
+    host: &str,
+    to_tag: &str,
+    from_tag: &str,
+) -> String {
+    format!(
+        "{}%3Bto-tag%3D{to_tag}%3Bfrom-tag%3D{from_tag}",
+        replaces_dialog_id(call_id, host)
+    )
+}
+
+/// The DTMF sequence a PBX feature-code transfer is typed as.
+///
+/// This is how a **hardware SIP phone** transfers: the transfer key
+/// sends the PBX's code, the user dials the target, and the phone
+/// sends the terminator. The PBX does the transfer; the phone only
+/// types.
+///
+/// Asterisk's `*2` is the blind transfer code and `*3` the attended
+/// one — both of them dialplan extensions, so what they do depends on
+/// the server's configuration, not on anything in the SIP message.
+///
+/// The spaces are stripped, because a target pasted as `555 88` is
+/// still the number `55588`.
+pub fn feature_code_sequence(prefix: &str, target: &str) -> String {
+    let cleaned: String = target
+        .trim()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    format!("{prefix}{cleaned}#")
 }
 
 /// A blind transfer: the transferee is asked to dial `target_uri`.
@@ -168,7 +239,12 @@ pub fn attended_transfer(transferee_uri: &str, consultation: &Consultation) -> R
         request_uri: transferee_uri.to_string(),
         refer_to: refer_to_attended(
             &consultation.uri,
-            &replaces_dialog_id(&consultation.call_id, &consultation.host),
+            &replaces_dialog_id_with_tags(
+                &consultation.call_id,
+                &consultation.host,
+                &consultation.to_tag,
+                &consultation.from_tag,
+            ),
         ),
     }
 }
@@ -222,6 +298,8 @@ mod tests {
             uri: "sip:bob@target.example.com".into(),
             call_id: "1a2b3c".into(),
             host: "192.0.2.4".into(),
+            to_tag: "peer-tag".into(),
+            from_tag: "our-tag".into(),
         };
         let refer = attended_transfer("sip:alice@peer", &consultation);
 
@@ -231,9 +309,48 @@ mod tests {
 
         assert_eq!(
             refer.refer_to,
-            "<sip:bob@target.example.com;method=INVITE?Replaces=1a2b3c%40192.0.2.4>"
+            "<sip:bob@target.example.com;method=INVITE?Replaces=1a2b3c%40192.0.2.4\
+             %3Bto-tag%3Dpeer-tag%3Bfrom-tag%3Dour-tag>"
         );
         assert_eq!(refer.mode(), TransferMode::Attended);
+    }
+
+    #[test]
+    fn the_replaces_names_the_dialog_by_all_three_of_its_identifiers() {
+        // RFC 3891 §3.1, and what Asterisk matches on. A Replaces
+        // with only the Call-ID is a dialog the server cannot find.
+        assert_eq!(
+            replaces_dialog_id_with_tags("1a2b3c", "192.0.2.4", "peer-tag", "our-tag"),
+            "1a2b3c%40192.0.2.4%3Bto-tag%3Dpeer-tag%3Bfrom-tag%3Dour-tag"
+        );
+    }
+
+    #[test]
+    fn the_tags_are_where_a_server_looks_for_them() {
+        // The value is parsed as a `Replaces` header once the escapes
+        // are undone, so the separators have to be escaped — and the
+        // to-tag is the peer's, the from-tag is ours.
+        let id = replaces_dialog_id_with_tags("1a2b3c", "192.0.2.4", "peer-tag", "our-tag");
+        let undone = id
+            .replace("%40", "@")
+            .replace("%3B", ";")
+            .replace("%3D", "=");
+
+        assert_eq!(
+            undone, "1a2b3c@192.0.2.4;to-tag=peer-tag;from-tag=our-tag",
+            "the Replaces does not read as a Replaces header once unescaped"
+        );
+    }
+
+    #[test]
+    fn a_feature_code_transfer_is_typed_as_the_phone_types_it() {
+        // The C++ sends `*2<target>#` — the PBX's blind transfer code,
+        // the target, and the terminator.
+        assert_eq!(feature_code_sequence("*2", "6666"), "*26666#");
+        assert_eq!(feature_code_sequence("*3", "6666"), "*36666#");
+
+        // A target pasted with spaces is still the number without them.
+        assert_eq!(feature_code_sequence("*2", " 555 88 "), "*255588#");
     }
 
     #[test]

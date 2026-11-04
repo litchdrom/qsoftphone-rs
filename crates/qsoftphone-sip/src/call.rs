@@ -37,7 +37,9 @@ use tracing::warn;
 use qsoftphone_core::model::account::Account;
 use qsoftphone_core::model::call_event::{CallEvent, CallEventType, Direction};
 use qsoftphone_core::sip::identity;
-use qsoftphone_core::sip::refer::{TransferProgress, attended_transfer, blind_transfer};
+use qsoftphone_core::sip::refer::{
+    TransferProgress, attended_transfer, blind_transfer, feature_code_sequence,
+};
 use qsoftphone_core::sip::uri::normalise_sip_target;
 use qsoftphone_media::{Codec, MediaConfig, MediaSession, MediaStatus};
 
@@ -48,6 +50,12 @@ use crate::transfer::{consultation_of, refer_progress};
 
 /// How long a DTMF digit lasts, in milliseconds.
 const DTMF_DURATION_MS: u32 = 100;
+
+/// The pause between two digits of a feature code, in milliseconds.
+///
+/// The server matches the code as a dialplan pattern, so the digits
+/// have to arrive as a sequence rather than as one burst.
+const DTMF_INTERDIGIT_MS: u64 = 60;
 
 /// Why a call could not be started or driven.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -541,6 +549,60 @@ impl CallManager {
                         response.reason_phrase().unwrap_or_default(),
                     );
                 }
+            }
+        });
+        Ok(())
+    }
+
+    /// Transfer a call the way a hardware SIP phone does: by typing
+    /// the PBX's feature code.
+    ///
+    /// The transfer key of a phone like the Sipura SPA sends the PBX's
+    /// code as DTMF, the user dials the target, and the phone sends
+    /// the terminator. The **PBX** does the transfer — there is no
+    /// REFER, no consultation and nothing to match on the far side.
+    ///
+    /// Asterisk's `*2` is the blind transfer code and `*3` the
+    /// attended one. Both are dialplan extensions, so what they do
+    /// depends on the server's configuration.
+    ///
+    /// The digits go out one at a time, in order, with a pause
+    /// between them: a server that matches the code as a dialplan
+    /// pattern needs to see the digits arrive as a sequence.
+    pub fn transfer_by_feature_code(
+        &self,
+        account_id: &str,
+        call_id: &str,
+        prefix: &str,
+        target: &str,
+    ) -> Result<(), CallError> {
+        let session = self
+            .sessions
+            .get(account_id)
+            .ok_or(CallError::NotRegistered)?;
+        let dialog = session.dialog(call_id).ok_or(CallError::NoSuchCall)?;
+
+        if !matches!(dialog.state(), DialogState::Confirmed(_, _)) {
+            return Err(CallError::Sip("the call is not up yet".to_string()));
+        }
+
+        let sequence = feature_code_sequence(prefix, target);
+        if target.trim().is_empty() {
+            return Err(CallError::BadTarget(target.to_string()));
+        }
+
+        let call_id = call_id.to_string();
+        self.handle.spawn(async move {
+            for digit in sequence.chars() {
+                let headers = vec![Header::ContentType(sdp::DTMF_RELAY_CONTENT_TYPE.into())];
+                let body = sdp::dtmf_relay_body(&digit.to_string(), DTMF_DURATION_MS);
+                if let Err(e) = dialog.info(Some(headers), Some(body)).await {
+                    warn!(call_id = %call_id, error = %e, "the feature code could not be sent");
+                    return;
+                }
+                // The server has to see the digits as a sequence, not
+                // as one burst.
+                tokio::time::sleep(std::time::Duration::from_millis(DTMF_INTERDIGIT_MS)).await;
             }
         });
         Ok(())

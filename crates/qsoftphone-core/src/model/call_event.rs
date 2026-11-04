@@ -146,8 +146,12 @@ pub struct CallEvent {
     pub transfer_code: i32,
     /// The reason the peer gave, when it gave one.
     ///
-    /// The `Subscription-State` reason: `terminated`, `noresource`
-    /// (the peer could not route to the target), and so on.
+    /// The `Subscription-State` reason: `noresource`, `timeout`,
+    /// `deactivated`, and so on.
+    ///
+    /// `noresource` is on the final NOTIFY of a **successful**
+    /// transfer as well (RFC 3515 §2.4.7), so it is not a failure by
+    /// itself — the status code is the judge.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub transfer_reason: String,
 

@@ -271,7 +271,10 @@ Deliberate differences from the C++:
   delegates to pjsip's `Call::xfer` / `Call::xferReplaces`. The brief
   is explicit that the attended form carries `Replaces` as a URI
   parameter inside the `Refer-To` value — not as a separate `Replaces`
-  header — and that the test suite expects exactly that.
+  header — and that the test suite expects exactly that. The *contents*
+  of the parameter are the tagged form (§5.6's example is kept in the
+  core and tested, but a PBX matches a dialog by all three of its
+  identifiers — see [M5](#m5--transfer)).
 
 ### One conflict in the brief, resolved in favour of the C++
 
@@ -3085,14 +3088,21 @@ to put a new leg up. There are two flavours, and they differ only in the
 Blind:
   Refer-To: <sip:bob@target.example.com>
 
-Attended (RFC 5589):
-  Refer-To: <sip:bob@target.example.com;method=INVITE?Replaces=<call-id>%40<host>>
+Attended (RFC 5589) — the `Replaces` names the dialog by all three of
+its identifiers, so the peer can find it:
+  Refer-To: <sip:bob@target.example.com;method=INVITE?Replaces=1a2b3c%40192.0.2.4%3Bto-tag%3Dpeer-tag%3Bfrom-tag%3Dour-tag>
 ```
 
 The peer answers `202 Accepted` and then reports the progress of the new
 leg over a `NOTIFY` (RFC 3515 §3.4). The progress arrives as a
 `call_transfer_progress` event, and the call page says what is
 happening.
+
+There is a **third** method, and it is the one a hardware SIP phone
+uses: the **PBX feature code**. The app types `*2<target>#` as DTMF and
+the *server* does the transfer. It needs no `REFER`, no consultation and
+nothing for the far side to match, so it works on a PBX that does not
+honour a `REFER` at all — and it is the C++'s own third method.
 
 ### The `NOTIFY` is read by hand
 
@@ -3112,19 +3122,61 @@ Two rules in it are worth stating:
 * **The last status line in the body is the progress.** RFC 3515 §3.4.1
   allows the body to carry several; a body with `100 Trying` and then
   `200 OK` is reporting progress, and the progress is the 200.
-* **`noresource` outranks the status line.** `terminated;reason=noresource`
-  means the peer could not route to the target (RFC 3515 §7.1.1). The
-  body may well say `100 Trying` — the transfer started and got nowhere,
-  and that is a failure whatever the status line says.
+* **The body decides, and the reason does not.** `terminated;reason=noresource`
+  does **not** mean the peer could not route to the target — it means the
+  subscription is over. RFC 3515 §2.4.7 asks for exactly that on the
+  final NOTIFY of a **successful** transfer, and pjsip's own state name
+  for a terminated subscription is the literal string
+  `terminated;reason=noresource`, so a server says it on every transfer
+  that ends. The rules are:
 
-### The `Replaces` is the consultation's Call-ID
+  | | |
+  |---|---|
+  | `200 OK` in the body | the transfer worked |
+  | `4xx` or `5xx` in the body | it failed |
+  | the subscription ended and the body said anything else | it failed |
+  | the subscription is still alive | it is in flight |
+
+  Reading `noresource` as "no route to the target" — as the C++'s own
+  comment does — reports **every successful transfer** as a failure,
+  because that is the string every successful transfer ends with.
+
+### The `Replaces` names the dialog by all three of its identifiers
 
 The attended transfer names the dialog it is handing over, so the peer
-can bridge to it. RFC 3891 wants `call-id;to-tag=…;from-tag=…`; §5.6 asks
-for `call-id%40host`, and the test suite uses exactly that form. The
-identifier is therefore the consultation dialog's **Call-ID**, with the
-`@` percent-encoded — the very string the peer saw in our INVITE, so the
-peer can match it.
+can bridge to it. A dialog is named by **three** things (RFC 3891 §3.1):
+its Call-ID, the tag the peer put on its `To`, and the tag we put on our
+`From`.
+
+§5.6's example is the Call-ID alone — `call-id%40host` — and it is kept
+in the core and tested, but it **cannot** match a local leg. Asterisk
+looks the dialog up with all three:
+
+```c
+pjsip_ua_find_dialog(&replaces->call_id, &replaces->to_tag, &replaces->from_tag, PJ_TRUE)
+```
+
+(`res_pjsip_refer.c`, `refer_incoming_attended_request`). With only a
+Call-ID the lookup fails, and Asterisk falls through to the
+`external_replaces` dialplan path — which is the user's error, verbatim:
+
+```text
+Received REFER for remote session on channel 'PJSIP/104-0000003e' from endpoint '104'
+but 'external_replaces' extension not found in context test
+```
+
+So what goes on the wire is the tagged form:
+
+```text
+Refer-To: <sip:bob@target.example.com;method=INVITE?Replaces=1a2b3c%40192.0.2.4%3Bto-tag%3Dpeer-tag%3Bfrom-tag%3Dour-tag>
+```
+
+The `;` and the `=` are percent-encoded because the value is parsed as a
+`Replaces` **header** once the escapes are undone — and pjsip sends the
+same string (`pjsua_call_xfer_replaces`). The two tags look swapped
+against what they are called: the **to-tag** is the *peer's* tag (our
+remote tag) and the **from-tag** is *ours* (our local tag), because the
+two ends of a dialog hold the same two tags the other way round.
 
 The host is the one the Call-ID carries, not the host of our contact: the
 peer matches the whole Call-ID it received.
@@ -3167,16 +3219,24 @@ composed the same way here:
 | 100 | "Transferring… new target trying" |
 | 180, 183 | "Transferring… new target ringing" |
 | 200 | "Transferring… new target answered" |
-| 400…699 | "Transfer failed: `<code>` (`<reason>`)" |
-| `noresource` | "Transfer failed: no route to target" |
+| 400…699 | "Transfer failed: `<code>` (`<reason>`)" — and the reason is left out when it is `noresource` |
+| a failure that never got an answer | "Transfer failed: no route to target" |
 | anything else | "Transfer ended (`<reason>`)", or "Transferring…" |
 
-**One thing is not the C++'s: the `noresource` reason is checked first.**
-The C++ checks it *last*, and its own comment says what it is for —
-*"Subscription ended without a resource being created (Asterisk couldn't
-route to the target)"*. With that order a `100 Trying` in the body wins,
-and the banner says a transfer that never reached anybody is a transfer
-in progress. The reason is unambiguous, so it decides here.
+**One thing is not the C++'s: the progress decides, and `noresource` is
+not shown.** The C++ reads `noresource` as *"the subscription ended
+without a resource being created (Asterisk couldn't route to the
+target)"* and puts it in the banner — so a failed transfer reads
+"Transfer failed: 486 (noresource)", which explains nothing, because
+`noresource` is on **every** terminating subscription.
+
+The C++ checks the reason *last*, so its successes are right. M5 checked
+it **first**, and every successful transfer was reported as "no route to
+target". The banner now takes the **progress** and the **code**:
+
+* the progress says whether it failed;
+* the code says how far it got;
+* the reason is shown only when it is not `noresource`.
 
 ### The interface
 
@@ -3217,6 +3277,40 @@ peer must not hear the conversation with the third party. That is a
 **local mute, not a SIP hold** — the peer is not told, and it has no way
 of knowing a hold happened.
 
+### The third method: the PBX feature code
+
+The popup offers a third button, **PBX feature code**, and it is the one
+a hardware SIP phone uses. The phone's transfer key sends the PBX's
+code, the user dials the target, and the phone sends the terminator —
+the PBX does the transfer and the phone only types.
+
+That is `*2<target>#` on Asterisk (`*3` for the attended flavour), sent
+as DTMF over `INFO`, one digit at a time with a pause between them,
+because the server matches the code as a dialplan pattern and needs to
+see the digits arrive as a sequence rather than as one burst.
+
+The prefix is editable in the popup, because it is the **server's**
+setting and not this build's: Asterisk's `*2` is a dialplan extension,
+and what it does depends on the dialplan. The default is `*2` — the
+blind transfer code.
+
+This method needs no `REFER`, no consultation and no `Replaces` for the
+far side to match, so it gets a transfer through a PBX that does not
+honour a `REFER` at all — and the C++ has the same third method, for
+the same reason.
+
+What it cannot do is report progress: the app types the code and the
+PBX takes the call from there. There is no `NOTIFY` to read, so the
+banner has nothing to say about how the transfer is going.
+
+It is also the one the brief calls out by name (§5.9): *"A PBX
+feature-code transfer (`*2<target>#`) must send the whole string as raw
+DTMF and must not be re-intercepted by the configured `*2` rule."* The
+string is sent whole, and it is sent from the app's DTMF path rather
+than from the dialpad — so the configurable `code → action` rules of
+§5.9, when they land in M6, have to be careful about where they
+intercept.
+
 ### The page does not jump
 
 The user's second report: the transfer field jumped about when the
@@ -3246,9 +3340,13 @@ No new package.
 * **A transfer we are *given* is declined.** A peer that sends us a
   `REFER` gets `501 Not Implemented`: this build does not take part in a
   transfer it is handed, and saying so is the honest answer.
-* **The `Replaces` has no tags.** RFC 3891 wants `to-tag` and `from-tag`
-  as well as the Call-ID; §5.6's form is the Call-ID alone. A PBX that
-  insists on the tags will not match the consultation.
+* **The `Replaces` on the wire is the tagged form.** §5.6's Call-ID-only
+  form is still in the core and still tested, but it is not what goes
+  out: a PBX that matches a dialog by its tags — which is what Asterisk
+  does — cannot find a dialog by its Call-ID alone.
+* **The feature code is the server's, not this build's.** The app types
+  `*2<target>#` and the PBX does what `*2` does. If the dialplan has no
+  `*2` in it, nothing happens, and nothing here can tell the user why.
 * **The consultation is not bridged by us.** The peer bridges to it —
   that is what the `Replaces` means.
 
@@ -3299,7 +3397,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M4.14** | The echo test comes back: the sound card is busy while a call is **up**, not while one is selected — so the test works again after a call, and the test sound waits for the card instead of playing over a call | **done** |
 | **M4.15** | The volume controls, and the preamp: the microphone gain is applied for the first time, it goes above unity, and both directions have a knob — live on the call page, and as the default in the settings | **done** |
 | **M4.16** | The call is said once: the media logged what the call did when it stopped *and* again when the session was dropped, so every call was in the log twice | **done** |
-| **M5** | Transfer: blind and attended REFER per §5.6, the NOTIFY progress over RFC 3515 §3.4, and the original leg released when the new leg is answered | **done** |
+| **M5** | Transfer: blind and attended REFER per §5.6, a `Replaces` that names the consultation by all three of its identifiers, the NOTIFY progress over RFC 3515 §3.4, the original leg released when the new leg is answered, and the PBX feature code | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -3363,7 +3461,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 362 tests, all passing.
+* `cargo test --workspace` — 370 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -3418,10 +3516,18 @@ player lands.
   checks that the original call ended and that the peer saw the `BYE`.
 * **An attended transfer names the consultation.** The `Refer-To` carries
   `;method=INVITE?Replaces=`, and the `Replaces` is the consultation
-  dialog's Call-ID with the `@` percent-encoded.
+  dialog's Call-ID with the `@` percent-encoded **and the dialog's two
+  tags** — the peer looks the dialog up by all three.
 * **A transfer that cannot reach its target leaves the original call
-  up.** The peer ends the subscription with `reason=noresource`; the
-  progress comes back as a failure, and no `BYE` goes out.
+  up.** The peer ends the subscription and the body says `486` or
+  `503`; the progress comes back as a failure, and no `BYE` goes out.
+* **A transfer that worked is not reported as a failure.** The final
+  `NOTIFY` of a successful transfer carries
+  `terminated;reason=noresource`, and that reason says nothing about
+  the transfer — the body says `200 OK`, and the transfer worked.
+* **A feature-code transfer arrives as DTMF.** The app types
+  `*2<target>#` one digit at a time, and the peer sees every digit in
+  order.
 * **The transfer popup says how the attended transfer is finished.** The
   popup has the C++'s two phases: one to name a target and pick the
   method, and one — while the consultation is dialling — that says where
@@ -3818,10 +3924,12 @@ player lands.
 * **The transfer has not been made to a real PBX.** The `REFER`, the
   `NOTIFY` progress and the release of the original leg are all proved
   against the hand-written peer in this repository, over a real socket.
-  What has not been tried is the user's own Asterisk: whether it takes
-  the `Replaces` in §5.6's form — a Call-ID with no `to-tag` or
-  `from-tag` — is the open question, and it is the one to check on the
-  next call with a second extension.
+  What has not been tried is the user's own Asterisk: the attended
+  transfer failed there because the `Replaces` named the dialog by its
+  Call-ID alone, and a PBX that matches a dialog by its tags cannot find
+  it that way. The `Replaces` now carries the tags as well — whether
+  Asterisk takes it is the open question, and it is the one to check on
+  the next call with a second extension.
 * **The remote session has not been tested against one.** This machine
   is at the console, so `GetSystemMetrics(SM_REMOTESESSION)` returns
   false here and the notice is exercised by a test that forces it on.
