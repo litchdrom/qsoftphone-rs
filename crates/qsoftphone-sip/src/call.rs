@@ -26,6 +26,7 @@ use std::sync::Arc;
 use rsipstack::dialog::authenticate::Credential;
 use rsipstack::dialog::dialog::{Dialog, DialogState, TerminatedReason};
 use rsipstack::dialog::invitation::InviteOption;
+use rsipstack::dialog::invite_dialog::InviteDialog;
 use rsipstack::sip::event_packages::parse_info_dtmf;
 use rsipstack::sip::{Auth, Header, HeadersExt, Scheme, StatusCode, ToTypedHeader, Uri};
 use rsipstack::transaction::Transaction;
@@ -36,12 +37,14 @@ use tracing::warn;
 use qsoftphone_core::model::account::Account;
 use qsoftphone_core::model::call_event::{CallEvent, CallEventType, Direction};
 use qsoftphone_core::sip::identity;
+use qsoftphone_core::sip::refer::{TransferProgress, attended_transfer, blind_transfer};
 use qsoftphone_core::sip::uri::normalise_sip_target;
 use qsoftphone_media::{Codec, MediaConfig, MediaSession, MediaStatus};
 
 use crate::endpoint::split_host_port;
 use crate::sdp;
 use crate::session::{AccountSession, SessionRegistry};
+use crate::transfer::{consultation_of, refer_progress};
 
 /// How long a DTMF digit lasts, in milliseconds.
 const DTMF_DURATION_MS: u32 = 100;
@@ -427,6 +430,122 @@ impl CallManager {
         Ok(())
     }
 
+    /// Transfer a call to another target — the blind transfer of §5.6.
+    ///
+    /// The REFER goes to the peer we are talking to, and the
+    /// `Refer-To` names the new target: that peer is the one who has
+    /// to put the new leg up (RFC 3515).
+    ///
+    /// The peer answers `202 Accepted` and then reports the progress
+    /// of the new leg over a NOTIFY (RFC 3515 §3.4); that progress
+    /// arrives as a [`CallEventType::TransferProgress`] event, and the
+    /// original leg is released when it says the new leg is answered.
+    pub fn transfer_blind(
+        &self,
+        account_id: &str,
+        call_id: &str,
+        target: &str,
+    ) -> Result<(), CallError> {
+        let session = self
+            .sessions
+            .get(account_id)
+            .ok_or(CallError::NotRegistered)?;
+        let account = session.account.clone();
+        let dialog = session.dialog(call_id).ok_or(CallError::NoSuchCall)?;
+
+        let target_uri = normalise_sip_target(target, &account.registrar);
+        // A target that is not a URI cannot be referred to.
+        target_uri
+            .parse::<Uri>()
+            .map_err(|_| CallError::BadTarget(target_uri.clone()))?;
+
+        let peer = dialog.snapshot().remote_uri.to_string();
+        let refer = blind_transfer(&peer, &target_uri);
+        self.send_refer(account_id, call_id, dialog, refer.refer_to)
+    }
+
+    /// Transfer a call to a consultation that is already up — the
+    /// attended transfer of §5.6 (RFC 5589).
+    ///
+    /// The `Refer-To` names the consultation and carries the
+    /// consultation's dialog identifier, so the peer bridges to the
+    /// call that is already up instead of dialling a new target.
+    ///
+    /// The consultation is **our** leg, so when the transfer works it
+    /// is released together with the original one.
+    pub fn transfer_attended(
+        &self,
+        account_id: &str,
+        call_id: &str,
+        consultation_call_id: &str,
+    ) -> Result<(), CallError> {
+        let session = self
+            .sessions
+            .get(account_id)
+            .ok_or(CallError::NotRegistered)?;
+        let dialog = session.dialog(call_id).ok_or(CallError::NoSuchCall)?;
+        let consultation = session
+            .dialog(consultation_call_id)
+            .ok_or(CallError::NoSuchCall)?;
+
+        let peer = dialog.snapshot().remote_uri.to_string();
+        let refer = attended_transfer(&peer, &consultation_of(&consultation));
+
+        // The consultation goes with the original leg when the
+        // transfer works, so the watcher has to know which one it is.
+        session.remember_consultation(call_id, consultation_call_id);
+
+        self.send_refer(account_id, call_id, dialog, refer.refer_to)
+    }
+
+    /// Send the REFER itself.
+    ///
+    /// The dialog has to be up: a REFER on a call that is not
+    /// established is a REFER the stack throws away without saying
+    /// so.
+    fn send_refer(
+        &self,
+        account_id: &str,
+        call_id: &str,
+        dialog: InviteDialog,
+        refer_to: String,
+    ) -> Result<(), CallError> {
+        if !matches!(dialog.state(), DialogState::Confirmed(_, _)) {
+            return Err(CallError::Sip("the call is not up yet".to_string()));
+        }
+
+        let account_id = account_id.to_string();
+        let call_id = call_id.to_string();
+        let bus = self.bus.clone();
+        self.handle.spawn(async move {
+            let response = match dialog.refer(refer_to, None, None).await {
+                Ok(response) => response,
+                Err(e) => {
+                    warn!(call_id = %call_id, error = %e, "the REFER could not be sent");
+                    transfer_failed(&bus, &account_id, &call_id, 0, &e.to_string());
+                    return;
+                }
+            };
+
+            // The peer refused the REFER itself: the transfer never
+            // started, and no NOTIFY is coming.
+            if let Some(response) = response {
+                let status = response.status_code();
+                if status.code() >= 300 {
+                    warn!(call_id = %call_id, code = status.code(), "the peer refused the transfer");
+                    transfer_failed(
+                        &bus,
+                        &account_id,
+                        &call_id,
+                        status.code(),
+                        response.reason_phrase().unwrap_or_default(),
+                    );
+                }
+            }
+        });
+        Ok(())
+    }
+
     /// Mute or unmute the microphone of a call.
     ///
     /// The flag is an atomic, so this is safe to call from the
@@ -619,6 +738,7 @@ async fn watch_dialog(
 ) {
     let account_id = session.account.id.clone();
     let mut ended = false;
+    let mut answered = false;
 
     loop {
         // The account can go away under a live call: the user
@@ -653,6 +773,15 @@ async fn watch_dialog(
                 }
             }
             DialogState::Confirmed(_, response) => {
+                // The dialog says "confirmed" again after every
+                // in-dialog request — the DTMF `INFO`, the transfer's
+                // `NOTIFY`. The call is still the same call, and it is
+                // answered once.
+                if answered {
+                    continue;
+                }
+                answered = true;
+
                 // The peer's answer is where its RTP comes from and
                 // which codec it chose. For an incoming call the offer
                 // already said, and the answer confirmed the codec.
@@ -705,6 +834,49 @@ async fn watch_dialog(
                 }
                 handle.respond(StatusCode::OK, None, None).await.ok();
             }
+            DialogState::Notify(_, request, handle) => {
+                // The transfer's progress (RFC 3515 §3.4). The NOTIFY
+                // has to be answered, or the peer's transaction hangs.
+                let update = refer_progress(&request);
+                handle.respond(StatusCode::OK, None, None).await.ok();
+
+                let Some(update) = update else {
+                    continue;
+                };
+
+                let mut event = CallEvent::new(CallEventType::TransferProgress);
+                event.user = user.clone();
+                event.call_id = call_id.clone();
+                event.call_direction = Some(direction);
+                event.transfer_progress = Some(update.progress);
+                event.transfer_code = update.code as i32;
+                event.transfer_reason = update.reason.clone();
+                bus.publish(&account_id, event);
+
+                if update.progress == TransferProgress::Answered {
+                    // The transfer worked. The original leg has to go:
+                    // the user is still connected to the old peer
+                    // otherwise (§5.6).
+                    release_legs(&session, &call_id);
+                } else {
+                    // The transfer is over either way — a failure ends
+                    // it too, and the consultation mapping is stale
+                    // from here on. The consultation itself stays up:
+                    // the user may want to try again.
+                    session.take_consultation(&call_id);
+                }
+            }
+            DialogState::Refer(_, _, handle) => {
+                // The peer is transferring the call **to us**. This
+                // build does not take part in a transfer it is given,
+                // and saying so is the honest answer: the transaction
+                // has to be closed either way.
+                warn!(call_id = %call_id, "the peer sent a REFER; this build does not take part in it");
+                handle
+                    .respond(StatusCode::NotImplemented, None, None)
+                    .await
+                    .ok();
+            }
             DialogState::Terminated(id, reason) => {
                 // The media goes first: the sound card is closed and
                 // the RTP threads stop before the call is forgotten.
@@ -744,6 +916,47 @@ async fn watch_dialog(
         event.call_state = "ended".to_string();
         event.hangup_cause = "the account was unregistered".to_string();
         bus.publish(&account_id, event);
+    }
+}
+
+/// Say that a transfer failed, on the call it was started from.
+///
+/// The user has to be told: the banner would otherwise sit on
+/// "Transferring…" for ever, because a REFER that never went out
+/// never produces a NOTIFY either.
+fn transfer_failed(bus: &CallBus, account_id: &str, call_id: &str, code: u16, reason: &str) {
+    let mut event = CallEvent::new(CallEventType::TransferProgress);
+    event.call_id = call_id.to_string();
+    event.transfer_progress = Some(TransferProgress::Failed);
+    event.transfer_code = code as i32;
+    event.transfer_reason = reason.to_string();
+    bus.publish(account_id, event);
+}
+
+/// Release the legs of a transfer that worked.
+///
+/// The original leg goes because the user is still connected to the
+/// old peer otherwise (§5.6), and the banner would say "Transferred"
+/// while the old peer is still on the line.
+///
+/// The consultation leg goes with it: it is **our** leg, and a leg
+/// left up holds the microphone for a call the user has already
+/// left.
+fn release_legs(session: &AccountSession, call_id: &str) {
+    let consultation = session.take_consultation(call_id);
+    for leg in [Some(call_id.to_string()), consultation]
+        .into_iter()
+        .flatten()
+    {
+        let Some(dialog) = session.dialog(&leg) else {
+            continue;
+        };
+        let leg_id = leg.clone();
+        tokio::spawn(async move {
+            if let Err(e) = dialog.hangup().await {
+                warn!(call_id = %leg_id, error = %e, "the leg could not be released");
+            }
+        });
     }
 }
 

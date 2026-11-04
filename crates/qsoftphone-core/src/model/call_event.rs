@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 
 use crate::model::account::HeaderMap;
+use crate::sip::refer::TransferProgress;
 
 /// The kind of event.
 ///
@@ -43,6 +44,12 @@ pub enum CallEventType {
     CallResumed,
     #[serde(rename = "contact_enriched")]
     ContactEnriched,
+    /// A transfer is going on: the peer reported its progress.
+    ///
+    /// §5.6 — one of these per NOTIFY the peer sends on the refer
+    /// subscription (RFC 3515 §3.4).
+    #[serde(rename = "call_transfer_progress")]
+    TransferProgress,
 }
 
 impl CallEventType {
@@ -61,6 +68,7 @@ impl CallEventType {
             CallEventType::CallOnHold => "call_on_hold",
             CallEventType::CallResumed => "call_resumed",
             CallEventType::ContactEnriched => "contact_enriched",
+            CallEventType::TransferProgress => "call_transfer_progress",
         }
     }
 }
@@ -125,6 +133,24 @@ pub struct CallEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub digit: String,
 
+    // -- Transfer context (TransferProgress only) --
+    /// How far the transfer has got.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_progress: Option<TransferProgress>,
+    /// The status code the peer reported for the transfer.
+    ///
+    /// The code of the **referred** call, out of the NOTIFY's
+    /// message/sipfrag body: 100 Trying, 180 Ringing, 200 OK on
+    /// success, a 4xx or 5xx on failure.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub transfer_code: i32,
+    /// The reason the peer gave, when it gave one.
+    ///
+    /// The `Subscription-State` reason: `terminated`, `noresource`
+    /// (the peer could not route to the target), and so on.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub transfer_reason: String,
+
     // -- Registration context (only on RegistrationStateChanged) --
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reg_state: String,
@@ -180,6 +206,9 @@ impl CallEvent {
             hangup_cause: String::new(),
             duration_sec: 0,
             digit: String::new(),
+            transfer_progress: None,
+            transfer_code: 0,
+            transfer_reason: String::new(),
             reg_state: String::new(),
             reg_reason: String::new(),
             reg_server: String::new(),

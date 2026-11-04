@@ -50,6 +50,13 @@ pub struct AccountSession {
     /// status of a call while the call is still being set up on
     /// another thread.
     media: Mutex<HashMap<String, MediaSession>>,
+    /// The consultation leg of an attended transfer, keyed by the
+    /// Call-ID of the call being transferred.
+    ///
+    /// The consultation is **our** leg: when the transfer succeeds it
+    /// has to go with the original one, or it stays up holding the
+    /// microphone for a call the user has already left.
+    consultations: Mutex<HashMap<String, String>>,
     /// What the media of a call should be.
     ///
     /// The settings are global, as they were in the C++: the `media`
@@ -75,6 +82,7 @@ impl AccountSession {
             token: CancellationToken::new(),
             dialogs: Mutex::new(HashMap::new()),
             media: Mutex::new(HashMap::new()),
+            consultations: Mutex::new(HashMap::new()),
             media_config,
         })
     }
@@ -159,6 +167,29 @@ impl AccountSession {
         if let Some(media) = self.media.lock().expect("media lock").remove(call_id) {
             media.stop();
         }
+    }
+
+    /// Remember the consultation leg of an attended transfer.
+    ///
+    /// The transfer is started on one call and points at another; the
+    /// second one has to be released with the first when the transfer
+    /// works.
+    pub fn remember_consultation(&self, call_id: &str, consultation_call_id: &str) {
+        self.consultations
+            .lock()
+            .expect("consultations lock")
+            .insert(call_id.to_string(), consultation_call_id.to_string());
+    }
+
+    /// The consultation leg of a transfer, taken out of the way.
+    ///
+    /// Taken, not copied: a transfer only has one consultation, and
+    /// the leg is released exactly once.
+    pub fn take_consultation(&self, call_id: &str) -> Option<String> {
+        self.consultations
+            .lock()
+            .expect("consultations lock")
+            .remove(call_id)
     }
 }
 

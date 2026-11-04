@@ -52,6 +52,43 @@ pub struct Consultation {
     pub host: String,
 }
 
+/// How a transfer is going.
+///
+/// The codes are the ones RFC 3515 §7.1.2 puts in the body of the
+/// NOTIFY that reports the progress of the referred call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferProgress {
+    /// The peer accepted the REFER and is putting the new leg up.
+    Trying,
+    /// The new target is ringing.
+    Ringing,
+    /// The new target answered: the transfer worked.
+    Answered,
+    /// The transfer failed.
+    Failed,
+}
+
+/// What a transfer's progress code means.
+///
+/// RFC 3515 §7.1.2: `100 Trying`, `180 Ringing` or `183 Session
+/// Progress` while the new leg comes up, `200 OK` when it is answered,
+/// and a `4xx` or `5xx` when it fails.
+///
+/// Anything else is a progress report this build does not know, and it
+/// is still in flight — so it is a "trying", not a failure. A transfer
+/// that is judged broken by a code it has never seen is a transfer that
+/// breaks on a server that is only being helpful.
+pub fn progress_of(code: u16) -> TransferProgress {
+    match code {
+        100 => TransferProgress::Trying,
+        180 | 183 => TransferProgress::Ringing,
+        200 => TransferProgress::Answered,
+        400..=699 => TransferProgress::Failed,
+        _ => TransferProgress::Trying,
+    }
+}
+
 /// A REFER request: where it goes and what it carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferRequest {
@@ -104,8 +141,16 @@ pub fn refer_to_attended(target_uri: &str, dialog_id: &str) -> String {
 /// A SIP Call-ID is `local-part@host`. Inside a URI parameter the
 /// `@` has to be percent-encoded, which is what the `%40` in the
 /// §5.6 example is.
+///
+/// A Call-ID with no host at all is passed through unchanged: a
+/// trailing `%40` with nothing behind it is not an identifier, it is
+/// a fragment.
 pub fn replaces_dialog_id(call_id: &str, host: &str) -> String {
-    format!("{call_id}%40{host}")
+    if host.is_empty() {
+        call_id.to_string()
+    } else {
+        format!("{call_id}%40{host}")
+    }
 }
 
 /// A blind transfer: the transferee is asked to dial `target_uri`.
@@ -189,5 +234,21 @@ mod tests {
             "<sip:bob@target.example.com;method=INVITE?Replaces=1a2b3c%40192.0.2.4>"
         );
         assert_eq!(refer.mode(), TransferMode::Attended);
+    }
+
+    #[test]
+    fn the_progress_code_says_what_is_happening() {
+        // RFC 3515 §7.1.2.
+        assert_eq!(progress_of(100), TransferProgress::Trying);
+        assert_eq!(progress_of(180), TransferProgress::Ringing);
+        assert_eq!(progress_of(183), TransferProgress::Ringing);
+        assert_eq!(progress_of(200), TransferProgress::Answered);
+        assert_eq!(progress_of(486), TransferProgress::Failed);
+        assert_eq!(progress_of(503), TransferProgress::Failed);
+
+        // A code this build does not know is still in flight, not a
+        // failure.
+        assert_eq!(progress_of(0), TransferProgress::Trying);
+        assert_eq!(progress_of(202), TransferProgress::Trying);
     }
 }

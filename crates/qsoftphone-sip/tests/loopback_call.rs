@@ -66,7 +66,7 @@ fn response(request: &str, status: &str, extra: &[(&str, &str)], body: &str) -> 
             // one tag for the whole test.
             let value = if name == "To" && request.starts_with("INVITE") && !value.contains("tag=")
             {
-                format!("{value};tag=peer-tag")
+                format!("{value};tag={PEER_TAG}")
             } else {
                 value
             };
@@ -238,6 +238,96 @@ const PEER_CHALLENGE: &str = concat!(
     r#"algorithm=MD5, qop="auth""#,
 );
 
+/// The tag the peer puts on the `To` header of its answers.
+const PEER_TAG: &str = "peer-tag";
+
+/// The tag in a header value, if it has one.
+///
+/// `<sip:104@127.0.0.1>;tag=abc123` → `abc123`.
+fn tag_of(value: &str) -> Option<String> {
+    let after = value.split_once(";tag=")?.1;
+    let tag = after.split(';').next().unwrap_or_default().trim();
+    if tag.is_empty() {
+        None
+    } else {
+        Some(tag.to_string())
+    }
+}
+
+/// The URI in a header value, without its parameters.
+///
+/// `<sip:104@127.0.0.1>;tag=abc123` → `<sip:104@127.0.0.1>`.
+fn uri_of(value: &str) -> String {
+    match value.split_once(';') {
+        Some((uri, _)) => uri.trim().to_string(),
+        None => value.trim().to_string(),
+    }
+}
+
+/// The `NOTIFY` that reports the progress of a transfer.
+///
+/// RFC 3515 §3.4: the NOTIFY carries `Event: refer` and the
+/// `Subscription-State` header; the body is a `message/sipfrag` with
+/// the status line of the referred call.
+///
+/// The branch has to be different for every NOTIFY — a branch that is
+/// repeated is a retransmission, and the second progress report would
+/// be thrown away as one.
+fn refer_notify(
+    dialog: &PeerDialog,
+    peer_addr: std::net::SocketAddr,
+    cseq: u32,
+    status: &str,
+    subscription_state: &str,
+) -> String {
+    let target = dialog
+        .contact
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .to_string();
+    let body = format!("{status}\r\n");
+
+    format!(
+        concat!(
+            "NOTIFY {target} SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP {addr};branch=z9hG4bK-peer-notify-{cseq}\r\n",
+            "Max-Forwards: 70\r\n",
+            "To: {to}\r\n",
+            "From: {from}\r\n",
+            "Call-ID: {call_id}\r\n",
+            "CSeq: {cseq} NOTIFY\r\n",
+            "Event: refer\r\n",
+            "Subscription-State: {state}\r\n",
+            "Content-Type: message/sipfrag\r\n",
+            "Content-Length: {len}\r\n",
+            "\r\n",
+            "{body}"
+        ),
+        target = target,
+        addr = peer_addr,
+        to = dialog.to,
+        from = dialog.from,
+        call_id = dialog.call_id,
+        cseq = cseq,
+        state = subscription_state,
+        len = body.len(),
+        body = body,
+    )
+}
+
+/// What the peer reports about a transfer.
+///
+/// The peer takes the REFER and then reports the progress of the new
+/// leg over NOTIFYs (RFC 3515 §3.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferScript {
+    /// The new leg comes up and is answered: the transfer worked.
+    Answered,
+    /// The peer could not route to the target.
+    NoRoute,
+}
+
 /// What the peer should do.
 #[derive(Debug, Clone, Copy, Default)]
 struct PeerOptions {
@@ -247,6 +337,8 @@ struct PeerOptions {
     dtmf: Option<char>,
     /// Answer the first INVITE with a 401 challenge.
     challenge_invite: bool,
+    /// What to report when the client sends a REFER.
+    transfer: Option<TransferScript>,
 }
 
 /// A registrar and call agent on one socket.
@@ -257,7 +349,13 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
     let peer_addr = socket.local_addr().expect("peer addr");
     let mut buf = vec![0u8; 65535];
     let mut client: Option<std::net::SocketAddr> = None;
-    let mut dialog: Option<PeerDialog> = None;
+    // The dialogs the peer is in, keyed by SIP Call-ID.
+    //
+    // A test can have more than one call up at a time — the attended
+    // transfer has two — and the in-dialog requests (the DTMF, the
+    // transfer's NOTIFYs) have to go to the right one.
+    let mut dialogs: std::collections::HashMap<String, PeerDialog> =
+        std::collections::HashMap::new();
 
     loop {
         let (len, from) = socket.recv_from(&mut buf).await.expect("recv");
@@ -283,7 +381,8 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
             if first.contains("200 OK")
                 && header_value(&text, "CSeq").is_some_and(|v| v.contains("INVITE"))
             {
-                if let Some(dialog) = dialog.as_mut() {
+                let call_id = header_value(&text, "Call-ID").unwrap_or_default();
+                if let Some(dialog) = dialogs.get_mut(&call_id) {
                     dialog.to = header_value(&text, "To").unwrap_or(dialog.to.clone());
                     dialog.contact = header_value(&text, "Contact").unwrap_or_default();
                 }
@@ -295,7 +394,7 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
 
                 // The dialog is established on the peer's side now, so
                 // the DTMF can follow the ACK.
-                if let (Some(digit), Some(dialog)) = (options.dtmf, dialog.as_ref()) {
+                if let (Some(digit), Some(dialog)) = (options.dtmf, dialogs.get(&call_id)) {
                     let info = dtmf_info(dialog, peer_addr, digit);
                     socket
                         .send_to(info.as_bytes(), from)
@@ -338,6 +437,38 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
                     continue;
                 }
 
+                // The client's Contact is where the in-dialog requests
+                // go — the transfer's NOTIFYs.
+                //
+                // The tags are the dialog's, and they are not the
+                // obvious ones: RFC 3261 §8.1.1.3 says the `To` header
+                // of an in-dialog request carries the **recipient's**
+                // tag, so the NOTIFY puts the client's own tag on the
+                // `To` and the peer's tag on the `From`. Get this
+                // wrong and the in-dialog request arrives with no
+                // dialog to go to.
+                let client_from = header_value(&text, "From").unwrap_or_default();
+                let client_tag = tag_of(&client_from).unwrap_or_default();
+                let client_uri = uri_of(&client_from);
+                let peer_uri = uri_of(&header_value(&text, "To").unwrap_or_default());
+                let call_id = header_value(&text, "Call-ID").unwrap_or_default();
+                dialogs.insert(
+                    call_id.clone(),
+                    PeerDialog {
+                        call_id,
+                        from: format!("{peer_uri};tag={PEER_TAG}"),
+                        to: format!("{client_uri};tag={client_tag}"),
+                        contact: header_value(&text, "Contact").unwrap_or_default(),
+                        cseq: header_value(&text, "CSeq")
+                            .and_then(|v| {
+                                v.split_whitespace()
+                                    .next()
+                                    .and_then(|n| n.parse::<u32>().ok())
+                            })
+                            .unwrap_or(1),
+                    },
+                );
+
                 // Ring first, then answer.
                 let ringing = response(&text, "180 Ringing", &[], "");
                 socket.send_to(ringing.as_bytes(), from).await.expect("180");
@@ -347,6 +478,54 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
                 let contact = format!("<sip:peer@{peer_addr}>");
                 let message = response(&text, "200 OK", &[("Contact", &contact)], PEER_SDP);
                 socket.send_to(message.as_bytes(), from).await.expect("200");
+            }
+            "REFER" => {
+                // The transfer. RFC 3515: the peer answers `202
+                // Accepted` and then reports the progress of the new
+                // leg over NOTIFYs.
+                let message = response(&text, "202 Accepted", &[], "");
+                socket
+                    .send_to(message.as_bytes(), from)
+                    .await
+                    .expect("REFER reply");
+
+                let Some(script) = options.transfer else {
+                    continue;
+                };
+                // The NOTIFYs go out on the dialog the REFER came in
+                // on — that is the dialog the progress belongs to.
+                let refer_call_id = header_value(&text, "Call-ID").unwrap_or_default();
+                let Some(dialog) = dialogs.get(&refer_call_id) else {
+                    continue;
+                };
+
+                // The NOTIFYs go out with the peer's own sequence
+                // numbers, so the client can tell them apart.
+                let first_cseq = dialog.cseq + 1;
+                let reports: &[(&str, &str)] = match script {
+                    TransferScript::Answered => &[
+                        ("SIP/2.0 100 Trying", "active;expires=60"),
+                        ("SIP/2.0 180 Ringing", "active;expires=60"),
+                        ("SIP/2.0 200 OK", "terminated;reason=other"),
+                    ],
+                    TransferScript::NoRoute => {
+                        &[("SIP/2.0 100 Trying", "terminated;reason=noresource")]
+                    }
+                };
+
+                for (step, (status, state)) in reports.iter().enumerate() {
+                    let notify =
+                        refer_notify(dialog, peer_addr, first_cseq + step as u32, status, state);
+                    socket
+                        .send_to(notify.as_bytes(), from)
+                        .await
+                        .expect("peer NOTIFY");
+                    // The client answers the NOTIFY before the next
+                    // one goes out: a NOTIFY that arrives while the
+                    // previous transaction is still open is a
+                    // retransmission, not a new report.
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                }
             }
             "BYE" => {
                 let message = response(&text, "200 OK", &[], "");
@@ -420,13 +599,16 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
                     .await
                     .expect("peer INVITE");
 
-                dialog = Some(PeerDialog {
-                    call_id: format!("peer-incoming-call@{peer_addr}"),
-                    from: format!("<sip:peer@{peer_addr}>;tag=peer-invite"),
-                    to: format!("<sip:104@{peer_addr}>"),
-                    contact: String::new(),
-                    cseq: 1,
-                });
+                dialogs.insert(
+                    format!("peer-incoming-call@{peer_addr}"),
+                    PeerDialog {
+                        call_id: format!("peer-incoming-call@{peer_addr}"),
+                        from: format!("<sip:peer@{peer_addr}>;tag=peer-invite"),
+                        to: format!("<sip:104@{peer_addr}>"),
+                        contact: String::new(),
+                        cseq: 1,
+                    },
+                );
             }
         }
     }
@@ -501,6 +683,7 @@ async fn an_outgoing_call_connects_and_hangs_up() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            transfer: None,
         },
     ));
 
@@ -609,6 +792,7 @@ async fn an_incoming_call_rings_before_the_user_answers() {
             call_back: true,
             dtmf: None,
             challenge_invite: false,
+            transfer: None,
         },
     ));
 
@@ -727,6 +911,7 @@ async fn a_ringing_incoming_call_is_declined_when_it_is_hung_up() {
             call_back: true,
             dtmf: None,
             challenge_invite: false,
+            transfer: None,
         },
     ));
 
@@ -788,6 +973,7 @@ async fn a_dtmf_digit_arrives_as_an_event() {
             call_back: true,
             dtmf: Some('5'),
             challenge_invite: false,
+            transfer: None,
         },
     ));
 
@@ -838,6 +1024,7 @@ async fn a_dtmf_digit_is_sent_as_an_info_request() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            transfer: None,
         },
     ));
 
@@ -926,6 +1113,7 @@ fn a_call_placed_off_the_runtime_does_not_take_the_app_down() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            transfer: None,
         },
     ));
 
@@ -991,6 +1179,7 @@ async fn a_challenged_invite_is_answered_with_the_account_digest() {
             call_back: false,
             dtmf: None,
             challenge_invite: true,
+            transfer: None,
         },
     ));
 
@@ -1052,5 +1241,304 @@ async fn a_challenged_invite_is_answered_with_the_account_digest() {
             &value,
         ),
         "the digest does not verify against the account's password"
+    );
+}
+
+/// Wait for the REFER the peer received.
+async fn wait_for_refer(observations: &Arc<Mutex<Observations>>) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        {
+            let observations = observations.lock().expect("observations lock");
+            if let Some(raw) = observations
+                .raw
+                .iter()
+                .find(|message| message.starts_with("REFER "))
+            {
+                return raw.clone();
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("the peer never saw the REFER");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Wait for the transfer progress that reports a particular code.
+///
+/// The peer reports the progress in several NOTIFYs — `100 Trying`,
+/// then `180 Ringing`, then `200 OK` — so the test asks for the one it
+/// cares about rather than for the first one.
+async fn wait_for_progress(
+    seen: &mut Vec<qsoftphone_core::model::call_event::CallEvent>,
+    calls: &mut CallManager,
+    code: i32,
+    timeout: Duration,
+) -> Option<qsoftphone_core::model::call_event::CallEvent> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        for update in calls.drain() {
+            seen.push(update.event);
+        }
+
+        if let Some(position) = seen.iter().position(|e| {
+            e.event_type == CallEventType::TransferProgress && e.transfer_code == code
+        }) {
+            return Some(seen.remove(position));
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A blind transfer: the peer takes the REFER, reports the progress,
+/// and the original leg is released when the new leg is answered
+/// (§5.6).
+#[tokio::test]
+async fn a_blind_transfer_reaches_the_peer_and_releases_the_original_call() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+            transfer: Some(TransferScript::Answered),
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-transfer-blind".to_string();
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut seen = Vec::new();
+    let call_id = stack
+        .calls
+        .place_call(&account.id, "100")
+        .expect("the call was placed");
+
+    let answered = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallAnswered,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(answered.is_some(), "the call was never answered");
+
+    stack
+        .calls
+        .transfer_blind(&account.id, &call_id, "200")
+        .expect("the transfer did not start");
+
+    // The peer saw the REFER, and the REFER names the new target.
+    let refer = wait_for_refer(&observations).await;
+    let refer_to = header_value(&refer, "Refer-To").expect("the REFER had no Refer-To");
+    assert!(
+        refer_to.contains("200"),
+        "the Refer-To does not name the new target: {refer_to}"
+    );
+    assert!(
+        !refer_to.contains("Replaces"),
+        "a blind transfer must not carry a Replaces: {refer_to}"
+    );
+
+    // The progress arrives over the NOTIFY (RFC 3515 §3.4).
+    let progress =
+        wait_for_progress(&mut seen, &mut stack.calls, 200, Duration::from_secs(5)).await;
+    let progress = progress.expect("the transfer progress was never reported");
+    assert_eq!(
+        progress.transfer_progress,
+        Some(qsoftphone_core::sip::refer::TransferProgress::Answered),
+        "the transfer did not reach the answered state"
+    );
+
+    // The original leg is released: the user is not left connected to
+    // the old peer (§5.6).
+    let ended = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallEnded,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(ended.is_some(), "the original call was never released");
+
+    assert!(
+        observations
+            .lock()
+            .expect("observations lock")
+            .saw_request("BYE"),
+        "the original leg was not hung up"
+    );
+}
+
+/// An attended transfer: the REFER names the consultation that is
+/// already up, and carries its dialog identifier (§5.6).
+#[tokio::test]
+async fn the_attended_transfer_names_the_consultation() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+            transfer: Some(TransferScript::Answered),
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-transfer-attended".to_string();
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut seen = Vec::new();
+    let source_call_id = stack
+        .calls
+        .place_call(&account.id, "100")
+        .expect("the original call was placed");
+    let answered = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallAnswered,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(answered.is_some(), "the original call was never answered");
+
+    // The consultation: a second call, to the party the call is being
+    // handed over to.
+    let consultation_call_id = stack
+        .calls
+        .place_call(&account.id, "200")
+        .expect("the consultation was placed");
+    let answered = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallAnswered,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(answered.is_some(), "the consultation was never answered");
+
+    stack
+        .calls
+        .transfer_attended(&account.id, &source_call_id, &consultation_call_id)
+        .expect("the transfer did not start");
+
+    let refer = wait_for_refer(&observations).await;
+    let refer_to = header_value(&refer, "Refer-To").expect("the REFER had no Refer-To");
+
+    // §5.6: the attended form carries the consultation's dialog
+    // identifier as a URI parameter.
+    assert!(
+        refer_to.contains(";method=INVITE?Replaces="),
+        "the Refer-To does not carry the Replaces parameter: {refer_to}"
+    );
+
+    // The identifier is the consultation's Call-ID with the `@`
+    // percent-encoded — the peer matches it against the dialog it has
+    // to take over.
+    let expected = consultation_call_id.replacen('@', "%40", 1);
+    assert!(
+        refer_to.contains(&expected),
+        "the Replaces is not the consultation's Call-ID: {refer_to}"
+    );
+}
+
+/// A transfer that cannot reach its target fails, and the original
+/// call stays up: the user may want to try again (§5.6).
+#[tokio::test]
+async fn a_transfer_that_cannot_route_leaves_the_original_call_up() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+            transfer: Some(TransferScript::NoRoute),
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-transfer-noroute".to_string();
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut seen = Vec::new();
+    let call_id = stack
+        .calls
+        .place_call(&account.id, "100")
+        .expect("the call was placed");
+    let answered = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallAnswered,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(answered.is_some(), "the call was never answered");
+
+    stack
+        .calls
+        .transfer_blind(&account.id, &call_id, "999")
+        .expect("the transfer did not start");
+
+    // The peer could not route to the target.
+    let progress =
+        wait_for_progress(&mut seen, &mut stack.calls, 100, Duration::from_secs(5)).await;
+    let progress = progress.expect("the failure was never reported");
+    assert_eq!(
+        progress.transfer_progress,
+        Some(qsoftphone_core::sip::refer::TransferProgress::Failed),
+        "a transfer that could not route was not reported as failed"
+    );
+    assert_eq!(progress.transfer_reason, "noresource");
+
+    // The original call is still up: a transfer that failed must not
+    // take the call down with it.
+    assert!(
+        !seen
+            .iter()
+            .any(|event| event.event_type == CallEventType::CallEnded),
+        "the original call was taken down by a transfer that failed"
+    );
+    assert!(
+        !observations
+            .lock()
+            .expect("observations lock")
+            .saw_request("BYE"),
+        "the original leg was hung up by a transfer that failed"
     );
 }

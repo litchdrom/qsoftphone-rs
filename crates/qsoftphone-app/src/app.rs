@@ -21,6 +21,7 @@ use qsoftphone_core::model::history::{
     format_duration, history_direction,
 };
 use qsoftphone_core::paths::AppPaths;
+use qsoftphone_core::sip::refer::TransferProgress;
 use qsoftphone_core::sip::uri::sip_uri_user_part;
 use qsoftphone_core::storage::{AccountStore, Db};
 use qsoftphone_media::{Codec, DeviceInfo};
@@ -65,6 +66,8 @@ pub struct QSoftphoneApp {
     call_order: Vec<String>,
     /// The call the call panel is showing.
     active_call_id: Option<String>,
+    /// What the user is doing with a transfer (§5.6).
+    transfer: TransferState,
     /// Which page the middle panel shows.
     view: View,
     /// The number the dialer has.
@@ -233,6 +236,27 @@ struct CallView {
     sip_code: i32,
     /// The final SIP reason phrase.
     hangup_cause: String,
+    /// The transfer banner: what the transfer is doing (§5.6).
+    transfer_status: String,
+    /// How far the transfer has got (§5.6).
+    transfer_progress: Option<TransferProgress>,
+}
+
+/// What the user is doing with a transfer (§5.6).
+///
+/// The blind transfer is one action: name a target, and the REFER goes
+/// out. The attended one is three: place a consultation, wait for it
+/// to be answered, and then send the REFER that points at it.
+#[derive(Debug, Clone, Default)]
+struct TransferState {
+    /// The call being transferred.
+    source_call_id: String,
+    /// The consultation call, once it has been placed.
+    consultation_call_id: Option<String>,
+    /// What the user typed as the target.
+    target: String,
+    /// Whether the panel is open.
+    open: bool,
 }
 
 /// What the history page asked for when a button was pressed.
@@ -341,6 +365,7 @@ impl QSoftphoneApp {
             call_views: HashMap::new(),
             call_order: Vec::new(),
             active_call_id: None,
+            transfer: TransferState::default(),
             view: View::Call,
             dial_number: String::new(),
             states: HashMap::new(),
@@ -443,6 +468,12 @@ impl QSoftphoneApp {
                     view.peer = sip_uri_user_part(&event.callee);
                 }
                 CallEventType::CallAnswered => view.answered = true,
+                CallEventType::TransferProgress => {
+                    // §5.6: the banner says what the transfer is doing.
+                    view.transfer_progress = event.transfer_progress;
+                    view.transfer_status =
+                        transfer_status_text(event.transfer_code, &event.transfer_reason);
+                }
                 CallEventType::CallEnded => {
                     view.ended = true;
                     view.ended_at = now_ms();
@@ -545,7 +576,7 @@ impl QSoftphoneApp {
             self.status = "That call has no number to redial.".to_string();
             return;
         }
-        self.place_call_on(&account, &target);
+        let _ = self.place_call_on(&account, &target);
     }
 
     /// Place a call to a target.
@@ -553,33 +584,137 @@ impl QSoftphoneApp {
         let Some(account) = self.selected_account().cloned() else {
             return;
         };
-        self.place_call_on(&account, target);
+        let _ = self.place_call_on(&account, target);
     }
 
     /// Place a call to a target, on a given account.
-    fn place_call_on(&mut self, account: &Account, target: &str) {
+    ///
+    /// The Call-ID of the new call is handed back: the attended
+    /// transfer has to know which call is the consultation (§5.6).
+    fn place_call_on(&mut self, account: &Account, target: &str) -> Option<String> {
         let target = target.trim().to_string();
         if target.is_empty() {
-            return;
+            return None;
         }
         // The echo test is holding the sound card. A call that starts
         // now would open the microphone a second time, and two clients
         // on one endpoint is what makes the audio break up.
         if self.echo_test == EchoTest::Running {
             self.status = "The echo test is running — wait for it to finish.".to_string();
-            return;
+            return None;
         }
         // The dialer shows what is being called, so a redial from the
         // history is visible too.
         self.dial_number = target.clone();
         match self.calls.place_call(&account.id, &target) {
             Ok(call_id) => {
-                self.active_call_id = Some(call_id);
+                self.active_call_id = Some(call_id.clone());
                 self.view = View::Call;
                 self.status = format!("Calling {target}…");
+                Some(call_id)
             }
-            Err(e) => self.status = format!("Could not place the call: {e}"),
+            Err(e) => {
+                self.status = format!("Could not place the call: {e}");
+                None
+            }
         }
+    }
+
+    /// Start a blind transfer (§5.6).
+    ///
+    /// The REFER goes out to the peer we are talking to, and that peer
+    /// puts the new leg up. The original call is released when the new
+    /// leg is answered — that happens in the call layer, not here.
+    fn transfer_blind(&mut self, call: &CallView) {
+        let target = self.transfer.target.trim().to_string();
+        if target.is_empty() {
+            self.status = "A transfer needs a target.".to_string();
+            return;
+        }
+        match self
+            .calls
+            .transfer_blind(&call.account_id, &call.call_id, &target)
+        {
+            Ok(()) => {
+                self.transfer.open = false;
+                self.status = format!("Transferring to {target}…");
+            }
+            Err(e) => self.status = format!("The transfer did not start: {e}"),
+        }
+    }
+
+    /// Place the consultation of an attended transfer (§5.6).
+    ///
+    /// The consultation is a second call, to the party the call is
+    /// being handed over to. It goes on the same account as the
+    /// original call: a transfer between two accounts is not a thing
+    /// a softphone does.
+    ///
+    /// The original call is muted while the consultation is up — the
+    /// peer must not hear the conversation with the third party. This
+    /// is a local mute, not a SIP hold: the peer is not told, and
+    /// the peer has no way of knowing that a hold happened.
+    fn start_consultation(&mut self, call: &CallView) {
+        let target = self.transfer.target.trim().to_string();
+        if target.is_empty() {
+            self.status = "A transfer needs a target.".to_string();
+            return;
+        }
+        let Some(account) = self
+            .accounts
+            .iter()
+            .find(|account| account.id == call.account_id)
+            .cloned()
+        else {
+            self.status = "There is no account to transfer on.".to_string();
+            return;
+        };
+
+        let Some(consultation) = self.place_call_on(&account, &target) else {
+            return;
+        };
+        self.transfer.source_call_id = call.call_id.clone();
+        self.transfer.consultation_call_id = Some(consultation);
+        let _ = self
+            .calls
+            .set_mic_muted(&call.account_id, &call.call_id, true);
+        self.status = format!("Consultation to {target}…");
+    }
+
+    /// Send the REFER that points at the consultation (§5.6).
+    fn complete_attended_transfer(&mut self, call: &CallView) {
+        let Some(consultation) = self.transfer.consultation_call_id.clone() else {
+            return;
+        };
+        match self
+            .calls
+            .transfer_attended(&call.account_id, &call.call_id, &consultation)
+        {
+            Ok(()) => {
+                self.transfer.open = false;
+                self.status = "Transferring…".to_string();
+            }
+            Err(e) => self.status = format!("The transfer did not start: {e}"),
+        }
+    }
+
+    /// Give the consultation up (§5.6).
+    ///
+    /// The consultation is our own leg: leaving it up would hold the
+    /// microphone for a call the user has already left.
+    fn cancel_transfer(&mut self) {
+        let source = self.transfer.source_call_id.clone();
+        if let Some(consultation) = self.transfer.consultation_call_id.take() {
+            if let Some(call) = self.call_views.get(&source).cloned() {
+                let _ = self.calls.hangup(&call.account_id, &consultation);
+                // The original call gets its voice back.
+                let _ = self
+                    .calls
+                    .set_mic_muted(&call.account_id, &call.call_id, false);
+            }
+        }
+        self.transfer.open = false;
+        self.status = "The transfer was cancelled.".to_string();
     }
 
     /// The calls, in the order they arrived.
@@ -1627,6 +1762,17 @@ impl QSoftphoneApp {
             });
         });
 
+        // The transfer banner (§5.6). It belongs to the call that is
+        // being transferred, not to the call the user happens to be
+        // looking at.
+        if !call.transfer_status.is_empty() {
+            ui.label(
+                egui::RichText::new(&call.transfer_status)
+                    .small()
+                    .color(transfer_status_colour(call.transfer_progress)),
+            );
+        }
+
         // The keypad belongs to the call the user is looking at, and
         // only while it is up.
         if active && call.state == "connected" {
@@ -1729,7 +1875,64 @@ impl QSoftphoneApp {
             // The DTMF keypad is in the header, where it is always
             // visible and does double duty: it dials the number when
             // the app is idle and it sends the tones during a call.
+
+            // The transfer (§5.6).
+            self.draw_transfer(ui, &call);
         }
+    }
+
+    /// The transfer controls of the call the user is looking at (§5.6).
+    ///
+    /// The blind transfer is one button: name a target, and the REFER
+    /// goes out. The attended one needs a consultation first, so it
+    /// is three steps — and the last one only appears once the
+    /// consultation has been answered.
+    fn draw_transfer(&mut self, ui: &mut egui::Ui, call: &CallView) {
+        let open = self.transfer.open && self.transfer.source_call_id == call.call_id;
+
+        if ui.selectable_label(open, "Transfer").clicked() {
+            if open {
+                self.transfer.open = false;
+            } else {
+                self.transfer.open = true;
+                self.transfer.source_call_id = call.call_id.clone();
+                self.transfer.consultation_call_id = None;
+            }
+        }
+
+        if !open {
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Transfer to");
+            ui.text_edit_singleline(&mut self.transfer.target);
+        });
+
+        let consultation = self.transfer.consultation_call_id.clone();
+        let consultation_answered = consultation
+            .as_ref()
+            .and_then(|id| self.call_views.get(id))
+            .map(|view| view.answered)
+            .unwrap_or(false);
+
+        ui.horizontal(|ui| {
+            if ui.button("Blind transfer").clicked() {
+                self.transfer_blind(call);
+            }
+            if consultation.is_none() && ui.button("Attended transfer").clicked() {
+                self.start_consultation(call);
+            }
+            if consultation.is_some()
+                && consultation_answered
+                && ui.button("Complete transfer").clicked()
+            {
+                self.complete_attended_transfer(call);
+            }
+            if consultation.is_some() && ui.button("Cancel").clicked() {
+                self.cancel_transfer();
+            }
+        });
     }
 
     /// The history page: the searchable list of past calls.
@@ -2603,6 +2806,63 @@ fn level_text(level: f32) -> String {
     match decibels(level) {
         Some(db) => format!("{db:.0} dB"),
         None => "silent".to_string(),
+    }
+}
+
+/// What the transfer banner says (§5.6).
+///
+/// The wording is the C++'s (`CallController::onTransferStatus`), so
+/// the two say the same thing about the same code:
+///
+/// ```text
+/// 100            "Transferring… new target trying"
+/// 180, 183       "Transferring… new target ringing"
+/// 200            "Transferring… new target answered"
+/// 400..=699      "Transfer failed: <code> (<reason>)"
+/// noresource     "Transfer failed: no route to target"
+/// any other      "Transfer ended (<reason>)", or "Transferring…"
+/// ```
+///
+/// The last case is the one that matters: a code this build does not
+/// know is still a transfer in flight, and saying "failed" about it
+/// would be a lie.
+///
+/// One thing is **not** the C++'s: the `noresource` reason is checked
+/// first here, where the C++ checks it last. The C++ wants to say
+/// "no route to target" for it, but its own ordering means a `100
+/// Trying` in the body wins and the banner says the transfer is still
+/// going — a transfer that never reached anybody, reported as a
+/// transfer in progress. The reason is unambiguous, so it decides.
+fn transfer_status_text(code: i32, reason: &str) -> String {
+    if reason == "noresource" {
+        // The subscription ended without a resource being created:
+        // the peer could not route to the target.
+        return "Transfer failed: no route to target".to_string();
+    }
+    match code {
+        100 => "Transferring… new target trying".to_string(),
+        180 | 183 => "Transferring… new target ringing".to_string(),
+        200 => "Transferring… new target answered".to_string(),
+        400..=699 => format!("Transfer failed: {code} ({reason})"),
+        _ => {
+            if !reason.is_empty() {
+                format!("Transfer ended ({reason})")
+            } else {
+                "Transferring…".to_string()
+            }
+        }
+    }
+}
+
+/// The colour of the transfer banner.
+///
+/// A failure is red and a finished transfer is green; anything in
+/// between is the amber of something in progress.
+fn transfer_status_colour(progress: Option<TransferProgress>) -> egui::Color32 {
+    match progress {
+        Some(TransferProgress::Failed) => egui::Color32::from_rgb(231, 76, 60),
+        Some(TransferProgress::Answered) => egui::Color32::from_rgb(120, 200, 120),
+        _ => egui::Color32::from_rgb(231, 176, 60),
     }
 }
 
@@ -4924,6 +5184,155 @@ mod tests {
             silence_diagnosis(&talking).is_none(),
             "a call with a voice on it was complained about: {:?}",
             silence_diagnosis(&talking)
+        );
+    }
+
+    /// The transfer's progress, as the SIP layer would report it.
+    fn transfer_event(
+        call_id: &str,
+        progress: TransferProgress,
+        code: i32,
+        reason: &str,
+    ) -> CallEvent {
+        let mut event = CallEvent::new(CallEventType::TransferProgress);
+        event.call_id = call_id.to_string();
+        event.call_direction = Some(Direction::Incoming);
+        event.transfer_progress = Some(progress);
+        event.transfer_code = code;
+        event.transfer_reason = reason.to_string();
+        event
+    }
+
+    #[test]
+    fn the_transfer_banner_is_the_cxxs_wording() {
+        // The C++'s `CallController::onTransferStatus`, word for word.
+        assert_eq!(
+            transfer_status_text(100, ""),
+            "Transferring… new target trying"
+        );
+        assert_eq!(
+            transfer_status_text(180, ""),
+            "Transferring… new target ringing"
+        );
+        assert_eq!(
+            transfer_status_text(183, ""),
+            "Transferring… new target ringing"
+        );
+        assert_eq!(
+            transfer_status_text(200, ""),
+            "Transferring… new target answered"
+        );
+        assert_eq!(
+            transfer_status_text(503, "unavailable"),
+            "Transfer failed: 503 (unavailable)"
+        );
+
+        // A code this build does not know is still a transfer in
+        // flight — saying "failed" about it would be a lie.
+        assert_eq!(transfer_status_text(202, ""), "Transferring…");
+        assert_eq!(transfer_status_text(0, ""), "Transferring…");
+
+        // And a subscription that ended without a resource says so.
+        assert_eq!(
+            transfer_status_text(0, "noresource"),
+            "Transfer failed: no route to target"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_call_page_offers_a_transfer() {
+        // §5.6: the REFER goes out from the call the user is looking
+        // at, so the control belongs on that call's page.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        frame(&mut app, &ctx);
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Transfer"),
+            "the call page has no transfer control:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_transfer_panel_offers_both_flavours() {
+        // The blind transfer is one step; the attended one needs a
+        // consultation first, so it is offered as a separate button.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        frame(&mut app, &ctx);
+
+        let output = frame(&mut app, &ctx);
+        let transfer =
+            button_at(&output, "Transfer").expect("the call page has no transfer button");
+        click_at(&mut app, &ctx, transfer);
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Transfer to"),
+            "the transfer panel does not ask for a target:\n{text}"
+        );
+        assert!(
+            button_at(&output, "Blind transfer").is_some(),
+            "there is no blind transfer:\n{text}"
+        );
+        assert!(
+            button_at(&output, "Attended transfer").is_some(),
+            "there is no attended transfer:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_banner_says_what_the_transfer_is_doing() {
+        // The progress comes over the NOTIFY (RFC 3515 §3.4), and the
+        // banner is where the user sees it.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        frame(&mut app, &ctx);
+
+        bus.publish(
+            "acct-ui-1",
+            transfer_event("call-1", TransferProgress::Ringing, 180, ""),
+        );
+        frame(&mut app, &ctx);
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Transferring… new target ringing"),
+            "the banner does not say the transfer is ringing:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_banner_says_when_the_target_cannot_be_reached() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        frame(&mut app, &ctx);
+
+        bus.publish(
+            "acct-ui-1",
+            transfer_event("call-1", TransferProgress::Failed, 100, "noresource"),
+        );
+        frame(&mut app, &ctx);
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Transfer failed: no route to target"),
+            "the banner does not say the target could not be reached:\n{text}"
         );
     }
 }

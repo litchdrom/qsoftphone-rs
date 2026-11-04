@@ -18,6 +18,8 @@
 //! * [`session`] — one account's endpoint and the dialogs on it.
 //! * [`state`] — what the UI needs to know about an account's
 //!   registration.
+//! * [`transfer`] — §5.6: the progress of a transfer, and the
+//!   consultation an attended transfer points at.
 //!
 //! The behavioural reference for all of it is the C++ implementation
 //! in `../qsoftphone`.
@@ -31,6 +33,7 @@ pub mod registrar;
 pub mod sdp;
 pub mod session;
 pub mod state;
+pub mod transfer;
 
 pub use call::{CallBus, CallError, CallManager, CallUpdate};
 pub use digest::DigestInterop;
@@ -40,3 +43,4 @@ pub use registrar::{RegistrationManager, RegistrationTask};
 pub use sdp::{answer_sdp, choose_format, dtmf_relay_body, offer_sdp, offered_formats};
 pub use session::{AccountSession, SessionRegistry};
 pub use state::{RegistrationEvent, RegistrationState};
+pub use transfer::{TransferUpdate, consultation_of, refer_progress};

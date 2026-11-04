@@ -9,7 +9,7 @@ identity resolution, the call event contract, the history rules and
 the transfer construction all have to behave identically, including the
 bugs that have already been fixed there.
 
-**Status: M4.15 complete.** The workspace builds, the test suite passes, the
+**Status: M5 complete.** The workspace builds, the test suite passes, the
 app starts and exits cleanly, an account can be registered against a SIP
 registrar with digest authentication (MD5 and SHA-256), and calls can be
 placed and received over that registration — outbound INVITE, inbound
@@ -54,7 +54,13 @@ set on every single packet, where MicroSIP sets it once. It now marks
 the start of a talkspurt, and nothing else. The **volume knobs** are
 there too: the microphone's gain is applied for the first time, it goes
 above unity as a preamp, and both directions have a knob — live on the
-call page, and as the default in the settings. See
+call page, and as the default in the settings. A call can now be
+**transferred**: the **Transfer** control on the call page sends a
+`REFER` — blind, to a new target, or attended, to a consultation that
+is already up — and the peer reports the progress of the new leg over
+`NOTIFY`s, which the banner on the call turns into words. When the new
+leg is answered the original leg is **released**, so the user is not
+left talking to the old peer under a banner that says "Transferred". See
 [Milestones](#milestones).
 
 ---
@@ -244,7 +250,7 @@ so the two can be diffed by hand.
 | §5.3 history stores the *remote* number, never the local AOR | `src/core/history/CallHistory.h`, `src/app/Application.cpp` | `model::history::CallRecord` |
 | §5.4 180 Ringing on every inbound INVITE | `src/core/sip/SipEndpoint.cpp` | `qsoftphone-sip::call::handle_incoming_invite` |
 | §5.5 hang up without a forced status code | `src/core/sip/SipCall.cpp` (`hangup`) | `qsoftphone-sip::call::CallManager::hangup` |
-| §5.6 `Refer-To` construction, blind and attended | `src/core/sip/SipEndpoint.cpp` | `sip::refer` |
+| §5.6 `Refer-To` construction, blind and attended | `src/core/sip/SipEndpoint.cpp` | `sip::refer`, `qsoftphone-sip::transfer` |
 | §5.8 digest auth: MD5 + SHA-256, realm vs SIP domain | `src/core/sip/SipEndpoint.cpp` | `qsoftphone-sip::digest` |
 | Header capture allowlist | `src/core/call/AccountProfile.h` | `model::account::AccountProfile::filter_headers` |
 | The call event contract | `src/core/call/CallEvent.h` | `model::call_event::CallEvent` |
@@ -3067,6 +3073,148 @@ media crate adds nothing to the build.
 
 ---
 
+## M5 — Transfer
+
+### What happens
+
+A transfer is a `REFER` (RFC 3515): the peer we are talking to is asked
+to put a new leg up. There are two flavours, and they differ only in the
+`Refer-To`:
+
+```text
+Blind:
+  Refer-To: <sip:bob@target.example.com>
+
+Attended (RFC 5589):
+  Refer-To: <sip:bob@target.example.com;method=INVITE?Replaces=<call-id>%40<host>>
+```
+
+The peer answers `202 Accepted` and then reports the progress of the new
+leg over a `NOTIFY` (RFC 3515 §3.4). The progress arrives as a
+`call_transfer_progress` event, and the call page says what is
+happening.
+
+### The `NOTIFY` is read by hand
+
+rsipstack has a `ReferStatus::parse` for exactly this — and it does not
+work. It looks for the `Event` and `Subscription-State` headers among the
+**unknown** ones, and rsipstack's own parser knows both of them, so it
+never finds them and the parse always comes back empty.
+
+`sip::transfer::refer_progress` reads the typed headers the stack
+actually produces: the `Event: refer` that says it is a transfer, the
+`message/sipfrag` body that carries the referred call's status line, and
+the `Subscription-State` that says whether the subscription is still
+alive and why it ended.
+
+Two rules in it are worth stating:
+
+* **The last status line in the body is the progress.** RFC 3515 §3.4.1
+  allows the body to carry several; a body with `100 Trying` and then
+  `200 OK` is reporting progress, and the progress is the 200.
+* **`noresource` outranks the status line.** `terminated;reason=noresource`
+  means the peer could not route to the target (RFC 3515 §7.1.1). The
+  body may well say `100 Trying` — the transfer started and got nowhere,
+  and that is a failure whatever the status line says.
+
+### The `Replaces` is the consultation's Call-ID
+
+The attended transfer names the dialog it is handing over, so the peer
+can bridge to it. RFC 3891 wants `call-id;to-tag=…;from-tag=…`; §5.6 asks
+for `call-id%40host`, and the test suite uses exactly that form. The
+identifier is therefore the consultation dialog's **Call-ID**, with the
+`@` percent-encoded — the very string the peer saw in our INVITE, so the
+peer can match it.
+
+The host is the one the Call-ID carries, not the host of our contact: the
+peer matches the whole Call-ID it received.
+
+### The original leg goes when the transfer works
+
+The brief is explicit: *"Tear down the original leg on success."* The
+user is otherwise still connected to the old peer while the banner says
+"Transferred".
+
+The release belongs to the **call layer**, not to the interface: the
+`NOTIFY` that reports the new leg as answered is what ends the original
+call, and the interface only draws what it is told.
+
+The C++ does not do this. `CallController::onTransferStatus` composes the
+banner string and nothing else, and its own comment says why it can
+leave it alone — *"200 OK — new target answered; the original call will
+be torn down by Asterisk imminently"*. A PBX that tears it down is a
+PBX that agrees; a PBX that does not is exactly the case the user is
+left connected to the old peer. This build hangs the leg up itself.
+
+For the attended transfer the **consultation leg goes with it**: it is
+our own leg, and a leg left up holds the microphone for a call the user
+has already left.
+
+### A failed transfer keeps the call up
+
+A transfer that fails — the target cannot be reached, the peer refuses
+the `REFER` — leaves the original call alone. The user may want to try
+again, and a call that no longer exists cannot be retried. This is the
+choice the brief offers, and it is the one this crate makes.
+
+### The banner is the C++'s wording
+
+`CallController::onTransferStatus` composes one string, and it is
+composed the same way here:
+
+| | |
+|---|---|
+| 100 | "Transferring… new target trying" |
+| 180, 183 | "Transferring… new target ringing" |
+| 200 | "Transferring… new target answered" |
+| 400…699 | "Transfer failed: `<code>` (`<reason>`)" |
+| `noresource` | "Transfer failed: no route to target" |
+| anything else | "Transfer ended (`<reason>`)", or "Transferring…" |
+
+**One thing is not the C++'s: the `noresource` reason is checked first.**
+The C++ checks it *last*, and its own comment says what it is for —
+*"Subscription ended without a resource being created (Asterisk couldn't
+route to the target)"*. With that order a `100 Trying` in the body wins,
+and the banner says a transfer that never reached anybody is a transfer
+in progress. The reason is unambiguous, so it decides here.
+
+### The interface
+
+The **Transfer** control is on the call page, under the mute buttons —
+the call the `REFER` goes out from. It opens a small panel: a target, a
+**Blind transfer** button, and an **Attended transfer** button.
+
+The attended one is three steps, because it has to be: *Attended
+transfer* places the consultation call on the same account as the
+original one, the panel waits for the consultation to be answered, and
+**Complete transfer** sends the `REFER` that points at it. **Cancel**
+hangs the consultation up.
+
+While the consultation is up the original call's microphone is muted: the
+peer must not hear the conversation with the third party. That is a
+**local mute, not a SIP hold** — the peer is not told, and it has no way
+of knowing a hold happened.
+
+### The dependency cost: nothing
+
+No new package.
+
+### What is *not* in M5
+
+* **A SIP hold is not implemented.** The original call is muted locally
+  during an attended transfer, not put on hold with a re-INVITE. The
+  peer sees a silent call, not a call on hold.
+* **A transfer we are *given* is declined.** A peer that sends us a
+  `REFER` gets `501 Not Implemented`: this build does not take part in a
+  transfer it is handed, and saying so is the honest answer.
+* **The `Replaces` has no tags.** RFC 3891 wants `to-tag` and `from-tag`
+  as well as the Call-ID; §5.6's form is the Call-ID alone. A PBX that
+  insists on the tags will not match the consultation.
+* **The consultation is not bridged by us.** The peer bridges to it —
+  that is what the `Replaces` means.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -3112,7 +3260,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M4.14** | The echo test comes back: the sound card is busy while a call is **up**, not while one is selected — so the test works again after a call, and the test sound waits for the card instead of playing over a call | **done** |
 | **M4.15** | The volume controls, and the preamp: the microphone gain is applied for the first time, it goes above unity, and both directions have a knob — live on the call page, and as the default in the settings | **done** |
 | **M4.16** | The call is said once: the media logged what the call did when it stopped *and* again when the session was dropped, so every call was in the log twice | **done** |
-| M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
+| **M5** | Transfer: blind and attended REFER per §5.6, the NOTIFY progress over RFC 3515 §3.4, and the original leg released when the new leg is answered | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -3176,7 +3324,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 342 tests, all passing.
+* `cargo test --workspace` — 360 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -3224,6 +3372,17 @@ player lands.
 * **A DTMF digit arrives as an event** (`dtmf`, with the digit), and
   **a DTMF digit sent by the app arrives at the peer as an `INFO`**
   request.
+* **A blind transfer reaches the peer and the original leg is released.**
+  The loopback peer answers the `REFER` with `202 Accepted` and then
+  reports the progress over `NOTIFY`s; the test reads the `Refer-To` off
+  the wire, waits for the progress that says the new leg is answered, and
+  checks that the original call ended and that the peer saw the `BYE`.
+* **An attended transfer names the consultation.** The `Refer-To` carries
+  `;method=INVITE?Replaces=`, and the `Replaces` is the consultation
+  dialog's Call-ID with the `@` percent-encoded.
+* **A transfer that cannot reach its target leaves the original call
+  up.** The peer ends the subscription with `reason=noresource`; the
+  progress comes back as a failure, and no `BYE` goes out.
 * **The answer names a codec the offer listed.** The loopback peer
   offers G.711 A-law and telephone-event — the offer Asterisk sends —
   and the test reads the `200 OK` off the wire and checks that it says
@@ -3610,6 +3769,13 @@ player lands.
   the device cleanly. **That is the one thing to check on the next
   call**, and the log now says what happened:
   `the call's media stopped received=… concealed=… underruns=…`.
+* **The transfer has not been made to a real PBX.** The `REFER`, the
+  `NOTIFY` progress and the release of the original leg are all proved
+  against the hand-written peer in this repository, over a real socket.
+  What has not been tried is the user's own Asterisk: whether it takes
+  the `Replaces` in §5.6's form — a Call-ID with no `to-tag` or
+  `from-tag` — is the open question, and it is the one to check on the
+  next call with a second extension.
 * **The remote session has not been tested against one.** This machine
   is at the console, so `GetSystemMetrics(SM_REMOTESESSION)` returns
   false here and the notice is exercised by a test that forces it on.
