@@ -15,7 +15,7 @@
 
 use std::time::{Duration, Instant};
 
-use qsoftphone_media::{Codec, MediaConfig, MediaSession};
+use qsoftphone_media::{Codec, MediaConfig, MediaSession, OutboundFrame};
 
 /// How long a test waits for the RTP to get there.
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -92,7 +92,9 @@ fn a_frame_goes_from_one_session_to_the_other() {
         .map(|i| ((i as f32 / 160.0) * 8000.0) as i16)
         .collect();
     let frame = Codec::Pcmu.encoder().encode(&pcm);
-    caller.audio_state().push_outbound(frame);
+    caller
+        .audio_state()
+        .push_outbound(OutboundFrame::speech(frame));
 
     let received = wait_for_samples(&callee, 160);
     assert!(
@@ -126,7 +128,9 @@ fn a_wideband_frame_goes_from_one_session_to_the_other() {
         .collect();
     let frame = Codec::G722.encoder().encode(&pcm);
     assert_eq!(frame.len(), 160);
-    caller.audio_state().push_outbound(frame);
+    caller
+        .audio_state()
+        .push_outbound(OutboundFrame::speech(frame));
 
     let received = wait_for_samples(&callee, 320);
     assert!(
@@ -155,7 +159,9 @@ fn a_muted_microphone_sends_silence() {
 
     // The muted microphone still sends: the frame is the codec's
     // silence code.
-    caller.audio_state().push_outbound(silence(Codec::Pcmu));
+    caller
+        .audio_state()
+        .push_outbound(OutboundFrame::silence(silence(Codec::Pcmu)));
 
     let received = wait_for_samples(&callee, 160);
     assert!(received.len() >= 160, "{} samples", received.len());
@@ -177,7 +183,9 @@ fn the_rtp_clock_keeps_moving_while_the_microphone_is_muted() {
     callee.start_transport();
 
     for _ in 0..5 {
-        caller.audio_state().push_outbound(silence(Codec::Pcmu));
+        caller
+            .audio_state()
+            .push_outbound(OutboundFrame::silence(silence(Codec::Pcmu)));
         std::thread::sleep(Duration::from_millis(20));
     }
 
@@ -196,7 +204,9 @@ fn a_stopped_session_sends_nothing_more() {
     caller.start_transport();
     callee.start_transport();
 
-    caller.audio_state().push_outbound(silence(Codec::Pcmu));
+    caller
+        .audio_state()
+        .push_outbound(OutboundFrame::silence(silence(Codec::Pcmu)));
     assert!(wait_for_samples(&callee, 160).len() >= 160);
 
     // The stop comes first: after it the sending thread is gone, so
@@ -245,11 +255,103 @@ fn a_session_without_a_peer_keeps_the_socket_open() {
     session.start_transport();
 
     // Nothing is sent, because there is nowhere to send it.
-    session.audio_state().push_outbound(silence(Codec::Pcmu));
+    session
+        .audio_state()
+        .push_outbound(OutboundFrame::silence(silence(Codec::Pcmu)));
     std::thread::sleep(Duration::from_millis(100));
 
     assert_eq!(session.local_port(), port);
     assert!(session.is_running());
     session.stop();
     assert!(!session.is_running());
+}
+
+/// The marker bit of an RTP packet.
+///
+/// It is the top bit of the second byte of the header — RFC 3550
+/// §5.1: "the most significant bit of the second octet".
+fn marker_of(packet: &[u8]) -> bool {
+    assert!(packet.len() > 12, "the packet is not an RTP packet");
+    packet[1] & 0x80 != 0
+}
+
+#[test]
+fn the_marker_bit_is_set_on_the_first_packet_and_on_no_other() {
+    // This is what the capture showed of the old stream: the marker on
+    // **every** packet, 540 times out of 540. RFC 3551 §5.1 says the
+    // marker marks the first octet of a talkspurt — so it goes on the
+    // first packet of the stream, and on the first packet after a
+    // silence, and nowhere else.
+    //
+    // The session here has no microphone: it sends silence for the
+    // whole call, and the marker says so — once.
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("listener");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let port = socket.local_addr().expect("addr").port();
+
+    let session = MediaSession::new(&MediaConfig::default()).expect("a session");
+    session.set_remote("127.0.0.1", port).expect("remote");
+    session.start_transport();
+
+    let mut buffer = [0u8; 1500];
+    let mut markers = Vec::new();
+    for _ in 0..3 {
+        let (length, _) = socket.recv_from(&mut buffer).expect("receive");
+        markers.push(marker_of(&buffer[..length]));
+    }
+
+    assert_eq!(
+        markers,
+        vec![true, false, false],
+        "the marker must not be set on every packet"
+    );
+
+    session.stop();
+}
+
+#[test]
+fn a_talk_after_a_pause_is_marked_as_one() {
+    // The other half of the rule: when the speech stops and starts
+    // again, the peer is told where the new talk begins.
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("listener");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let port = socket.local_addr().expect("addr").port();
+
+    let session = MediaSession::new(&MediaConfig::default()).expect("a session");
+    session.set_remote("127.0.0.1", port).expect("remote");
+    session.start_transport();
+
+    // The session has no microphone, so the sender makes the silence
+    // itself. What is queued here is what the microphone would have
+    // given it: a pause, and then a talk.
+    let state = session.audio_state();
+    state.push_outbound(OutboundFrame::silence(silence(Codec::Pcmu)));
+    std::thread::sleep(Duration::from_millis(60));
+    state.push_outbound(OutboundFrame::speech(silence(Codec::Pcmu)));
+
+    let mut buffer = [0u8; 1500];
+    let mut markers = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && markers.len() < 6 {
+        if let Ok((length, _)) = socket.recv_from(&mut buffer) {
+            markers.push(marker_of(&buffer[..length]));
+        }
+    }
+
+    // The first packet of the stream carries the marker, and so does
+    // the first packet of the talk that follows the pause.
+    assert!(
+        markers.first() == Some(&true),
+        "the first packet must be marked: {markers:?}"
+    );
+    assert!(
+        markers.iter().filter(|&&marker| marker).count() >= 2,
+        "the talk after the pause must be marked: {markers:?}"
+    );
+
+    session.stop();
 }

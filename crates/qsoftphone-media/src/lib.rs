@@ -62,7 +62,7 @@ pub mod jitter;
 pub mod rtp;
 
 pub use audio::{
-    AudioError, AudioState, DeviceInfo, EchoReport, LevelSink, REMOTE_SESSION_HINT,
+    AudioError, AudioState, DeviceInfo, EchoReport, LevelSink, OutboundFrame, REMOTE_SESSION_HINT,
     REMOTE_SESSION_MIC_HINT, devices, is_remote_session, play_echo_test, play_test_sound,
 };
 pub use codec::Codec;
@@ -735,7 +735,7 @@ fn sender_loop(
     while !stop.load(Ordering::Relaxed) {
         match state.wait_for_outbound(FRAME_PERIOD) {
             Some(frame) => {
-                if let Err(e) = sender.send_frame(&frame) {
+                if let Err(e) = sender.send_frame(&frame.payload, frame.silent) {
                     warn!(error = %e, "an RTP packet could not be sent");
                 } else {
                     state.count_frame_sent(false);
@@ -762,7 +762,10 @@ fn sender_loop(
                 // wait does not turn into a slow clock.
                 while due <= Instant::now() {
                     let frame = encoder.encode_silence();
-                    if let Err(e) = sender.send_frame(&frame) {
+                    // The silence the sender makes itself is silence,
+                    // and it says so: the marker bit has to know where
+                    // a talk starts, and this is not one.
+                    if let Err(e) = sender.send_frame(&frame, true) {
                         warn!(error = %e, "an RTP packet could not be sent");
                         break;
                     }

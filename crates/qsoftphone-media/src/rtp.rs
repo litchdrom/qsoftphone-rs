@@ -87,6 +87,18 @@ pub struct RtpSender {
     /// The synchronisation source — this end's identifier for the
     /// stream. RFC 3550 wants it to be random.
     ssrc: u32,
+    /// Whether anything has been sent yet.
+    ///
+    /// The first packet of a stream carries the marker bit: it is the
+    /// start of the first talkspurt, and the peer may be waiting for
+    /// it before it plays anything.
+    sent: bool,
+    /// Whether the last frame that was sent was silence.
+    ///
+    /// This is what the next frame is compared against: the first
+    /// frame after a silence starts a talkspurt, and that is where the
+    /// marker belongs.
+    silent: bool,
 }
 
 impl RtpSender {
@@ -109,6 +121,8 @@ impl RtpSender {
             packetizer: Box::new(packetizer),
             remote: None,
             ssrc,
+            sent: false,
+            silent: false,
         }
     }
 
@@ -131,10 +145,37 @@ impl RtpSender {
     /// A frame is 160 bytes — 20 ms at 8 kHz. The packetizer turns it
     /// into exactly one packet, with the sequence number and the
     /// timestamp advanced.
-    pub fn send_frame(&mut self, frame: &[u8]) -> io::Result<()> {
+    ///
+    /// `silent` says whether the frame is silence, and the **marker
+    /// bit** follows from it.
+    ///
+    /// ## The marker bit
+    ///
+    /// RFC 3551 §5.1: the marker "is set to 1 to indicate that the
+    /// packet contains the first octet of a talkspurt". It is how a
+    /// peer sees where one talk begins and the next ends.
+    ///
+    /// So it goes on the first packet of the stream, and on the first
+    /// packet after a silence — the two places where a talkspurt
+    /// starts. It does **not** go on every packet: a stream that
+    /// claims every frame is the start of a talk says that nothing is
+    /// a continuation of anything, and a peer that believes it cannot
+    /// tell a talk from a pause.
+    ///
+    /// The packetizer cannot do this on its own. `rtc`'s packetizer
+    /// sets the marker on the *last* payload of a frame, which for a
+    /// frame that is one packet long is every packet — so the marker
+    /// is set here instead, where the talkspurt is known.
+    pub fn send_frame(&mut self, frame: &[u8], silent: bool) -> io::Result<()> {
         let Some(remote) = self.remote else {
             return Ok(());
         };
+
+        // The first packet of the stream, and the first packet after a
+        // silence. Nothing else starts a talkspurt.
+        let marker = !self.sent || (self.silent && !silent);
+        self.sent = true;
+        self.silent = silent;
 
         let packets = self
             .packetizer
@@ -145,7 +186,12 @@ impl RtpSender {
             )
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        for packet in packets {
+        for (index, mut packet) in packets.into_iter().enumerate() {
+            // The marker belongs on the **first** packet of a frame:
+            // it marks the first octet of the talkspurt, and a frame
+            // that is split over several packets starts at the first
+            // of them.
+            packet.header.marker = marker && index == 0;
             let bytes = packet
                 .marshal()
                 .map_err(|e| io::Error::other(e.to_string()))?;
@@ -247,7 +293,7 @@ mod tests {
         sender.set_remote(peer_address);
 
         let frame = vec![0xD5u8; FRAME_SAMPLES];
-        sender.send_frame(&frame).expect("send");
+        sender.send_frame(&frame, false).expect("send");
 
         let mut buffer = [0u8; 1500];
         peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -278,7 +324,9 @@ mod tests {
         let mut sequences = Vec::new();
         let mut timestamps = Vec::new();
         for _ in 0..3 {
-            sender.send_frame(&[0u8; FRAME_SAMPLES]).expect("send");
+            sender
+                .send_frame(&[0u8; FRAME_SAMPLES], false)
+                .expect("send");
             peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .expect("timeout");
             let (length, _) = peer.recv_from(&mut buffer).expect("receive");
@@ -300,7 +348,80 @@ mod tests {
         let socket = RtpSocket::bind().expect("bind");
         let mut sender = RtpSender::new(socket.shared(), 0, 1);
         // No remote set: the frame goes nowhere, and nothing fails.
-        sender.send_frame(&[0u8; FRAME_SAMPLES]).expect("send");
+        sender
+            .send_frame(&[0u8; FRAME_SAMPLES], false)
+            .expect("send");
+    }
+
+    /// Send some frames and read the marker bit off each packet.
+    ///
+    /// The frames are `(payload, silent)` pairs, and what comes back is
+    /// the marker of every packet that was sent.
+    fn markers_of(frames: &[(u8, bool)]) -> Vec<bool> {
+        let socket = RtpSocket::bind().expect("bind");
+        let shared = socket.shared();
+        let peer = UdpSocket::bind(("127.0.0.1", 0)).expect("bind peer");
+        let peer_address = peer.local_addr().expect("peer address");
+
+        let mut sender = RtpSender::new(shared, 8, 0x0BADF00D);
+        sender.set_remote(peer_address);
+
+        let mut buffer = [0u8; 1500];
+        let mut markers = Vec::new();
+        for &(byte, silent) in frames {
+            sender
+                .send_frame(&[byte; FRAME_SAMPLES], silent)
+                .expect("send");
+            peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("timeout");
+            let (length, _) = peer.recv_from(&mut buffer).expect("receive");
+            let mut cursor = Bytes::copy_from_slice(&buffer[..length]);
+            let packet = Packet::unmarshal(&mut cursor).expect("unmarshal");
+            markers.push(packet.header.marker);
+        }
+        markers
+    }
+
+    #[test]
+    fn the_marker_is_set_on_the_first_packet_and_on_no_other() {
+        // This is the bug the capture showed: the marker was set on
+        // **every** packet — 540 of 540 — so every frame of the call
+        // claimed to be the start of a talk. MicroSIP's stream, in the
+        // same capture, sets it once: on the first packet.
+        let markers = markers_of(&[(0x11, false), (0x11, false), (0x11, false)]);
+        assert_eq!(
+            markers,
+            vec![true, false, false],
+            "the marker must mark the start of the stream, not every packet"
+        );
+    }
+
+    #[test]
+    fn the_marker_marks_the_start_of_a_talkspurt() {
+        // The other half of the rule: when the speech stops and
+        // starts again, the peer is told where the new talk begins.
+        let markers = markers_of(&[
+            (0x11, false), // the first packet of the stream
+            (0x11, false), // still talking
+            (0x11, true),  // a pause
+            (0x11, true),  // still paused
+            (0x11, false), // talking again — this one starts a talkspurt
+            (0x11, false), // and the next one does not
+        ]);
+        assert_eq!(
+            markers,
+            vec![true, false, false, false, true, false],
+            "the marker must mark the start of a talkspurt"
+        );
+    }
+
+    #[test]
+    fn a_silent_stream_marks_only_its_first_packet() {
+        // A call that nobody speaks into — the machine with no
+        // microphone — sends silence for the whole call. That is one
+        // talkspurt of nothing, and it is marked once.
+        let markers = markers_of(&[(0xD5, true), (0xD5, true), (0xD5, true)]);
+        assert_eq!(markers, vec![true, false, false]);
     }
 
     #[test]
@@ -313,7 +434,9 @@ mod tests {
         let peer = UdpSocket::bind(("127.0.0.1", 0)).expect("bind peer");
         let mut sender = RtpSender::new(shared.clone(), 8, 7);
         sender.set_remote(loopback(socket.port()));
-        sender.send_frame(&[0xD5u8; FRAME_SAMPLES]).expect("send");
+        sender
+            .send_frame(&[0xD5u8; FRAME_SAMPLES], false)
+            .expect("send");
 
         // A packet of our own, with the peer's payload type.
         let packet = rtc::rtp::Packet {

@@ -76,6 +76,52 @@ const MAX_INBOUND_FRAMES: usize = 100;
 /// burst costs nothing and dropping one costs a hole.
 const PLAYOUT_FRAMES: usize = 6;
 
+/// The level below which a frame counts as silence.
+///
+/// Sixty-four on a scale of 32768 is about −54 dBFS: quiet enough that
+/// the hum of a room is silence, and loud enough that a breath is not.
+///
+/// It is a threshold and not a zero, because the microphone has a noise
+/// floor: a room that is quiet is not digitally quiet, and a frame of
+/// near-silence is silence as far as a talk is concerned.
+const SILENCE_LEVEL: u16 = 64;
+
+/// A frame of audio on its way to the peer.
+///
+/// The payload is the encoded frame — G.711 or G.722, 160 bytes — and
+/// the flag says whether it is silence.
+///
+/// The flag travels with the frame because silence is a property of the
+/// **samples**, and the samples are gone by the time the frame is
+/// encoded: G.711 has a fixed silence code but G.722 does not, and
+/// neither of them says whether a frame of audio was *quiet*. So it is
+/// decided here, where the audio still is, and carried along.
+#[derive(Debug, Clone)]
+pub struct OutboundFrame {
+    /// The encoded frame.
+    pub payload: Vec<u8>,
+    /// Whether the frame is silence.
+    pub silent: bool,
+}
+
+impl OutboundFrame {
+    /// A frame that carries sound.
+    pub fn speech(payload: Vec<u8>) -> Self {
+        Self {
+            payload,
+            silent: false,
+        }
+    }
+
+    /// A frame that carries silence.
+    pub fn silence(payload: Vec<u8>) -> Self {
+        Self {
+            payload,
+            silent: true,
+        }
+    }
+}
+
 /// Whether this is a remote session.
 ///
 /// Windows Remote Desktop brings its own audio endpoints — the "Remote
@@ -209,7 +255,7 @@ pub fn devices() -> Vec<DeviceInfo> {
 #[derive(Debug)]
 pub struct AudioState {
     /// The encoded frames waiting to be sent.
-    outbound: Mutex<VecDeque<Vec<u8>>>,
+    outbound: Mutex<VecDeque<OutboundFrame>>,
     /// Woken when a frame is queued, or when the session stops.
     outbound_signal: Condvar,
     /// The PCM waiting to be played, at the codec's rate.
@@ -412,8 +458,8 @@ impl AudioState {
             .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
-    /// Queue a G.711 frame for sending.
-    pub fn push_outbound(&self, frame: Vec<u8>) {
+    /// Queue a frame for sending.
+    pub fn push_outbound(&self, frame: OutboundFrame) {
         {
             let mut queue = self.outbound.lock().expect("outbound lock");
             if queue.len() >= MAX_OUTBOUND_FRAMES {
@@ -433,7 +479,7 @@ impl AudioState {
     /// sender stoppable: without it the thread would sleep in the
     /// condvar until a frame arrived, and a session that is over
     /// would never release its threads.
-    pub(crate) fn wait_for_outbound(&self, timeout: Duration) -> Option<Vec<u8>> {
+    pub(crate) fn wait_for_outbound(&self, timeout: Duration) -> Option<OutboundFrame> {
         let mut queue = self.outbound.lock().expect("outbound lock");
         loop {
             if let Some(frame) = queue.pop_front() {
@@ -459,9 +505,9 @@ impl AudioState {
         self.outbound_signal.notify_all();
     }
 
-    /// Take the next G.711 frame to send, if there is one.
+    /// Take the next frame to send, if there is one.
     #[cfg(test)]
-    pub(crate) fn pop_outbound(&self) -> Option<Vec<u8>> {
+    pub(crate) fn pop_outbound(&self) -> Option<OutboundFrame> {
         self.outbound.lock().expect("outbound lock").pop_front()
     }
 
@@ -836,6 +882,14 @@ struct FrameBuilder {
     encoder: crate::codec::Encoder,
     buffer: Vec<i16>,
     filled: usize,
+    /// The loudest sample of the frame being built.
+    ///
+    /// This is what decides whether the frame is silence. It is
+    /// measured on the samples, before they are encoded, because the
+    /// encoded frame cannot say: G.722's silence has no code of its
+    /// own, and G.711's silence code is not the same thing as a quiet
+    /// room.
+    loudest: u16,
 }
 
 impl FrameBuilder {
@@ -844,6 +898,7 @@ impl FrameBuilder {
             encoder: codec.encoder(),
             buffer: vec![0i16; codec.frame_samples()],
             filled: 0,
+            loudest: 0,
         }
     }
 
@@ -856,12 +911,22 @@ impl FrameBuilder {
         // end.
         let sample = if state.mic_muted() { 0.0 } else { sample };
         let scaled = (sample * 32767.0).round().clamp(-32768.0, 32767.0);
-        self.buffer[self.filled] = scaled as i16;
+        let scaled = scaled as i16;
+        self.buffer[self.filled] = scaled;
         self.filled += 1;
+        // The loudest sample of the frame so far. `unsigned_abs` is
+        // used because `i16::MIN` has no positive counterpart.
+        self.loudest = self.loudest.max(scaled.unsigned_abs());
 
         if self.filled == self.buffer.len() {
             let frame = self.encoder.encode(&self.buffer);
-            state.push_outbound(frame);
+            let silent = self.loudest < SILENCE_LEVEL;
+            self.loudest = 0;
+            state.push_outbound(if silent {
+                OutboundFrame::silence(frame)
+            } else {
+                OutboundFrame::speech(frame)
+            });
             self.filled = 0;
         }
     }
@@ -2071,7 +2136,7 @@ mod tests {
     fn the_outbound_queue_is_bounded() {
         let state = AudioState::default();
         for _ in 0..100 {
-            state.push_outbound(vec![0; FRAME_SAMPLES]);
+            state.push_outbound(OutboundFrame::silence(vec![0; FRAME_SAMPLES]));
         }
         assert_eq!(state.outbound_frames(), MAX_OUTBOUND_FRAMES);
     }
@@ -2216,8 +2281,9 @@ mod tests {
             builder.push(0.5, &state);
         }
         let frame = state.pop_outbound().expect("a frame");
-        assert_eq!(frame.len(), 160);
-        assert!(frame.iter().all(|&b| b == 0xD5), "A-law silence");
+        assert_eq!(frame.payload.len(), 160);
+        assert!(frame.payload.iter().all(|&b| b == 0xD5), "A-law silence");
+        assert!(frame.silent, "a muted microphone sends silence");
     }
 
     #[test]
@@ -2228,8 +2294,9 @@ mod tests {
             builder.push(0.5, &state);
         }
         let frame = state.pop_outbound().expect("a frame");
-        assert_eq!(frame.len(), 160);
-        assert!(frame.iter().any(|&b| b != 0xD5), "not silence");
+        assert_eq!(frame.payload.len(), 160);
+        assert!(frame.payload.iter().any(|&b| b != 0xD5), "not silence");
+        assert!(!frame.silent, "a loud microphone does not send silence");
     }
 
     #[test]
@@ -2244,7 +2311,7 @@ mod tests {
 
         builder.push(0.5, &state);
         let frame = state.pop_outbound().expect("a frame");
-        assert_eq!(frame.len(), 160);
+        assert_eq!(frame.payload.len(), 160);
     }
 
     #[test]
@@ -2259,10 +2326,11 @@ mod tests {
             builder.push(0.5, &state);
         }
         let frame = state.pop_outbound().expect("a frame");
-        assert_eq!(frame.len(), 160);
+        assert_eq!(frame.payload.len(), 160);
+        assert!(frame.silent, "a muted microphone sends silence");
 
         let mut decoder = Codec::G722.decoder();
-        let decoded = decoder.decode(&frame);
+        let decoded = decoder.decode(&frame.payload);
         assert_eq!(decoded.len(), 320);
         for sample in decoded {
             assert!(sample.abs() < 64, "silence decoded to {sample}");

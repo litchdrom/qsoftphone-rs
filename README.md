@@ -9,7 +9,7 @@ identity resolution, the call event contract, the history rules and
 the transfer construction all have to behave identically, including the
 bugs that have already been fixed there.
 
-**Status: M4.10 complete.** The workspace builds, the test suite passes, the
+**Status: M4.13 complete.** The workspace builds, the test suite passes, the
 app starts and exits cleanly, an account can be registered against a SIP
 registrar with digest authentication (MD5 and SHA-256), and calls can be
 placed and received over that registration — outbound INVITE, inbound
@@ -46,7 +46,12 @@ silence the sender had to make for itself. The call page holds **only
 the calls that are up**. And the history's expanded details open **under
 the row they belong to**, the way the C++ opens them — they used to be
 drawn below the whole table, which put them off the screen in a history
-of any length. See
+of any length. And the user's own packet capture was read against
+MicroSIP's call in the same file: there was **no loss at all** in either
+direction, the echo that comes back is a faithful copy of the voice that
+goes out, and the one thing that was different was the **marker bit** —
+set on every single packet, where MicroSIP sets it once. It now marks
+the start of a talkspurt, and nothing else. See
 [Milestones](#milestones).
 
 ---
@@ -2705,6 +2710,134 @@ No new crate.
 
 ---
 
+## M4.13 — The two captures, side by side
+
+### What the user asked for
+
+> Hello. Please compare two dumps. 1st call qsoftphone - 2nd call microsip
+
+One capture, two calls, one PBX: this app first, MicroSIP second. It is
+1839 packets long and it holds four RTP streams — what each end sent,
+and what each end got back.
+
+### What is in the capture
+
+| | **qsoftphone** | **MicroSIP** |
+|---|---|---|
+| Stream | `192.168.0.71:60712 ↔ 193.178.169.164:50196` | `192.168.0.71:38000 ↔ 193.178.169.164:50138` |
+| What was sent | **PCMA (PT 8)**, 540 packets of 172 bytes | **G.722 (PT 9)**, 373 packets |
+| The clock | 50.1 fps, timestamp +160 every time | 50 fps |
+| Sequence gaps | **0** | **0** |
+| **Marker bit** | **set on 540 of 540** | **set on 1 of 373** |
+| Inter-arrival | p10 12.1 ms, p50 20.8 ms, p90 22.5 ms, max 23.6 ms | p10 19.7 ms, p50 20.0 ms, p90 20.3 ms, max 29.7 ms |
+| What the PBX sent back | PT 8 for 525 packets, **PT 9 for the first 3** | PT 9 for all 374 packets |
+| Sequence gaps (back) | **0** | **0** |
+
+Two calls, one PBX, and **not one frame lost in either direction**. The
+"a fifth of the peer's frames never arrive" of M4.12 was the environment
+on the day, not the codec and not this app: the same build with the
+same codec was clean at 19:43 on 2 November and broken from 20:17 that
+evening, and it is clean today, with both codecs.
+
+### The audio, decoded
+
+Both calls were decoded with this crate's own decoders — the same G.711
+and G.722 code that plays the audio:
+
+| | sent (peak / rms) | returned (peak / rms) |
+|---|---|---|
+| qsoftphone | 0.1914 / 0.0144 | 0.1914 / 0.0264 |
+| MicroSIP | 1.0000 / 0.0909 | 1.0000 / 0.0950 |
+
+MicroSIP's echo is a copy: what came back is four per cent above what
+was sent. Ours is the same at the peak, and the extra in the average is
+the PBX's own **start beep** — a loud quarter of a second at the head of
+the returned stream, louder than the speech, and part of what looked
+"weird".
+
+The app's own counters for that same call agree: `received=524 sent=540
+lost=1 concealed=1 underruns=0`, with `incoming_peak=0.19140625` against
+`outgoing_peak=0.19102521`.
+
+### The answer is not the answer
+
+The capture carries the SDP of both calls. Ours:
+
+```
+m=audio 60712 RTP/AVP 8 9 0
+```
+
+Asterisk's:
+
+```
+m=audio 50196 RTP/AVP 9 8 0
+```
+
+**G.722 first.** And yet Asterisk sent **PCMA** for 525 of its 528
+packets. The answer is the peer's list of what it can do; the channel
+codec is picked from the **offer's** order. That is M4.12's fix,
+confirmed on the wire: this app asks for PCMA first and gets PCMA.
+
+### The one difference: the marker bit
+
+Everything else about the two streams is the same. This is not:
+
+* ours: the marker is set on **every** packet — 540 out of 540;
+* MicroSIP's: the marker is set on **one** packet out of 373.
+
+RFC 3551 §5.1: the marker "is set to 1 to indicate that the packet
+contains the first octet of a talkspurt". It marks where a talk
+**starts** — not where every frame starts.
+
+`rtc`'s packetizer cannot know that. It sets the marker on the **last**
+payload of a frame, and a frame here is one packet long, so the marker
+lands on every packet. pjsip — the media stack of the C++ reference —
+does it differently and simply: it keeps a flag for "we are streaming",
+clears it when nothing is transmitted, and sets the marker on the first
+packet after that.
+
+### The fix
+
+The marker is now set by the RTP layer, which is where a talkspurt is
+known:
+
+* the **first** packet of the stream carries it — it is the start of the
+  first talkspurt, and the peer may be waiting for it;
+* the **first packet after a silence** carries it — that is where the
+  next talk starts;
+* **no other packet does.**
+
+Silence is decided on the **samples**, before they are encoded, and it
+travels with the frame into the sender (`OutboundFrame`). It cannot be
+decided on the encoded frame: G.722 has no silence code at all, and
+G.711's silence code is not the same thing as a quiet room. The
+threshold is −54 dBFS — quiet enough for the hum of a room, loud enough
+for a breath.
+
+The tests read the marker bit off the wire (the top bit of the second
+byte of the RTP header) and check all three cases: the first packet of a
+stream, the first packet after a pause, and a stream that is silence
+from beginning to end.
+
+### The dependency cost: nothing
+
+No new crate.
+
+### What is *not* in M4.13
+
+* **The frames the peer never sent are still gone.** M4.12 counts them
+  and says so; nothing brings them back.
+* **The send jitter is still ours.** Our inter-arrival spread is ±5 ms
+  and MicroSIP's is ±0.3 ms: our clock is the sound card's 512-sample
+  buffer against a 960-sample frame. A deadline-paced sender would
+  narrow it, and that is a bigger change than this milestone.
+* **The capture is not re-taken.** The marker bit is proved by the tests
+  and by MicroSIP's stream in the same capture; a fresh capture of this
+  app's own stream would be the confirmation, and it needs a capture
+  tool on the machine.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -2746,6 +2879,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M4.10** | The details are under the row they belong to: the history table is drawn by hand with fixed columns, an expanded row opens its details **under itself** instead of below the whole table, and the table fits the window | **done** |
 | **M4.11** | Where the silence is: the call row carries a live peer meter, the three levels in decibels, and a sentence that names the place the silence is in; the media path is measured end to end against the real PBX | **done** |
 | **M4.12** | The codec the peer chose, and the frames that never came: our own codec preference decides the session, the jitter buffer holds a peer's bursts, the frames that never arrived are counted and said out loud, and the clock runs at fifty frames a second even with no microphone | **done** |
+| **M4.13** | The two captures, side by side: the user's own pcap, read packet by packet, against MicroSIP's call in the same file — the loss was the environment, the echo is faithful, and the one difference left was the marker bit, which is now set only where a talkspurt starts | **done** |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
@@ -2810,7 +2944,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 326 tests, all passing.
+* `cargo test --workspace` — 331 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -3172,6 +3306,15 @@ player lands.
   test measures the rate over a second and asks for at least forty: a
   sender that waits twenty milliseconds between the frames runs at
   thirty-one on Windows, and it did.
+* **The user's own capture, read packet by packet.** Both calls in it —
+  this app's and MicroSIP's — have **zero** sequence gaps in both
+  directions, and the audio that comes back is a faithful copy of the
+  audio that was sent (`incoming_peak=0.19140625` against
+  `outgoing_peak=0.19102521` for this app's call). See
+  [M4.13](#m413--the-two-captures-side-by-side).
+* **The marker bit marks a talkspurt, and only a talkspurt.** The test
+  reads the bit off the wire: it is set on the first packet of a stream
+  and on the first packet after a silence, and on no other packet.
 
 **Not verified:**
 
@@ -3185,33 +3328,32 @@ player lands.
   answered them, and reported **"no sound"**. The call is answered, RTP
   flows both ways, and the numbers say the line is quiet: the peer's
   payload is -45 … -66 dBFS after the first 400 ms, while our side hands
-  the sound card -16.7 dBFS. What is *not* yet proved by a human ear is
-  the other direction — what the far end hears from us — because every
-  measurement of our microphone was taken with nobody at the machine.
-  The call row now shows all three numbers while the call is up, so the
-  next call answers the question without an argument with a log. See
+  the sound card -16.7 dBFS. The later capture settles the other
+  direction: our own outgoing stream in that call carried real speech
+  (peak 0.19) and the PBX sent it back at the same level. What is *not*
+  yet proved by a human ear is what the far end hears from us. The call
+  row shows all three numbers while the call is up, so the next call
+  answers the question without an argument with a log. See
   [M4.11](#m411--where-the-silence-is).
-* **The echo comes back broken, and the reason is known — but the last
-  step of it is not.** The user's report was that the echo from their
-  Asterisk echo extension arrives garbled, while MicroSIP on the same
-  machine and the same PBX gets a loud, clean one. The cause is
-  measured: the path drops about a fifth of the peer's frames, and this
-  app was being pushed onto **G.722**, whose decoder cannot survive a
-  lost frame. With G.711 — what MicroSIP asks for — the same loss is a
-  dropout, and the echo is clean. See
-  [M4.12](#m412--the-codec-the-peer-chose-and-the-frames-that-never-came).
-  What is **not** settled is *who* drops those frames: the PBX's own
-  jitter buffer gives up on some of ours, and the path may drop the
-  rest. This side cannot tell the two apart — the frames are gone
-  before they reach the socket, and the peer's stream already has the
-  holes in it. **The user's pcap would settle it**, and so would
-  `rtp set debug` on the Asterisk side.
-* **The user's microphone is still silent in every measurement.** The
-  levels say so — `you=0.0015`, about -56 dBFS — and the echo of it
-  comes back at the same level, which is the proof that the path is
-  sound. Whether the microphone is muted in Windows, or the machine
-  picked the wrong device, or the room was simply quiet, is not
-  something this build can see.
+* **The echo comes back clean, and the pcap says why.** The user's report
+  was that the echo from their Asterisk echo extension arrives garbled,
+  while MicroSIP on the same machine and the same PBX gets a loud, clean
+  one. The cause was measured and fixed in
+  [M4.12](#m412--the-codec-the-peer-chose-and-the-frames-that-never-came):
+  this app was being pushed onto **G.722**, whose decoder cannot survive
+  a lost frame. The user's own capture has now settled the rest — see
+  [M4.13](#m413--the-two-captures-side-by-side): **not one frame was
+  lost in either direction**, in either call, and the returned audio is
+  a faithful copy of what was sent. What is left is the marker bit,
+  which is fixed and proved by the tests.
+* **The user's microphone is silent in every measurement this machine
+  made, and loud in the user's own.** The levels say `you=0.0015`, about
+  -56 dBFS — every measurement of the microphone was taken with nobody
+  at the machine. The user's capture, taken with somebody at the
+  machine, has our outgoing stream at peak 0.19 with speech in it, and
+  the PBX sends it back at the same level. What the machine cannot see
+  is the microphone's own state: whether it is muted in Windows, or the
+  machine picked the wrong device, or the room was simply quiet.
 * **The stale call has been proved by reading the code, not by
   hearing it.** The chain is in [M4.5](#m45--the-stale-call-and-the-real-time-callback)
   and every link is checkable: the media was only ever released by the
