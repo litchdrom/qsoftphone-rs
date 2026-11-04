@@ -887,12 +887,37 @@ impl QSoftphoneApp {
         });
     }
 
+    /// Whether a call is holding the sound card.
+    ///
+    /// The sound card is a shared resource: one client at a time. The
+    /// echo test and the test sound both open it, and a second client
+    /// on the same endpoint is what makes cpal report an overrun — the
+    /// audio breaks up.
+    ///
+    /// A call that has **ended** has given the card back: the media is
+    /// released before the call-ended event is published, so by the
+    /// time the app knows that a call is over, its microphone and its
+    /// speaker are closed. Asking about the *selected* call instead of
+    /// a live one would leave the tests broken for the rest of the
+    /// session, over a call that is long gone.
+    fn sound_card_is_busy(&self) -> bool {
+        self.call_views.values().any(|view| !view.ended)
+    }
+
     /// Play the test sound through the speaker.
     ///
     /// The tone is a third of a second long, and playing it means
     /// opening the device — so it happens on the runtime (§3).
     fn play_test_sound(&mut self) {
         if self.sound_test == SoundTest::Playing {
+            return;
+        }
+        // The sound card is a shared resource: a call is holding the
+        // speaker, and a second client on the same endpoint is what
+        // makes the audio break up.
+        if self.sound_card_is_busy() {
+            self.sound_test =
+                SoundTest::Failed("a call is up — the sound card is in use.".to_string());
             return;
         }
         let speaker = self.config.media.speaker.clone();
@@ -925,7 +950,13 @@ impl QSoftphoneApp {
         // The sound card is a shared resource: a call is holding the
         // microphone and the speaker, and a second client on the same
         // endpoint is what makes cpal report an overrun.
-        if self.active_call().is_some() {
+        //
+        // A call that has **ended** does not hold it: the media is
+        // released before the call-ended event arrives, so the card is
+        // free by the time the app knows the call is over. Asking
+        // about the selected call instead of a live one left the test
+        // broken for the rest of the session — the user's report.
+        if self.sound_card_is_busy() {
             self.echo_test =
                 EchoTest::Failed("a call is up — the sound card is in use.".to_string());
             return;
@@ -3835,6 +3866,19 @@ mod tests {
         );
     }
 
+    /// Publish a call that starts and is answered, and stays up.
+    async fn run_a_call_that_stays_up(bus: &CallBus, call_id: &str) {
+        let mut incoming = incoming_event();
+        incoming.call_id = call_id.to_string();
+        bus.publish("acct-ui-1", incoming);
+
+        let mut ok = CallEvent::new(CallEventType::CallAnswered);
+        ok.call_id = call_id.to_string();
+        ok.call_direction = Some(Direction::Incoming);
+        ok.call_state = "connected".to_string();
+        bus.publish("acct-ui-1", ok);
+    }
+
     #[tokio::test]
     async fn the_echo_test_will_not_run_during_a_call() {
         // The sound card is a shared resource: a second client on one
@@ -3843,7 +3887,7 @@ mod tests {
         let (mut app, bus) = build_app(tokio::runtime::Handle::current());
         let ctx = egui::Context::default();
 
-        run_a_call(&bus, "call-1", true).await;
+        run_a_call_that_stays_up(&bus, "call-1").await;
         frame(&mut app, &ctx);
 
         app.play_echo_test();
@@ -3852,6 +3896,66 @@ mod tests {
             matches!(app.echo_test, EchoTest::Failed(_)),
             "the echo test ran during a call: {:?}",
             app.echo_test
+        );
+    }
+
+    #[tokio::test]
+    async fn the_echo_test_works_again_after_the_call_is_over() {
+        // The user's report: after a call with media, the echo test in
+        // the settings stopped working — for the rest of the session.
+        //
+        // It was refused because a call was *selected*: the selection
+        // is made when the call is placed and is never cleared. But a
+        // call that is over has given the sound card back — the media
+        // is released before the call-ended event is published, so the
+        // card is free by the time the app knows the call is gone.
+        //
+        // The test that said otherwise used a call that had already
+        // ended, so it asserted the bug and kept it alive.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        // A call comes, is answered, and is over.
+        run_a_call(&bus, "call-1", true).await;
+        frame(&mut app, &ctx);
+
+        assert!(
+            !app.sound_card_is_busy(),
+            "the sound card is still busy after the call ended"
+        );
+
+        // The devices are ones that are not there, so the test that
+        // starts fails on its own, without touching the machine's
+        // sound card.
+        app.config.media.microphone = "no-such-microphone".to_string();
+        app.config.media.speaker = "no-such-speaker".to_string();
+
+        app.play_echo_test();
+
+        assert!(
+            matches!(app.echo_test, EchoTest::Running),
+            "the echo test was still refused after the call ended: {:?}",
+            app.echo_test
+        );
+    }
+
+    #[tokio::test]
+    async fn the_test_sound_waits_for_the_call_that_is_up() {
+        // The same sound card and the same rule: a second client on
+        // one endpoint is what makes the audio break up. The test sound
+        // had no rule at all, so it played over a call.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        frame(&mut app, &ctx);
+
+        app.play_test_sound();
+
+        assert!(
+            matches!(app.sound_test, SoundTest::Failed(_)),
+            "the test sound played during a call: {:?}",
+            app.sound_test
         );
     }
 
@@ -4436,7 +4540,8 @@ mod tests {
         assert!(text.contains("Mute speaker"), "no speaker button:\n{text}");
     }
 
-    // TEMPORARY PROBE — what does egui lay out for the level row?
+    // The meter and the label that follows it: a regression test for a
+    // number that was painted over the next thing.
     #[tokio::test]
     async fn the_meters_number_does_not_land_on_the_next_thing() {
         // The meter painted its number outside the space the layout had

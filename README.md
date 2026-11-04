@@ -2838,6 +2838,91 @@ No new crate.
 
 ---
 
+## M4.14 — The echo test comes back
+
+### What the user reported
+
+> Some major bug with echo test in settings. After call with media —
+> echo test stopped working.
+
+The echo test is the microphone played back through the speaker: speak,
+and hear yourself. It is the only test of the sound card that a user
+can do alone, and after a call it stopped working — for the rest of
+the session.
+
+### The bug
+
+The test refused to start when the sound card was busy:
+
+```rust
+if self.active_call().is_some() {
+    self.echo_test = EchoTest::Failed("a call is up — the sound card is in use.".to_string());
+    return;
+}
+```
+
+`active_call()` is the call **the panel is showing** — the one the user
+selected. It is set when a call is placed, and it is never cleared: the
+call page keeps showing the call that is over, which is right. So after
+the first call of the session `active_call()` was `Some(...)` for ever,
+and the echo test refused for ever.
+
+The sound card was free the whole time. The media is released *before*
+the call-ended event is published — `session.forget_media(&call_id)`
+runs first, and it closes the microphone and the speaker — so by the
+time the app knows the call is over, the card has been given back.
+
+### The test that kept it alive
+
+There was a test for this: `the_echo_test_will_not_run_during_a_call`.
+It used `run_a_call(&bus, "call-1", true)` — a helper that publishes a
+call that starts, is answered **and ends**. The test asserted that the
+echo test is refused while a call is up, and the call it built was not
+up any more. It asserted the bug, and the bug survived every change
+since.
+
+The helpers now say what they mean: `run_a_call_that_stays_up` for a
+call that is still there, `run_a_call` for one that is over.
+
+### The fix
+
+One predicate, and it asks the right question:
+
+```rust
+fn sound_card_is_busy(&self) -> bool {
+    self.call_views.values().any(|view| !view.ended)
+}
+```
+
+A call that has **ended** does not hold the sound card.
+
+The test that catches it was written against the old behaviour and
+failed with it: *"the sound card is still busy after the call ended"*.
+
+### The other button
+
+The **test sound** — the tone the settings page plays through the
+speaker — had no rule at all, so it played **over a call**: a second
+client on one endpoint, which is exactly what makes cpal report an
+overrun and the audio break up. It now waits for the same reason.
+
+### The dependency cost: nothing
+
+No new crate.
+
+### What is *not* in M4.14
+
+* **The microphone gain is still not applied.** The config's
+  `microphoneVolume` is stored and never used, so the microphone is
+  played at unity whatever the setting says. That is the next
+  milestone.
+* **The echo test does not cancel the echo.** It is a loopback: the
+  microphone is played back through the speaker, and what the
+  microphone hears of the speaker is in the recording. Turning the
+  volume down is the answer; cancelling it is not built.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -2880,6 +2965,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M4.11** | Where the silence is: the call row carries a live peer meter, the three levels in decibels, and a sentence that names the place the silence is in; the media path is measured end to end against the real PBX | **done** |
 | **M4.12** | The codec the peer chose, and the frames that never came: our own codec preference decides the session, the jitter buffer holds a peer's bursts, the frames that never arrived are counted and said out loud, and the clock runs at fifty frames a second even with no microphone | **done** |
 | **M4.13** | The two captures, side by side: the user's own pcap, read packet by packet, against MicroSIP's call in the same file — the loss was the environment, the echo is faithful, and the one difference left was the marker bit, which is now set only where a talkspurt starts | **done** |
+| **M4.14** | The echo test comes back: the sound card is busy while a call is **up**, not while one is selected — so the test works again after a call, and the test sound waits for the card instead of playing over a call | **done** |
 | M5 | Transfer: blind and attended REFER per §5.6, NOTIFY progress, original leg released on success | |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
 
@@ -2944,7 +3030,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 331 tests, all passing.
+* `cargo test --workspace` — 333 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -3203,7 +3289,9 @@ player lands.
 * **The echo test is on the settings page**, it says that it plays the
   microphone, and it **will not run during a call** — the sound card is
   a shared resource, and a second client on one endpoint is what makes
-  cpal report an overrun.
+  cpal report an overrun. It **runs again as soon as the call is over**:
+  a call that has ended has given the card back, and the card is free
+  before the app is even told the call is gone.
 * **The echo test reports what it heard and which devices it used**, and
   it distinguishes "the microphone sent nothing" from "the microphone was
   silent" from "your voice came in".
