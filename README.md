@@ -3181,6 +3181,48 @@ two ends of a dialog hold the same two tags the other way round.
 The host is the one the Call-ID carries, not the host of our contact: the
 peer matches the whole Call-ID it received.
 
+### The Contact has to be the **public** address
+
+Every in-dialog request — the REFER, the BYE, the DTMF `INFO` — carries a
+`Contact`, and it has to name the address the peer can actually reach us
+at. Behind a NAT that is not the address of our own socket.
+
+rsipstack builds the dialog's own Contact from the transport's address
+when the dialog is created without one, and on a machine with more than
+one network interface that is a gamble. The user's own PBX showed the
+result: `<sip:10.251.7.193:5060>` — the **VPN interface's** address,
+which the peer cannot reach at all.
+
+It is not a cosmetic difference. **Asterisk sends the transfer's NOTIFYs
+to the Contact of the REFER** (RFC 3515 §3.4), so with a private
+Contact the progress never arrives: the app never learns that the
+transfer worked, never releases the original leg, and **the call never
+ends**. The user's two reports — *"the call does not end after the
+transfer"* and *"it picks some other address, it's my VPN interface"* —
+were the same bug.
+
+The registrar says where it sees us from — RFC 3581's `received` and
+`rport` in the `Via` of its answer — and that is the address the
+Contact has to carry. The dialog is created with it now, so every
+in-dialog request carries it.
+
+### The `Refer-To` names the **target**, not the server
+
+The attended transfer's `Refer-To` names the third party the
+consultation was placed to: the number the user dialled.
+
+The dialog's own snapshot carries the peer's **Contact**, and when the
+consultation went through a PBX that Contact is the *server's* address.
+A `Refer-To` that names the server is a transfer to the server. pjsip
+does not have the problem — it takes the consult call's remote URI,
+which is the third party's address.
+
+It matters for the fallback: when the peer cannot match the `Replaces`
+— it does not know the dialog — it dials the `Refer-To` instead
+(Asterisk's `external_replaces` path). With the target in it, that
+fallback is a sensible blind transfer; with the server's address in it,
+it is a transfer to the server.
+
 ### The original leg goes when the transfer works
 
 The brief is explicit: *"Tear down the original leg on success."* The
@@ -3461,7 +3503,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 370 tests, all passing.
+* `cargo test --workspace` — 372 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -3528,6 +3570,15 @@ player lands.
 * **A feature-code transfer arrives as DTMF.** The app types
   `*2<target>#` one digit at a time, and the peer sees every digit in
   order.
+* **An in-dialog request carries the public address.** The BYE's
+  `Contact` names the address the registrar says it sees us at, not the
+  local socket. The test runs on a machine with a VPN interface, and
+  without the fix the Contact is that interface's address — exactly
+  what the user's PBX showed.
+* **A BYE the peer does not know still ends the call.** The peer answers
+  `481 Call/Transaction Does Not Exist`, which is what a PBX does after
+  a transfer: the dialog is gone, the channel is in a bridge. The call
+  still ends — the BYE went out (RFC 3261 §15.1.1).
 * **The transfer popup says how the attended transfer is finished.** The
   popup has the C++'s two phases: one to name a target and pick the
   method, and one — while the consultation is dialling — that says where
@@ -3930,6 +3981,15 @@ player lands.
   it that way. The `Replaces` now carries the tags as well — whether
   Asterisk takes it is the open question, and it is the one to check on
   the next call with a second extension.
+* **The attended transfer has not been seen through yet.** Against the
+  user's Asterisk the `Replaces` was accepted — the dialog was found,
+  and Asterisk put the transfer in motion — but the progress never came
+  back: the NOTIFYs went to the private address in the Contact, so the
+  app never learned the transfer had worked and never released the
+  original leg. That is the Contact fix above. What the next call with
+  a second extension will show is whether the far end is bridged the
+  way the user expects — that is a question about the PBX's dialplan,
+  not about the app.
 * **The remote session has not been tested against one.** This machine
   is at the console, so `GetSystemMetrics(SM_REMOTESESSION)` returns
   false here and the notice is exercised by a test that forces it on.

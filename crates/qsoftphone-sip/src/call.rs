@@ -254,6 +254,11 @@ impl CallManager {
         let call_id = dialog.id().call_id.clone();
         session.remember(&call_id, dialog);
         session.remember_media(&call_id, media);
+        // What the user dialled. An attended transfer's `Refer-To` has
+        // to name the target, and this is the only place that knows it:
+        // the dialog's snapshot carries the peer's **Contact**, which is
+        // the server's address when the call went through a PBX.
+        session.remember_target(&call_id, target_uri.clone());
 
         let mut event = CallEvent::new(CallEventType::OutgoingCallInitiated);
         event.user = account.user.clone();
@@ -497,7 +502,21 @@ impl CallManager {
             .ok_or(CallError::NoSuchCall)?;
 
         let peer = dialog.snapshot().remote_uri.to_string();
-        let refer = attended_transfer(&peer, &consultation_of(&consultation));
+        let mut consultation = consultation_of(&consultation);
+
+        // The `Refer-To` names the **target** of the consultation — the
+        // third party the user dialled, not the server's own Contact
+        // URI. pjsip does the same: it takes the consult call's remote
+        // URI, which is the third party's address.
+        //
+        // It matters for the fallback: when the peer cannot match the
+        // `Replaces`, it dials the `Refer-To` instead. A `Refer-To` that
+        // names the server is a transfer to the server.
+        if let Some(target) = session.target_of(consultation_call_id) {
+            consultation.uri = target;
+        }
+
+        let refer = attended_transfer(&peer, &consultation);
 
         // The consultation goes with the original leg when the
         // transfer works, so the watcher has to know which one it is.
@@ -705,9 +724,23 @@ pub async fn handle_incoming_invite(
     tx.send_trying().await.ok();
 
     let (state_sender, state_receiver) = session.dialog_layer.new_dialog_state_channel();
+
+    // The Contact the **dialog** carries from now on — the one on every
+    // in-dialog request: the REFER, the BYE, the DTMF `INFO`.
+    //
+    // rsipstack builds its own from the local socket when the dialog is
+    // created without one, and behind a NAT that is a **private**
+    // address the peer cannot reach. It is not a cosmetic difference:
+    // Asterisk sends the transfer's NOTIFYs (RFC 3515 §3.4) to the
+    // Contact of the REFER, so a private Contact means the progress
+    // never arrives, the app never learns the transfer worked, and the
+    // call never ends. The user's own PBX showed it exactly — the
+    // NOTIFYs went to the VPN interface's address instead of the
+    // public one the registrar had reported.
+    let local_contact = contact_uri(&account, &session);
     let dialog = session
         .dialog_layer
-        .get_or_create_server_invite(&tx, state_sender, None, None)
+        .get_or_create_server_invite(&tx, state_sender, None, Some(local_contact))
         .map_err(|e| CallError::Sip(e.to_string()))?;
 
     let call_id = dialog.id().call_id.clone();

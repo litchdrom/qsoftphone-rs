@@ -57,6 +57,14 @@ pub struct AccountSession {
     /// has to go with the original one, or it stays up holding the
     /// microphone for a call the user has already left.
     consultations: Mutex<HashMap<String, String>>,
+    /// What each outgoing call was placed to, keyed by SIP Call-ID.
+    ///
+    /// The URI the user dialled. An attended transfer needs it: the
+    /// `Refer-To` has to name the **target** of the consultation, and
+    /// the dialog's own snapshot only carries the peer's Contact — which
+    /// is the *server's* address when the call went through a PBX. A
+    /// `Refer-To` that names the server is a transfer to the server.
+    targets: Mutex<HashMap<String, String>>,
     /// What the media of a call should be.
     ///
     /// The settings are global, as they were in the C++: the `media`
@@ -83,6 +91,7 @@ impl AccountSession {
             dialogs: Mutex::new(HashMap::new()),
             media: Mutex::new(HashMap::new()),
             consultations: Mutex::new(HashMap::new()),
+            targets: Mutex::new(HashMap::new()),
             media_config,
         })
     }
@@ -130,6 +139,24 @@ impl AccountSession {
     /// Forget a dialog that has ended.
     pub fn forget(&self, call_id: &str) {
         self.dialogs.lock().expect("dialog lock").remove(call_id);
+        self.targets.lock().expect("targets lock").remove(call_id);
+    }
+
+    /// Remember what a call was placed to.
+    pub fn remember_target(&self, call_id: &str, target: String) {
+        self.targets
+            .lock()
+            .expect("targets lock")
+            .insert(call_id.to_string(), target);
+    }
+
+    /// What a call was placed to, if it was placed by us.
+    pub fn target_of(&self, call_id: &str) -> Option<String> {
+        self.targets
+            .lock()
+            .expect("targets lock")
+            .get(call_id)
+            .cloned()
     }
 
     /// The calls that are currently up.

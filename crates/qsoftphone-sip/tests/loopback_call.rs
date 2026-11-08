@@ -21,6 +21,14 @@ use qsoftphone_core::model::call_event::CallEventType;
 use qsoftphone_sip::{CallBus, CallManager, RegistrationManager, SessionRegistry};
 use tokio::net::UdpSocket;
 
+/// The address the loopback registrar says it sees the client at.
+///
+/// RFC 5737's documentation range: it is not routable, and it is not
+/// the client's own socket address either — which is the whole point.
+/// Behind a NAT the registrar sees the public address, and that is the
+/// one the client has to advertise.
+const PUBLIC_ADDRESS: &str = "203.0.113.9:5060";
+
 /// A minimal SDP for the peer to answer with.
 const PEER_SDP: &str = "v=0\r\n\
 o=- 1 1 IN IP4 127.0.0.1\r\n\
@@ -85,6 +93,40 @@ fn response(request: &str, status: &str, extra: &[(&str, &str)], body: &str) -> 
     out
 }
 
+/// A response that says where the registrar saw the request come from.
+///
+/// RFC 3581: `received` is the source address the server saw and
+/// `rport` the source port. Both are optional — a server that reports
+/// neither is telling us that the address in the `Via` is the real one.
+fn response_with_public_address(request: &str, status: &str, public: &str) -> String {
+    let out = response(request, status, &[("Expires", "300")], "");
+    let (host, port) = public.split_once(':').unwrap_or((public, "5060"));
+    let via = header_value(request, "Via").unwrap_or_default();
+
+    // The registrar's `rport` **replaces** the client's, it is not added
+    // to it: a Via with two of them is malformed, and the first one is
+    // the one that gets read. The client asks for a `rport` of its own
+    // (RFC 3581) — that is the bare parameter it puts in its Via.
+    let mut parts: Vec<String> = via
+        .split(';')
+        .map(|part| part.trim().to_string())
+        .filter(|part| {
+            !part.is_empty()
+                && !part.eq_ignore_ascii_case("rport")
+                && !part.to_ascii_lowercase().starts_with("rport=")
+        })
+        .collect();
+    parts.push(format!("received={host}"));
+    parts.push(format!("rport={port}"));
+    let new_via = parts.join(";");
+
+    out.replacen(
+        &format!("Via: {via}\r\n"),
+        &format!("Via: {new_via}\r\n"),
+        1,
+    )
+}
+
 /// What the peer saw.
 ///
 /// The peer runs forever, so it cannot hand the observations back
@@ -100,6 +142,11 @@ struct Observations {
     /// The full text of every message the peer received, in the same
     /// order.
     raw: Vec<String>,
+    /// The status lines of the answers the peer sent, in order.
+    ///
+    /// A test that needs to know what the peer **replied** looks here:
+    /// the `observations` above are what the peer saw.
+    sent: Vec<String>,
 }
 
 impl Observations {
@@ -126,6 +173,16 @@ impl Observations {
             .iter()
             .zip(raw.by_ref())
             .find(|(line, _)| line.starts_with("SIP/") && line.contains(fragment))
+            .map(|(_, raw)| raw.clone())
+    }
+
+    /// The full text of the first request whose method is `method`.
+    fn request(&self, method: &str) -> Option<String> {
+        let mut raw = self.raw.iter();
+        self.messages
+            .iter()
+            .zip(raw.by_ref())
+            .find(|(line, _)| !line.starts_with("SIP/") && line.starts_with(method))
             .map(|(_, raw)| raw.clone())
     }
 }
@@ -339,6 +396,19 @@ struct PeerOptions {
     challenge_invite: bool,
     /// What to report when the client sends a REFER.
     transfer: Option<TransferScript>,
+    /// The address the registrar says it sees the client at.
+    ///
+    /// RFC 3581: the `received` and `rport` parameters of the `Via` in
+    /// the answer say where the request came from. Behind a NAT that is
+    /// **not** the address of the client's own socket, and it is the
+    /// address the client has to advertise in its Contact.
+    public_address: Option<&'static str>,
+    /// What to answer a BYE with.
+    ///
+    /// `None` is the usual `200 OK`. A peer that does not know the
+    /// dialog answers `481 Call/Transaction Does Not Exist` — which is
+    /// what a PBX does after a transfer.
+    bye_status: Option<&'static str>,
 }
 
 /// A registrar and call agent on one socket.
@@ -414,7 +484,12 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
         match method.as_str() {
             "REGISTER" => {
                 client = Some(from);
-                let message = response(&text, "200 OK", &[("Expires", "300")], "");
+                // The answer says where the registrar sees the client
+                // from, when it is not the client's own socket address.
+                let message = match &options.public_address {
+                    Some(public) => response_with_public_address(&text, "200 OK", public),
+                    None => response(&text, "200 OK", &[("Expires", "300")], ""),
+                };
                 socket
                     .send_to(message.as_bytes(), from)
                     .await
@@ -528,7 +603,17 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
                 }
             }
             "BYE" => {
-                let message = response(&text, "200 OK", &[], "");
+                // The peer may not know the dialog. A PBX answers `481
+                // Call/Transaction Does Not Exist` after a transfer,
+                // because the channel is in a bridge and the dialog is
+                // gone.
+                let status = options.bye_status.unwrap_or("200 OK");
+                observations
+                    .lock()
+                    .expect("observations lock")
+                    .sent
+                    .push(status.to_string());
+                let message = response(&text, status, &[], "");
                 socket
                     .send_to(message.as_bytes(), from)
                     .await
@@ -684,6 +769,8 @@ async fn an_outgoing_call_connects_and_hangs_up() {
             dtmf: None,
             challenge_invite: false,
             transfer: None,
+            public_address: None,
+            bye_status: None,
         },
     ));
 
@@ -793,6 +880,8 @@ async fn an_incoming_call_rings_before_the_user_answers() {
             dtmf: None,
             challenge_invite: false,
             transfer: None,
+            public_address: None,
+            bye_status: None,
         },
     ));
 
@@ -912,6 +1001,8 @@ async fn a_ringing_incoming_call_is_declined_when_it_is_hung_up() {
             dtmf: None,
             challenge_invite: false,
             transfer: None,
+            public_address: None,
+            bye_status: None,
         },
     ));
 
@@ -974,6 +1065,8 @@ async fn a_dtmf_digit_arrives_as_an_event() {
             dtmf: Some('5'),
             challenge_invite: false,
             transfer: None,
+            public_address: None,
+            bye_status: None,
         },
     ));
 
@@ -1025,6 +1118,8 @@ async fn a_dtmf_digit_is_sent_as_an_info_request() {
             dtmf: None,
             challenge_invite: false,
             transfer: None,
+            public_address: None,
+            bye_status: None,
         },
     ));
 
@@ -1114,6 +1209,8 @@ fn a_call_placed_off_the_runtime_does_not_take_the_app_down() {
             dtmf: None,
             challenge_invite: false,
             transfer: None,
+            public_address: None,
+            bye_status: None,
         },
     ));
 
@@ -1180,6 +1277,8 @@ async fn a_challenged_invite_is_answered_with_the_account_digest() {
             dtmf: None,
             challenge_invite: true,
             transfer: None,
+            public_address: None,
+            bye_status: None,
         },
     ));
 
@@ -1295,6 +1394,181 @@ async fn wait_for_progress(
     }
 }
 
+/// Every in-dialog request has to carry the **public** address in its
+/// Contact.
+///
+/// Behind a NAT the socket's own address is a private one the peer
+/// cannot reach, and the registrar's answer says where it really sees
+/// us from (RFC 3581). The Contact of an in-dialog request is what the
+/// peer sends **its** in-dialog requests to — and the transfer's
+/// NOTIFYs are exactly that.
+///
+/// The user's own PBX showed what goes wrong: the NOTIFYs went to the
+/// VPN interface's address instead of the public one, so the progress
+/// never arrived, the app never learned that the transfer had worked,
+/// and the call never ended.
+#[tokio::test]
+async fn an_in_dialog_request_carries_the_public_contact() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: true,
+            dtmf: None,
+            challenge_invite: false,
+            transfer: None,
+            public_address: Some(PUBLIC_ADDRESS),
+            bye_status: None,
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-loopback-contact".to_string();
+    stack.registrations.start(&account, 0);
+
+    let mut seen = Vec::new();
+    let incoming = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::IncomingCall,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the incoming call never arrived");
+
+    stack
+        .calls
+        .answer(&account.id, &incoming.call_id)
+        .expect("answer");
+    wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallAnswered,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the call was never answered");
+
+    // The hangup is an in-dialog request, and it carries the dialog's
+    // Contact.
+    stack
+        .calls
+        .hangup(&account.id, &incoming.call_id)
+        .expect("hangup");
+    wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallEnded,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the call never ended");
+
+    let bye = observations
+        .lock()
+        .expect("observations lock")
+        .request("BYE")
+        .expect("the peer never saw the BYE");
+    let contact = header_value(&bye, "Contact").unwrap_or_default();
+
+    assert!(
+        contact.contains(PUBLIC_ADDRESS),
+        "the BYE's Contact must name the public address, not the local socket: {contact}"
+    );
+    assert!(
+        contact.contains("104"),
+        "the BYE's Contact must name the user: {contact}"
+    );
+}
+
+/// A BYE the peer does not know still ends the call.
+///
+/// A PBX answers `481 Call/Transaction Does Not Exist` when the dialog
+/// is gone — which is what happens after a transfer, when the channel
+/// is in a bridge and the dialog is not there any more. The call still
+/// has to end: the BYE went out, and RFC 3261 §15.1.1 says the dialog
+/// is terminated once the request is handed to its transaction.
+#[tokio::test]
+async fn a_bye_the_peer_does_not_know_still_ends_the_call() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: true,
+            dtmf: None,
+            challenge_invite: false,
+            transfer: None,
+            public_address: None,
+            bye_status: Some("481 Call/Transaction Does Not Exist"),
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-loopback-481".to_string();
+    stack.registrations.start(&account, 0);
+
+    let mut seen = Vec::new();
+    let incoming = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::IncomingCall,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the incoming call never arrived");
+
+    stack
+        .calls
+        .answer(&account.id, &incoming.call_id)
+        .expect("answer");
+    wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallAnswered,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the call was never answered");
+
+    stack
+        .calls
+        .hangup(&account.id, &incoming.call_id)
+        .expect("hangup");
+    wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallEnded,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the call never ended, even though the peer did not know the dialog");
+
+    // The peer really did answer with 481.
+    assert!(
+        observations
+            .lock()
+            .expect("observations lock")
+            .sent
+            .iter()
+            .any(|status| status.contains("481")),
+        "the peer never answered the BYE with 481"
+    );
+}
+
 /// A blind transfer: the peer takes the REFER, reports the progress,
 /// and the original leg is released when the new leg is answered
 /// (§5.6).
@@ -1312,6 +1586,8 @@ async fn a_blind_transfer_reaches_the_peer_and_releases_the_original_call() {
             dtmf: None,
             challenge_invite: false,
             transfer: Some(TransferScript::Answered),
+            public_address: None,
+            bye_status: None,
         },
     ));
 
@@ -1402,6 +1678,8 @@ async fn the_attended_transfer_names_the_consultation() {
             dtmf: None,
             challenge_invite: false,
             transfer: Some(TransferScript::Answered),
+            public_address: None,
+            bye_status: None,
         },
     ));
 
@@ -1475,6 +1753,22 @@ async fn the_attended_transfer_names_the_consultation() {
         refer_to.contains("%3Bto-tag%3Dpeer-tag%3Bfrom-tag%3D"),
         "the Replaces does not carry the dialog's tags: {refer_to}"
     );
+
+    // The `Refer-To` names the **target** the consultation was placed
+    // to — the third party, not the server. The dialog's own snapshot
+    // carries the peer's Contact, which is the server's address when
+    // the call went through a PBX, and a `Refer-To` that names the
+    // server is a transfer to the server. It matters for the fallback:
+    // a server that cannot match the `Replaces` dials the `Refer-To`
+    // instead.
+    assert!(
+        refer_to.contains("sip:200@"),
+        "the Refer-To must name the target that was dialled: {refer_to}"
+    );
+    assert!(
+        !refer_to.contains("sip:peer@"),
+        "the Refer-To must not name the server's contact: {refer_to}"
+    );
 }
 
 /// The DTMF digits the peer received, in order.
@@ -1526,6 +1820,8 @@ async fn a_feature_code_transfer_is_typed_as_dtmf() {
             dtmf: None,
             challenge_invite: false,
             transfer: None,
+            public_address: None,
+            bye_status: None,
         },
     ));
 
@@ -1590,6 +1886,8 @@ async fn a_transfer_that_cannot_route_leaves_the_original_call_up() {
             dtmf: None,
             challenge_invite: false,
             transfer: Some(TransferScript::NoRoute),
+            public_address: None,
+            bye_status: None,
         },
     ));
 
