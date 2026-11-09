@@ -145,7 +145,9 @@ qsoftphone-rs/
     │   └── state.rs               what the UI needs to know, nothing more
     └── qsoftphone-app/            the binary
         ├── main.rs                startup order, --smoke
-        └── app.rs                 the egui shell
+        ├── app.rs                 the egui shell
+        ├── history.rs             the call history, read on the runtime
+        └── picker.rs              the native file dialog, on a thread of its own
 ```
 
 The split is deliberate. Everything the brief calls out as a bug is a
@@ -170,6 +172,7 @@ Pinned in the workspace `Cargo.toml`, locked in `Cargo.lock`.
 | `rusqlite` | 0.41 | storage, `bundled` — SQLite is compiled in |
 | `tokio` | 1.54.1 | the async runtime the SIP stack runs on |
 | `tracing` | 0.1 | logging |
+| `rfd` | 0.17.2 | the operating system's own file dialog (M6.4) |
 
 ### The dependency budget
 
@@ -229,6 +232,51 @@ The lock file grew by exactly those four — 580 → 584 entries — and the
 per-target tree by the same four: Windows 306 → 310, Linux 386 → 390.
 (The counts in the paragraph above were taken with a command that
 counts one fewer; the delta is the same.)
+
+**M6.4 added one package: `rfd`, the native file dialog.**
+`rfd` is what opens the operating system's own "pick a file" window,
+the way the C++ opens Qt's `FileDialog`. The lock file grew by two
+entries — 584 → 586 — and the per-target tree by **one package name**:
+Windows 309 → 310, Linux 389 → 390. The extra lock entry is
+`pollster 0.4.0`, which `rfd`'s Linux portal backend wants; the tree
+already had a `pollster` (1.0.1), so only the name count moved.
+
+What `rfd` brings with it is almost nothing, because it is almost
+nothing: `log`, `raw-window-handle` and `windows-sys` were **already**
+in the tree (eframe and winit need them), so on Windows the whole
+cost is one crate that compiles against the COM `IFileOpenDialog` that
+is already part of the operating system.
+
+**The version is 0.17 and not 0.18, on purpose.** `rfd` 0.18
+(published 2026-11-07) declares `rust-version = "1.92"`. Taking it
+would have raised this workspace's floor from 1.85 to 1.92 — and
+because clippy reads that floor, it would have turned **nine
+pre-existing findings** in `qsoftphone-media` and `qsoftphone-core`
+(`clippy::chunks_exact_to_as_chunks`, which asks for `as_chunks` — a
+1.88 API) into build errors in a milestone that has nothing to do with
+the media plane. 0.17.2 declares no floor of its own and brings the
+same dependencies. The floor is still 1.85.
+
+The features are trimmed per target:
+
+```toml
+[target.'cfg(target_os = "windows")'.dependencies]
+rfd = { version = "0.17", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rfd = { version = "0.17", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { version = "0.17" }
+```
+
+`default-features = false` on Windows and macOS leaves out the Linux
+portal backend and the Wayland parent-window support — neither of
+which exists on those platforms. On Linux the defaults are kept,
+because they are the **portal** backend (`xdg-desktop-portal`), which
+is the one that needs no system libraries; the `gtk3` backend would
+need GTK installed on the machine, which is a worse thing to ask of
+a user than a portal that every modern desktop already speaks.
 
 **What was trimmed.** `rsipstack` is built with `default-features = false`
 and only `platform-tokio`, `std` and `rustls` enabled:
@@ -3771,6 +3819,124 @@ already in the C++.
 
 ---
 
+## M6.4 — The file the user picks
+
+*"Ok. Looks nice. Let's add some interface to obtain ringtone audio
+files like browse."*
+
+### What the C++ has
+
+`src/ui/SettingsWindow.qml` has, next to the ringtone field, a
+**"Browse…"** button and a **"Reset"** button, and a QML `FileDialog`:
+
+```qml
+FileDialog {
+    id: fileDialog
+    title: qsTr("Pick a ringtone WAV file")
+    nameFilters: [ qsTr("WAV files (*.wav)"), qsTr("All files (*.*)") ]
+    fileMode: FileDialog.OpenFile
+}
+```
+
+Until now the ringtone file could only be **typed** into a field, and a
+path that is typed wrong is a path that does not ring. The C++ lets
+the user *pick* the file, and that is what is missing here.
+
+### What there is now
+
+**Browse…** and **Reset**, on both places a ringtone file lives:
+
+| Where | The file | Browse… | Reset |
+|---|---|---|---|
+| The settings page | the app's own ringtone | yes | yes — back to the built-in tone |
+| The account editor | one account's ringtone | yes | yes — back to the app's ringtone |
+
+The dialog is the operating system's own window, with the C++'s title
+(*"Pick a ringtone WAV file"*) and its two filters — **WAV files**
+(`*.wav`) and **All files** (`*.*`), so a ringtone that is called
+something else can still be picked.
+
+### The dialog is on a thread of its own
+
+A file dialog stays open until the user has answered it. Opening it
+on the interface thread would freeze the window for as long as the
+user takes to look at it, so the dialog is opened on a **worker
+thread** and what it says arrives on a channel, which the app drains
+at the top of the frame — the same pattern as the registration state,
+the call events and the media (§3: the interface never waits).
+
+That is not a workaround around `rfd`; it is what `rfd` does itself
+for its own asynchronous API, and on Windows it has to be that way:
+the COM apartment the dialog lives in is per **thread**, and `rfd`
+initialises COM (`CoInitializeEx(COINIT_APARTMENTTHREADED)`) on
+whichever thread opens the dialog.
+
+The window keeps running while the dialog is up. The **Browse…**
+button is greyed out until the dialog has been answered, so there is
+never more than one of them.
+
+### A picked file has to be a file the softphone can play
+
+The "All files" filter is an escape hatch, and it lets the user pick
+something that is not a ringtone at all. The file is therefore read
+**before** it is accepted, with the same reader the ringtone itself
+uses (`qsoftphone_media::read_wav` — 16-bit PCM, mono or stereo, and
+a stereo file is mixed down to mono). A file that cannot be played is
+refused, and the status line says why:
+
+> That file cannot be used as a ringtone: C:\sounds\notes.txt is not
+> a WAV file
+
+The check is on the worker thread, with the reading, so a big file
+does not stall the window. The point is that the ringtone setting can
+never become a file that will not ring: the built-in tone is the
+fallback, and a ringtone that silently does not ring is the one
+failure a user cannot forgive.
+
+### An account's ringtone is an editor field
+
+A picked file for the **app's** ringtone is written to the settings
+file at once. A picked file for an **account's** ringtone goes into the
+editor, like every other field of it — the account is saved when the
+user presses "Save", and the status line says so:
+
+> Picked C:\sounds\office.wav. Save the account to keep it.
+
+The dialog is modal to the *user*, not to the app: the window keeps
+running while it is up, and the user can pick another account behind
+it. So the answer carries **which account** it was for, and a file
+that comes back for an account the user has since left is refused:
+
+> The account changed while the dialog was open — pick the file again.
+
+### The dependency cost: one package
+
+`rfd` — the operating system's own file dialog. **One** package name
+on each target (Windows 309 → 310, Linux 389 → 390), two lock
+entries. The full accounting, and why it is 0.17 and not 0.18, are in
+[the dependency budget](#the-dependency-budget) above.
+
+### What is *not* in M6.4
+
+* **The dialog is not parented to the app's window.** `eframe` keeps
+  the raw window handle private (`raw_window_handle` is `pub(crate)`
+  in `epi.rs`), so there is no handle to give `rfd`. The dialog is a
+  window of its own: it comes to the front, because a process that
+  owns the foreground may always bring its own windows forward, but it
+  is not modal to the app's window — the app keeps running.
+* **macOS has no "All files" filter.** The macOS panel merges every
+  filter into one flat list of allowed types, and there a `*` is not a
+  wildcard but a literal extension. The WAV filter stands on its own
+  there.
+* **The Linux and macOS builds are unverified from here.** This
+  machine is Windows: the portal backend on Linux and `NSOpenPanel` on
+  macOS are the upstream code paths, but they have not been run.
+* **The dialog does not remember the last folder.** It opens in the
+  folder the current ringtone is in, and in the system's own default
+  place otherwise.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -3820,6 +3986,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.1** | The sounds and the redirect: a ringtone on an incoming call with a file and a volume in the settings, a generated ringback on a 180 without SDP, and a 302 Moved Temporarily from the incoming-call screen | **done** |
 | **M6.2** | The ringtone per account, the call the panel shows, and the hold: a ringtone file on the account, the panel following the call that is up, and the attended transfer putting the original leg on hold | **done** |
 | **M6.3** | The consultation that dies: the transfer popup following the consultation, a dead consultation offering no transfer, a failed transfer putting the original call back on the line, and the `Replaces` header the server reads | **done** |
+| **M6.4** | The file the user picks: a native **Browse…** dialog for the ringtone, on the settings page and on the account editor, with the WAV filter, the **Reset** button, and a file that is checked before it is accepted | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -3839,7 +4006,7 @@ none of them is lost and none of them disturbs the order above.
 | **Opus, as a third codec** | M6 | The next codec after G.722. It needs a pure-Rust encoder (`opus-rs`, which brings `fearless_simd` and `libm` with it), the RFC 7587 RTP framing, and — the hard part — a **third-party `codec_opus` module on the PBX**: Asterisk does not ship one, so the PBX has to be built with it before a single Opus call is possible. |
 | **Expandable history, with the call time and the SIP code** | **done in M3** | The **data** was already there: the `calls` table has `duration_sec`, `sip_code` and `hangup_cause`. The UI was the missing part, and M3 has it: the history page's row shows the number, the duration, the time and the SIP status code, and expands to the full URI, the cause and the exact timestamps. |
 | **NAT traversal for the media plane** | M5 | The signalling side already does what it can: the public `Contact` is learned from the `received`/`rport` the registrar echoes (RFC 3581), the binding is refreshed before it expires, and Asterisk's OPTIONS keepalive is answered. M4 bound a **real** port and the SDP names it — but it is the **local** port, and a NAT that rewrites it will break the call. At the very least the SDP has to carry the NAT-mapped port and the stack has to accept the symmetric RTP a NAT sends back from a different source port; beyond that, `rtc` 0.21.1 already ships `ice`, `stun` and `turn` as unconditional dependencies, so full ICE with host/srflx/relay candidates is available without adding a crate. |
-| **Configurable, playable ring tone for incoming calls, in the main settings** | **done in M6.1 and M6.2** | The settings page has a **RINGTONE** section: the WAV file, a preview button and two levels. The player is in the media crate (`SoundPlayer`) — the C++ reference is `RingtonePlayer`. The built-in tone is generated rather than shipped as a binary. **M6.2** made the file **per account**: the account editor has one too, and the account's own file is used for its calls. |
+| **Configurable, playable ring tone for incoming calls, in the main settings** | **done in M6.1, M6.2 and M6.4** | The settings page has a **RINGTONE** section: the WAV file, a preview button and two levels. The player is in the media crate (`SoundPlayer`) — the C++ reference is `RingtonePlayer`. The built-in tone is generated rather than shipped as a binary. **M6.2** made the file **per account**: the account editor has one too, and the account's own file is used for its calls. **M6.4** added the **Browse…** dialog and the **Reset** button to both, so the file is picked rather than typed — the C++'s own `FileDialog`, with its WAV filter. |
 | **A generated ring tone when a call is ringing and there is no media** | **done in M6.1** | A **synthesised** tone, not a file: it starts on a `180 Ringing` that carries no SDP, so an outgoing call still rings audibly. The C++ reference is `RingbackPlayer`. |
 
 **Why NAT traversal is on this list and not in M2.** In M2 the SDP named
@@ -3883,7 +4050,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 409 tests, all passing.
+* `cargo test --workspace` — 422 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -4005,6 +4172,23 @@ player lands.
   the app's, and with neither it is the built-in tone. The account editor
   has the field, and an older database gains the column without losing
   the accounts that are already in it.
+* **The ringtone file can be picked, not only typed.** The **Browse…**
+  button is on the settings page and on the account editor, with the
+  C++'s **Reset** beside it, and both are inside the window — a button
+  off the right edge is a button nobody can click. The reset puts the
+  built-in tone back.
+* **A picked file lands where it was picked for.** The app's ringtone
+  goes into the settings file; an account's goes into the editor, which
+  is what "Save" then writes. A file that comes back for an account the
+  user has since left is refused, and the status line says so.
+* **A file that cannot be played is refused.** The picked file is read
+  with the same reader the ringtone uses, and a file that is not a WAV
+  the softphone can play never reaches the settings — the ringtone
+  cannot become a file that will not ring.
+* **The native dialog really opens.** On this machine (Windows), the
+  COM `IFileOpenDialog` was opened from a worker thread and stayed up
+  until the process ended — so the dialog is not just a call that
+  returns nothing.
 * **The panel follows the call that is up.** A call that has ended gives
   the panel up, a call that is answered takes it, and a call the user
   picked in the list keeps it — until that call ends.
@@ -4517,7 +4701,18 @@ player lands.
   show the real layout and the real colours, but they are a rasteriser's
   idea of the frame, not the framebuffer itself.
 * The Linux build has not been compiled or run. The dependency tree is
-  resolved for `x86_64-unknown-linux-gnu` (385 package names) but no
+  resolved for `x86_64-unknown-linux-gnu` (390 package names) but no
   Linux binary was produced.
+* **The file dialog has only been run on Windows.** The COM backend was
+  opened and waited for, on this machine. The Linux portal backend and
+  the macOS `NSOpenPanel` are the upstream code paths, but neither has
+  been run here, and the macOS panel has no "All files" filter (the
+  filters are merged into one flat list of allowed types there, where a
+  `*` is a literal extension rather than a wildcard).
+* **The dialog is not parented to the app's window.** `eframe` keeps
+  the raw window handle private, so there is no handle to give `rfd`.
+  The dialog is a window of its own; it comes to the front, because a
+  process that owns the foreground may always bring its own windows
+  forward, but it is not modal to the app's window.
 * The SIP domain is not applied to the From/To URI — M6, as noted
   above.

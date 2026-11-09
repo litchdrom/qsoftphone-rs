@@ -30,6 +30,7 @@ use qsoftphone_sip::{
 };
 
 use crate::history::{HistoryService, HistoryUpdate};
+use crate::picker::{Picked, Picker, Target};
 
 /// The application state.
 pub struct QSoftphoneApp {
@@ -152,6 +153,14 @@ pub struct QSoftphoneApp {
     /// has picked another one that is up. That pick is theirs, and it
     /// holds until the call they picked ends.
     active_pinned: bool,
+    /// The native file dialog.
+    ///
+    /// It is the operating system's own "pick a file" window, and it
+    /// is open on a thread of its own: a window that stays open until
+    /// the user has answered must not stand on the interface thread
+    /// (§3). What it says arrives on a channel and is drained at the
+    /// top of the frame.
+    picker: Picker,
 }
 
 /// The state of the redirect popup.
@@ -500,6 +509,7 @@ impl QSoftphoneApp {
             ringing: None,
             redirect: RedirectState::default(),
             active_pinned: false,
+            picker: Picker::new(),
         };
         app.load_selected();
         // The history is read on the runtime; the rows arrive on the
@@ -1744,6 +1754,107 @@ impl QSoftphoneApp {
         }
     }
 
+    /// Drain what the file dialog has to say.
+    ///
+    /// The dialog is the operating system's own window and it is open
+    /// on a thread of its own, so its answer arrives here like every
+    /// other event from outside egui (§3).
+    fn drain_picker(&mut self) {
+        while let Some(picked) = self.picker.take() {
+            match picked {
+                Picked::File { target, path } => self.apply_picked_file(target, path),
+                Picked::Cancelled { .. } => {
+                    self.status = "No file was chosen.".to_string();
+                }
+                Picked::Failed { target, error } => {
+                    tracing::warn!(target = ?target, error = %error, "the file cannot be used");
+                    self.status = format!("That file cannot be used as a ringtone: {error}");
+                }
+            }
+        }
+    }
+
+    /// Open the file dialog for a ringtone.
+    ///
+    /// The dialog opens where the ringtone it is replacing lives, so
+    /// the user is already in the folder the file is in.
+    fn browse_for(&mut self, target: Target) {
+        let start_in = self.ringtone_directory(&target);
+        if !self.picker.open(target, start_in) {
+            self.status = "The file dialog is already open.".to_string();
+            return;
+        }
+        self.status = "Pick a WAV file…".to_string();
+    }
+
+    /// Where the dialog should open.
+    ///
+    /// The folder the current ringtone is in — or nothing at all, which
+    /// leaves the dialog where the operating system puts it.
+    fn ringtone_directory(&self, target: &Target) -> Option<std::path::PathBuf> {
+        let current = match target {
+            Target::AppRingtone => self.config.audio.ringtone_file.clone(),
+            Target::AccountRingtone { account_id } => self
+                .accounts
+                .iter()
+                .find(|account| &account.id == account_id)
+                .map(|account| account.ringtone_file.clone())
+                .unwrap_or_default(),
+        };
+        let current = current.trim();
+        if current.is_empty() {
+            return None;
+        }
+        let path = std::path::Path::new(current);
+        let directory = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent()?.to_path_buf()
+        };
+        directory.is_dir().then_some(directory)
+    }
+
+    /// Take the file the user picked.
+    ///
+    /// The app's own ringtone is written to the settings file at once.
+    /// An account's ringtone goes into the **editor**, like every other
+    /// field of it: the account is saved when the user says so.
+    fn apply_picked_file(&mut self, target: Target, path: std::path::PathBuf) {
+        let file = path.to_string_lossy().to_string();
+        match target {
+            Target::AppRingtone => {
+                self.config.audio.ringtone_file = file.clone();
+                self.save_settings();
+                self.status = format!("The ringtone is now {file}.");
+                tracing::info!(file = %file, "the ringtone file was picked");
+            }
+            Target::AccountRingtone { account_id } => {
+                // The editor may have moved on while the dialog was
+                // open — the user can pick another account behind it.
+                if self.editing_id.as_deref() != Some(account_id.as_str()) {
+                    self.status =
+                        "The account changed while the dialog was open — pick the file again."
+                            .to_string();
+                    return;
+                }
+                self.edit_account.ringtone_file = file.clone();
+                self.status = format!("Picked {file}. Save the account to keep it.");
+                tracing::info!(account_id = %account_id, file = %file, "the account's ringtone file was picked");
+            }
+        }
+    }
+
+    /// Put the app's ringtone back to the built-in one.
+    ///
+    /// The C++ has the same button, and it is only there when there is
+    /// something to reset: a ringtone that is already the default has
+    /// nothing to reset.
+    fn reset_app_ringtone(&mut self) {
+        self.config.audio.ringtone_file.clear();
+        self.save_settings();
+        self.status = "The ringtone is back to the built-in tone.".to_string();
+    }
+
     /// Remember the selected account in the settings file.
     fn persist_active_account(&mut self) {
         let id = self
@@ -1886,6 +1997,7 @@ impl QSoftphoneApp {
         self.drain_calls();
         self.drain_history();
         self.drain_media();
+        self.drain_picker();
 
         // The header. One line: who we are and whether we are
         // registered. Everything else is a page.
@@ -3030,12 +3142,17 @@ impl QSoftphoneApp {
 
         // The editor. The borrow of the draft ends with this block, so
         // the buttons below can take `&mut self`.
-        {
+        let browse = {
             let draft = &mut self.edit_account;
+            // The grid hands back what its body returns, and what it
+            // returns is whether the file dialog was asked for: the
+            // dialog is opened after the block, because opening it
+            // needs `&mut self` and the draft is holding it.
             egui::Grid::new("account_editor")
                 .num_columns(2)
                 .striped(true)
                 .show(ui, |ui| {
+                    let mut browse = false;
                     ui.label("Label");
                     ui.text_edit_singleline(&mut draft.label);
                     ui.end_row();
@@ -3079,7 +3196,26 @@ impl QSoftphoneApp {
                     ui.end_row();
 
                     ui.label("Ringtone file");
-                    ui.text_edit_singleline(&mut draft.ringtone_file);
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut draft.ringtone_file);
+                        // The same two buttons the settings page has
+                        // (M6.4): the operating system's own file
+                        // dialog, and the way back to the app's own
+                        // ringtone.
+                        if ui
+                            .add_enabled(!self.picker.is_open(), egui::Button::new("Browse…"))
+                            .clicked()
+                        {
+                            browse = true;
+                        }
+                        let has_file = !draft.ringtone_file.trim().is_empty();
+                        if ui
+                            .add_enabled(has_file, egui::Button::new("Reset"))
+                            .clicked()
+                        {
+                            draft.ringtone_file.clear();
+                        }
+                    });
                     ui.end_row();
                     ui.label("");
                     ui.weak(
@@ -3087,7 +3223,14 @@ impl QSoftphoneApp {
                          own ringtone.",
                     );
                     ui.end_row();
-                });
+                    browse
+                })
+                .inner
+        };
+        if browse {
+            self.browse_for(Target::AccountRingtone {
+                account_id: account.id.clone(),
+            });
         }
 
         ui.horizontal(|ui| {
@@ -3265,15 +3408,37 @@ impl QSoftphoneApp {
         // The page is a page: a setting that takes a row of its own
         // pushes the rest of the page down, and a page that does not
         // fit in the window is a page with a half of it out of sight.
+        //
+        // The row carries the field, the **Browse…** button that opens
+        // the operating system's own file dialog, and the **Reset**
+        // that puts the built-in tone back — the same three the C++
+        // has (`SettingsWindow.qml`).
         ui.horizontal(|ui| {
             ui.label("Ringtone file");
             let mut file = self.config.audio.ringtone_file.clone();
-            let response = ui.add_sized([240.0, 18.0], egui::TextEdit::singleline(&mut file));
+            let response = ui.add_sized([200.0, 18.0], egui::TextEdit::singleline(&mut file));
             if response.changed() {
                 self.config.audio.ringtone_file = file.trim().to_string();
             }
             if response.lost_focus() {
                 self.save_settings();
+            }
+            // The dialog is a window of its own and it stays up until
+            // the user has answered, so the button is greyed out while
+            // it is open.
+            if ui
+                .add_enabled(!self.picker.is_open(), egui::Button::new("Browse…"))
+                .clicked()
+            {
+                self.browse_for(Target::AppRingtone);
+            }
+            // Reset is only there when there is something to reset.
+            let has_file = !self.config.audio.ringtone_file.trim().is_empty();
+            if ui
+                .add_enabled(has_file, egui::Button::new("Reset"))
+                .clicked()
+            {
+                self.reset_app_ringtone();
             }
             // The preview: hear it without making a call.
             let playing = self.sound.is_playing();
@@ -6875,6 +7040,197 @@ mod tests {
         assert!(
             text.contains("50%"),
             "the ringback level does not say where it is:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_settings_page_can_browse_for_a_ringtone() {
+        // The C++ has a "Browse…" button next to the ringtone field
+        // (`SettingsWindow.qml`): the operating system's own file
+        // dialog, so the user does not have to type a path into a
+        // field and get it wrong.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        app.view = View::Settings;
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Browse"),
+            "the settings page has no browse button:\n{text}"
+        );
+        assert!(
+            button_at(&output, "Browse…").is_some(),
+            "the browse button is not a button:\n{text}"
+        );
+        // And the way back to the built-in tone.
+        assert!(
+            button_at(&output, "Reset").is_some(),
+            "the settings page has no reset button:\n{text}"
+        );
+        // The row has to fit: a button that is off the right edge of
+        // the window is a button nobody can click.
+        let browse = button_at(&output, "Browse…").expect("no browse button");
+        assert!(
+            browse.max.x <= 1100.0,
+            "the browse button is off the window: {browse:?}"
+        );
+        let reset = button_at(&output, "Reset").expect("no reset button");
+        assert!(
+            reset.max.x <= 1100.0,
+            "the reset button is off the window: {reset:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_account_page_can_browse_for_a_ringtone() {
+        // The per-account ringtone is ours, not the C++'s — but it
+        // gets the same buttons, or one ringtone would be picked by
+        // typing and the other by clicking.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        app.view = View::Account;
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Browse"),
+            "the account page has no browse button:\n{text}"
+        );
+        assert!(
+            button_at(&output, "Browse…").is_some(),
+            "the browse button is not a button:\n{text}"
+        );
+        let browse = button_at(&output, "Browse…").expect("no browse button");
+        assert!(
+            browse.max.x <= 1100.0,
+            "the browse button is off the window: {browse:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_picked_file_becomes_the_ringtone() {
+        // The dialog answers on its own thread and the answer is
+        // drained at the top of the frame, like every other event.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.picker.deliver(Picked::File {
+            target: Target::AppRingtone,
+            path: std::path::PathBuf::from(r"C:\sounds\desk.wav"),
+        });
+        frame(&mut app, &ctx);
+
+        assert_eq!(
+            app.config.audio.ringtone_file, r"C:\sounds\desk.wav",
+            "the picked file did not become the ringtone"
+        );
+        assert!(
+            app.status.contains("desk.wav"),
+            "the app did not say what it took: {}",
+            app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn a_picked_file_becomes_the_accounts_ringtone() {
+        // An account's ringtone goes into the editor, like every
+        // other field of it: the account is saved when the user says
+        // so.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        let account_id = app.accounts[0].id.clone();
+
+        app.picker.deliver(Picked::File {
+            target: Target::AccountRingtone { account_id },
+            path: std::path::PathBuf::from(r"C:\sounds\office.wav"),
+        });
+        frame(&mut app, &ctx);
+
+        assert_eq!(
+            app.edit_account.ringtone_file, r"C:\sounds\office.wav",
+            "the picked file did not become the account's ringtone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pick_for_another_account_is_refused() {
+        // The dialog is open while the user carries on with the app,
+        // and they may pick another account behind it. A file picked
+        // for one account must not land on another.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.picker.deliver(Picked::File {
+            target: Target::AccountRingtone {
+                account_id: "acct-somebody-else".to_string(),
+            },
+            path: std::path::PathBuf::from(r"C:\sounds\office.wav"),
+        });
+        frame(&mut app, &ctx);
+
+        assert!(
+            app.edit_account.ringtone_file.is_empty(),
+            "the file landed on the wrong account: {}",
+            app.edit_account.ringtone_file
+        );
+        assert!(
+            app.status.contains("account changed"),
+            "the app did not say what happened: {}",
+            app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_that_cannot_be_played_is_refused() {
+        // A file that is not a WAV the softphone can play is not
+        // written into the settings: the ringtone must not become a
+        // file that will not ring.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.picker.deliver(Picked::Failed {
+            target: Target::AppRingtone,
+            error: r"C:\sounds\notes.txt is not a WAV file".to_string(),
+        });
+        frame(&mut app, &ctx);
+
+        assert!(
+            app.config.audio.ringtone_file.is_empty(),
+            "the bad file was written into the settings"
+        );
+        assert!(
+            app.status.contains("not a WAV"),
+            "the app did not say why: {}",
+            app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reset_button_puts_the_built_in_tone_back() {
+        // The C++'s "Reset": the ringtone goes back to the default,
+        // and the default is the built-in tone.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        app.config.audio.ringtone_file = r"C:\sounds\desk.wav".to_string();
+        app.view = View::Settings;
+        let output = frame(&mut app, &ctx);
+        let reset = button_at(&output, "Reset").expect("there is no reset button");
+        click_at(&mut app, &ctx, reset);
+
+        assert!(
+            app.config.audio.ringtone_file.is_empty(),
+            "the reset did not put the built-in tone back: {}",
+            app.config.audio.ringtone_file
+        );
+        assert!(
+            app.status.contains("built-in"),
+            "the app did not say so: {}",
+            app.status
         );
     }
 

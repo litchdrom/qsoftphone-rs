@@ -14,6 +14,7 @@
 
 mod app;
 mod history;
+mod picker;
 
 use std::process::ExitCode;
 

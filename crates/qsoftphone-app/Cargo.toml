@@ -29,3 +29,30 @@ egui.workspace = true
 # `rtc` drives the RTP/SRTP session and `cpal` the sound card.
 rtc.workspace = true
 cpal.workspace = true
+
+# The native file dialog — the operating system's own "pick a file"
+# window, which is what the C++ has (Qt's `FileDialog`).
+#
+# On Windows and macOS it brings **nothing** else with it: the
+# Windows backend is the COM `IFileOpenDialog` and the macOS one is
+# `NSOpenPanel`, and both need only what is already in the tree
+# (`windows-sys`, `raw-window-handle`, `log`). On Linux the default
+# features are the portal backend, which is the one that needs no
+# system libraries — `gtk3` would need GTK installed.
+#
+# The version is 0.17 and not 0.18 on purpose. 0.18 (published
+# 2026-11-07) declares `rust-version = "1.92"`, which would raise
+# the workspace's floor from 1.85 and turn nine clippy findings that
+# predate this milestone into build errors in the media and core
+# crates. 0.17.2 declares no floor of its own and brings the same
+# dependencies.
+#
+# The dependency budget is in the README.
+[target.'cfg(target_os = "windows")'.dependencies]
+rfd = { version = "0.17", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rfd = { version = "0.17", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { version = "0.17" }
