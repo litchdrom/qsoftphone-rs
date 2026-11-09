@@ -9,7 +9,7 @@ identity resolution, the call event contract, the history rules and
 the transfer construction all have to behave identically, including the
 bugs that have already been fixed there.
 
-**Status: M6.1 complete.** The workspace builds, the test suite passes, the
+**Status: M6.2 complete.** The workspace builds, the test suite passes, the
 app starts and exits cleanly, an account can be registered against a SIP
 registrar with digest authentication (MD5 and SHA-256), and calls can be
 placed and received over that registration — outbound INVITE, inbound
@@ -71,6 +71,15 @@ there is nothing to hear. A call that is still ringing can be
 Moved Temporarily` and a `Contact` naming the target, so the call is
 forwarded without ever being answered. See
 [Milestones](#milestones).
+
+Two of the things that were wrong with it are right now: the **ringtone
+can be per account** — the account editor has a file of its own, so two
+lines can be told apart by the ring that comes for them — and the
+**attended transfer puts the original leg on hold**, the way a phone
+does, so the user hears the consultation and not the other party at the
+same time. The panel also **follows the call that is up** now: a call
+that has ended gives the panel up, and the keypad sends its tones to the
+call the user is actually talking to.
 
 ---
 
@@ -3533,9 +3542,6 @@ No new package. The tones are made with `f32` maths, the WAV is read with
 
 ### What is *not* in M6
 
-* **The ringtone is not per account.** One ringtone for the application, as
-  in the C++. A per-account ringtone needs an account column and a
-  migration.
 * **Early media is not implemented.** The media starts at the `200 OK`, so a
   `180` with an SDP is silent until the call is answered.
 * **The redirect is not a `SIP 302` with a `Reason` header**, and it does
@@ -3546,6 +3552,102 @@ No new package. The tones are made with `f32` maths, the WAV is read with
 * **M6's other items are not started**: the accounts UI, the transport
   picker, the SIP domain and the outbound proxy. This milestone is the
   three things that were asked for; the rest of M6 is still M6.
+
+---
+
+## M6.2 — The ringtone per account, the call the panel shows, and the held leg
+
+Three things, all reported after M6.1 went out.
+
+### The ringtone is per account now
+
+The user asked for it: *"I meant to play some audio to inbound call.
+That the user can separate account with audio."* A softphone with two
+accounts wants two rings — the ring is how you know **which** line is
+calling you.
+
+So the ringtone file is a column on the account (`ringtone_file`), with
+a field in the account editor. The lookup is: **the account's own file
+first**, then the app's own file (`audio.ringtoneFile` in the settings),
+then the built-in tone. An account with nothing set rings exactly like
+the app does.
+
+The column was added after the first release, so it comes with the
+migration that brings an older database up to it — `ALTER TABLE accounts
+ADD COLUMN ringtone_file TEXT NOT NULL DEFAULT ''`. The default matters:
+the accounts that are already there get an **empty** ringtone, not a
+null one, and they survive the migration with their rows intact.
+
+### The panel follows the call that is up
+
+*"The user must click to the call to have active screen of the call"* and
+*"dialpad input ignored in main screen"*.
+
+They were the same bug. The panel showed **one** call, and the app never
+let go of it: the active call was only set when there was **no** active
+call, and it was never cleared when a call ended. So after the first call
+of the day, the panel stayed on that dead call — and the keypad, which
+sends its DTMF to the active call, thought the app was idle and dialled
+a number instead of sending a tone.
+
+Three rules now, and they are the C++'s in spirit — the C++ has a window
+per call, so it never has this problem:
+
+* **A call that has ended gives the panel up.** The panel moves to the
+  newest call that is still up.
+* **A call that is answered takes the panel.** It is the call the user is
+  talking to, and the keypad has to send its tones there.
+* **A call the user picked in the list keeps the panel**, until that call
+  ends. The pick is theirs, and a call being answered somewhere else
+  does not overrule it.
+
+Hanging up a call in the list no longer takes the panel to it either:
+the user did not ask to look at the call they are hanging up.
+
+### The attended transfer holds the original leg
+
+*"I can hear the called line and the ring tone in the same time. Normal
+is calling leg went hold."*
+
+The original leg was only **locally muted**: the microphone was muted,
+so the peer could not hear the conversation with the third party — but
+the speaker was not, so the user heard the other party **and** the
+consultation's ringback at the same time.
+
+Now the original leg goes on a **real hold**, as the C++ does
+(`CallController::holdCall` before the consultation is dialled,
+`unholdCall` when the transfer is called off):
+
+* A hold is a **re-INVITE** whose SDP says `a=sendonly` (RFC 3264 §5):
+  "I will send, I will not receive". The peer answers `a=recvonly` and
+  stops sending, so the far end goes quiet.
+* The re-offer names **the codec that was negotiated and nothing else**.
+  A hold must not change the codec under the call.
+* The speaker is muted **at once**, before the re-INVITE goes out: the
+  peer takes a moment to stop, and a user who is on a consultation
+  should not hear the other leg in the meantime. If the peer refuses
+  the hold, the speaker comes back — a silent user with a live peer is
+  worse than a loud one.
+* When the transfer is called off, the original leg comes off hold and
+  gets its microphone back.
+
+The transfer popup says **"Original call on hold — the other party cannot
+hear you"**, because a leg that goes quiet without saying why looks like
+a fault.
+
+### The dependency cost: nothing
+
+No new package: a column, a migration, a re-INVITE that rsipstack
+already knows how to send, and a flag that was already there.
+
+### What is *not* in M6.2
+
+* **There is no file picker.** The ringtone file is typed, as every
+  other path in this app is.
+* **The held leg is not unheld when the transfer completes.** The
+  original leg is released then, so there is nothing to unhold.
+* **The peer is not told that the call is on hold in words.** It is
+  told in the SDP, which is how a hold is told.
 
 ---
 
@@ -3595,8 +3697,9 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M4.15** | The volume controls, and the preamp: the microphone gain is applied for the first time, it goes above unity, and both directions have a knob — live on the call page, and as the default in the settings | **done** |
 | **M4.16** | The call is said once: the media logged what the call did when it stopped *and* again when the session was dropped, so every call was in the log twice | **done** |
 | **M5** | Transfer: blind and attended REFER per §5.6, a `Replaces` that names the consultation by all three of its identifiers, the NOTIFY progress over RFC 3515 §3.4, the original leg released when the new leg is answered, and the PBX feature code | **done** |
-| **M6.1** | The sounds and the redirect: a ringtone on an incoming call with a file and a volume in the settings, a generated ringback on a `180` without SDP, and a `302 Moved Temporarily` from the incoming-call screen | **done** |
-| M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 |
+| **M6.1** | The sounds and the redirect: a ringtone on an incoming call with a file and a volume in the settings, a generated ringback on a 180 without SDP, and a 302 Moved Temporarily from the incoming-call screen | **done** |
+| **M6.2** | The ringtone per account, the call the panel shows, and the hold: a ringtone file on the account, the panel following the call that is up, and the attended transfer putting the original leg on hold | **done** |
+| M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
 
@@ -3615,7 +3718,7 @@ none of them is lost and none of them disturbs the order above.
 | **Opus, as a third codec** | M6 | The next codec after G.722. It needs a pure-Rust encoder (`opus-rs`, which brings `fearless_simd` and `libm` with it), the RFC 7587 RTP framing, and — the hard part — a **third-party `codec_opus` module on the PBX**: Asterisk does not ship one, so the PBX has to be built with it before a single Opus call is possible. |
 | **Expandable history, with the call time and the SIP code** | **done in M3** | The **data** was already there: the `calls` table has `duration_sec`, `sip_code` and `hangup_cause`. The UI was the missing part, and M3 has it: the history page's row shows the number, the duration, the time and the SIP status code, and expands to the full URI, the cause and the exact timestamps. |
 | **NAT traversal for the media plane** | M5 | The signalling side already does what it can: the public `Contact` is learned from the `received`/`rport` the registrar echoes (RFC 3581), the binding is refreshed before it expires, and Asterisk's OPTIONS keepalive is answered. M4 bound a **real** port and the SDP names it — but it is the **local** port, and a NAT that rewrites it will break the call. At the very least the SDP has to carry the NAT-mapped port and the stack has to accept the symmetric RTP a NAT sends back from a different source port; beyond that, `rtc` 0.21.1 already ships `ice`, `stun` and `turn` as unconditional dependencies, so full ICE with host/srflx/relay candidates is available without adding a crate. |
-| **Configurable, playable ring tone for incoming calls, in the main settings** | **done in M6.1** | The settings page has a **RINGTONE** section: the WAV file, a preview button and two levels. The player is in the media crate (`SoundPlayer`) — the C++ reference is `RingtonePlayer`. The built-in tone is generated rather than shipped as a binary. |
+| **Configurable, playable ring tone for incoming calls, in the main settings** | **done in M6.1 and M6.2** | The settings page has a **RINGTONE** section: the WAV file, a preview button and two levels. The player is in the media crate (`SoundPlayer`) — the C++ reference is `RingtonePlayer`. The built-in tone is generated rather than shipped as a binary. **M6.2** made the file **per account**: the account editor has one too, and the account's own file is used for its calls. |
 | **A generated ring tone when a call is ringing and there is no media** | **done in M6.1** | A **synthesised** tone, not a file: it starts on a `180 Ringing` that carries no SDP, so an outgoing call still rings audibly. The C++ reference is `RingbackPlayer`. |
 
 **Why NAT traversal is on this list and not in M2.** In M2 the SDP named
@@ -3659,7 +3762,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 392 tests, all passing.
+* `cargo test --workspace` — 402 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -3758,6 +3861,23 @@ player lands.
   the page scrolls — the echo test used to fall off the bottom of the
   window, and a setting that cannot be reached is a setting that does not
   exist.
+* **An account can have its own ringtone.** The account's own file is
+  used for its calls, an account with no file of its own falls back to
+  the app's, and with neither it is the built-in tone. The account editor
+  has the field, and an older database gains the column without losing
+  the accounts that are already in it.
+* **The panel follows the call that is up.** A call that has ended gives
+  the panel up, a call that is answered takes it, and a call the user
+  picked in the list keeps it — until that call ends.
+* **The keypad sends its tones to the call that is up.** The tone goes to
+  the call on the panel, not to the dead call the panel used to be stuck
+  on, and the status line names the peer it was meant for.
+* **A call can be held and taken off hold.** The hold is a re-INVITE
+  whose SDP says `a=sendonly`; the peer answers `a=recvonly` and stops
+  sending, and the re-offer names the codec that was negotiated and
+  nothing else.
+* **The transfer popup says the original call is on hold.** A leg that
+  goes quiet without saying why looks like a fault.
 * **The page does not jump when the levels move.** The diagnosis under
   the meters gets a space of its own that does not change size, so the
   buttons under it never move.

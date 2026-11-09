@@ -45,6 +45,13 @@ pub struct Account {
     pub capture_headers: Vec<String>,
     /// Which CRM plugin handles this account. Empty = local contacts.
     pub crm_preset_id: String,
+    /// The WAV file this account rings with.
+    ///
+    /// Empty = the app's own ringtone (the `audio.ringtoneFile` in the
+    /// settings file). A path here is this account's own sound, so two
+    /// accounts can be told apart by the ring that sounds for them —
+    /// which is the whole point of having a per-account ringtone.
+    pub ringtone_file: String,
     /// Epoch milliseconds.
     pub created_at: i64,
     /// Epoch milliseconds.

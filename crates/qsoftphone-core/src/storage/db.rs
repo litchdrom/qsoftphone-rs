@@ -67,6 +67,7 @@ impl Db {
                     dialed_number_header TEXT    NOT NULL DEFAULT '',
                     capture_headers      TEXT    NOT NULL DEFAULT '[]',
                     crm_preset_id        TEXT    NOT NULL DEFAULT '',
+                    ringtone_file        TEXT    NOT NULL DEFAULT '',
                     created_at           INTEGER NOT NULL DEFAULT 0,
                     updated_at           INTEGER NOT NULL DEFAULT 0
                 );
@@ -118,7 +119,14 @@ impl Db {
     /// already exists, so columns added after the first release need
     /// an explicit `ALTER TABLE`.
     fn add_missing_columns(&self) -> Result<()> {
-        let additions = [("calls", "dialed_number", "TEXT")];
+        let additions = [
+            ("calls", "dialed_number", "TEXT"),
+            // The per-account ringtone: a column added after the first
+            // release, so an older database has to be brought up to it.
+            // The default matters: the rows that are already there get
+            // an empty ringtone, not a null one.
+            ("accounts", "ringtone_file", "TEXT NOT NULL DEFAULT ''"),
+        ];
         self.with_conn(|conn| {
             for (table, column, ty) in additions {
                 if !column_exists(conn, table, column)? {
@@ -234,6 +242,69 @@ mod tests {
 
         assert!(has_column, "dialed_number should have been added");
         assert_eq!(old_row, 1, "existing rows must survive the migration");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_older_accounts_table_gains_the_ringtone_column() {
+        // The per-account ringtone is a column added after the first
+        // release: an older database has to be brought up to it, and
+        // the accounts that are already in it have to survive.
+        let dir = std::env::temp_dir().join(format!("qsoftphone-mig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accounts.sqlite");
+
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE accounts (
+                    id                   TEXT    PRIMARY KEY,
+                    label                TEXT    NOT NULL DEFAULT '',
+                    registrar            TEXT    NOT NULL DEFAULT '',
+                    user                 TEXT    NOT NULL DEFAULT '',
+                    password             TEXT    NOT NULL DEFAULT '',
+                    transport            TEXT    NOT NULL DEFAULT 'udp',
+                    domain               TEXT    NOT NULL DEFAULT '',
+                    outbound_proxy       TEXT    NOT NULL DEFAULT '',
+                    caller_id_header     TEXT    NOT NULL DEFAULT '',
+                    dialed_number_header TEXT    NOT NULL DEFAULT '',
+                    capture_headers      TEXT    NOT NULL DEFAULT '[]',
+                    crm_preset_id        TEXT    NOT NULL DEFAULT '',
+                    created_at           INTEGER NOT NULL DEFAULT 0,
+                    updated_at           INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO accounts (id, label, user) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["old-account", "Office", "104"],
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let (has_column, label, ringtone): (bool, String, String) = db
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare("PRAGMA table_info(accounts)")?;
+                let mut has = false;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let name: String = row.get(1)?;
+                    if name == "ringtone_file" {
+                        has = true;
+                    }
+                }
+                let mut stmt = conn.prepare("SELECT label, ringtone_file FROM accounts")?;
+                let mut rows = stmt.query([])?;
+                let row = rows.next()?.expect("the old account is still there");
+                Ok((has, row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+
+        assert!(has_column, "ringtone_file should have been added");
+        assert_eq!(label, "Office", "the old account must survive");
+        assert_eq!(ringtone, "", "the new column starts empty");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

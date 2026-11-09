@@ -38,6 +38,19 @@ t=0 0\r\n\
 m=audio 4000 RTP/AVP 0\r\n\
 a=rtpmap:0 PCMU/8000\r\n";
 
+/// The peer's answer to a **hold**.
+///
+/// RFC 3264 §5: an offer of `a=sendonly` is answered with
+/// `a=recvonly` — the peer stops sending, and the far end goes quiet.
+const PEER_RECVONLY_SDP: &str = "v=0\r\n\
+o=- 2 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 4000 RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=recvonly\r\n";
+
 /// The offer the peer sends — the one Asterisk sends.
 ///
 /// G.711 A-law and telephone-event. No µ-law: an answer that names
@@ -142,7 +155,7 @@ struct Observations {
     /// The full text of every message the peer received, in the same
     /// order.
     raw: Vec<String>,
-    /// The status lines of the answers the peer sent, in order.
+    /// The full text of every answer the peer sent, in order.
     ///
     /// A test that needs to know what the peer **replied** looks here:
     /// the `observations` above are what the peer saw.
@@ -184,6 +197,21 @@ impl Observations {
             .zip(raw.by_ref())
             .find(|(line, _)| !line.starts_with("SIP/") && line.starts_with(method))
             .map(|(_, raw)| raw.clone())
+    }
+
+    /// The full text of every request whose method is `method`, in the
+    /// order they arrived.
+    ///
+    /// A re-INVITE is an INVITE like any other, so a test that wants
+    /// the *second* one has to look at all of them.
+    fn requests(&self, method: &str) -> Vec<String> {
+        let mut raw = self.raw.iter();
+        self.messages
+            .iter()
+            .zip(raw.by_ref())
+            .filter(|(line, _)| !line.starts_with("SIP/") && line.starts_with(method))
+            .map(|(_, raw)| raw.clone())
+            .collect()
     }
 }
 
@@ -503,6 +531,30 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
                     .expect("REGISTER reply");
             }
             "INVITE" => {
+                // A **re-INVITE** is a hold or an unhold: the dialog is
+                // already up, so it is answered straight away — and the
+                // direction in the answer is the mirror of the offer's
+                // (RFC 3264 §5).
+                let reinvite_call_id = header_value(&text, "Call-ID").unwrap_or_default();
+                if dialogs.contains_key(&reinvite_call_id) {
+                    let held = text.contains("a=sendonly");
+                    let answer_sdp = if held { PEER_RECVONLY_SDP } else { PEER_SDP };
+                    // The Contact has to be there: the ACK to a
+                    // re-INVITE is sent to it.
+                    let contact = format!("<sip:peer@{peer_addr}>");
+                    let message = response(&text, "200 OK", &[("Contact", &contact)], answer_sdp);
+                    observations
+                        .lock()
+                        .expect("observations lock")
+                        .sent
+                        .push(message.clone());
+                    socket
+                        .send_to(message.as_bytes(), from)
+                        .await
+                        .expect("re-INVITE reply");
+                    continue;
+                }
+
                 // The challenge comes first, and only once: the client
                 // has to answer it with the account's digest.
                 if options.challenge_invite && header_value(&text, "Authorization").is_none() {
@@ -623,12 +675,12 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
                 // because the channel is in a bridge and the dialog is
                 // gone.
                 let status = options.bye_status.unwrap_or("200 OK");
+                let message = response(&text, status, &[], "");
                 observations
                     .lock()
                     .expect("observations lock")
                     .sent
-                    .push(status.to_string());
-                let message = response(&text, status, &[], "");
+                    .push(message.clone());
                 socket
                     .send_to(message.as_bytes(), from)
                     .await
@@ -1973,6 +2025,136 @@ async fn a_transfer_that_cannot_route_leaves_the_original_call_up() {
             .saw_request("BYE"),
         "the original leg was hung up by a transfer that failed"
     );
+}
+
+/// A call can be put on hold, and taken off hold again.
+///
+/// The hold is a **re-INVITE** whose SDP says `a=sendonly` (RFC 3264
+/// §5): "I will send, I will not receive". The peer answers
+/// `a=recvonly` and stops sending, so the far end goes quiet — which
+/// is what an attended transfer needs, because the user must not hear
+/// the other party while the consultation is ringing.
+#[tokio::test]
+async fn a_call_can_be_held() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+            transfer: None,
+            public_address: None,
+            bye_status: None,
+            early_media: false,
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-loopback-hold".to_string();
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut seen = Vec::new();
+    let call_id = stack
+        .calls
+        .place_call(&account.id, "100")
+        .expect("the call was placed");
+
+    // The call has to be up before it can be held.
+    let answered = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallAnswered,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(answered.is_some(), "the call was never answered");
+
+    // The hold.
+    stack
+        .calls
+        .hold(&account.id, &call_id)
+        .expect("the call was not held");
+
+    // The peer sees a re-INVITE that says `a=sendonly`.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let hold = loop {
+        let invites = observations
+            .lock()
+            .expect("observations lock")
+            .requests("INVITE");
+        // The first INVITE is the call itself; the hold is the second.
+        if let Some(hold) = invites.get(1) {
+            break hold.clone();
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("the peer never got the re-INVITE that holds the call");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    assert!(
+        hold.contains("a=sendonly"),
+        "the hold does not say sendonly:\n{hold}"
+    );
+    // The codec must not change under the call: the re-offer names the
+    // one that was negotiated and nothing else.
+    assert!(
+        hold.contains("m=audio"),
+        "the hold has no media line:\n{hold}"
+    );
+
+    // And the peer answers `a=recvonly` — it stops sending.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let answers = observations.lock().expect("observations lock").sent.clone();
+        if let Some(answer) = answers.iter().find(|answer| answer.contains("200 OK")) {
+            assert!(
+                answer.contains("a=recvonly"),
+                "the peer did not stop sending:\n{answer}"
+            );
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("the peer never answered the hold");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Off hold: the re-INVITE goes back to `a=sendrecv`.
+    stack
+        .calls
+        .unhold(&account.id, &call_id)
+        .expect("the call was not taken off hold");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let invites = observations
+            .lock()
+            .expect("observations lock")
+            .requests("INVITE");
+        if invites.len() >= 3 {
+            let unhold = invites.last().expect("the unhold");
+            assert!(
+                unhold.contains("a=sendrecv"),
+                "the unhold does not say sendrecv:\n{unhold}"
+            );
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("the peer never got the re-INVITE that takes the call off hold");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// A call that is still ringing can be redirected.

@@ -692,6 +692,88 @@ impl CallManager {
         Ok(())
     }
 
+    /// Put a call on hold.
+    ///
+    /// A hold is a **re-INVITE** whose SDP says `a=sendonly` (RFC 3264
+    /// §5): "I will send, I will not receive". The peer answers
+    /// `a=recvonly` and stops sending, so the far end goes quiet.
+    ///
+    /// That is what an attended transfer needs: the original leg goes
+    /// on hold, and the user hears the consultation ringing — not the
+    /// other party and the ring tone at the same time. The C++ does the
+    /// same: `CallController::holdCall` before the consultation is
+    /// dialled, `unholdCall` when the transfer is called off.
+    ///
+    /// The speaker is muted as well, and at once: the peer takes a
+    /// moment to stop sending, and a user who is on a consultation
+    /// should not hear the other leg in the meantime.
+    pub fn hold(&self, account_id: &str, call_id: &str) -> Result<(), CallError> {
+        self.set_held(account_id, call_id, true)
+    }
+
+    /// Take a call off hold.
+    ///
+    /// The re-INVITE goes back to `a=sendrecv`, and the speaker comes
+    /// back.
+    pub fn unhold(&self, account_id: &str, call_id: &str) -> Result<(), CallError> {
+        self.set_held(account_id, call_id, false)
+    }
+
+    /// Hold a call, or take it off hold.
+    fn set_held(&self, account_id: &str, call_id: &str, held: bool) -> Result<(), CallError> {
+        let session = self
+            .sessions
+            .get(account_id)
+            .ok_or(CallError::NotRegistered)?;
+        let dialog = session.dialog(call_id).ok_or(CallError::NoSuchCall)?;
+        if !matches!(dialog.state(), DialogState::Confirmed(_, _)) {
+            return Err(CallError::Sip("the call is not up yet".to_string()));
+        }
+        let media = session.media(call_id).ok_or(CallError::NoSuchCall)?;
+
+        // The re-offer names the codec that was negotiated and nothing
+        // else: a hold must not change the codec under the call.
+        let body = sdp::offer_sdp_with_direction(
+            &media_address(&session),
+            media.local_port(),
+            1,
+            &[media.codec()],
+            if held {
+                sdp::Direction::SendOnly
+            } else {
+                sdp::Direction::SendRecv
+            },
+        );
+
+        // The speaker goes quiet at once, whatever the peer does.
+        media.set_speaker_muted(held);
+
+        let call_id = call_id.to_string();
+        let media = media.clone();
+        self.handle.spawn(async move {
+            let headers = vec![Header::ContentType("application/sdp".into())];
+            let response = match dialog.reinvite(Some(headers), Some(body)).await {
+                Ok(response) => response,
+                Err(e) => {
+                    warn!(call_id = %call_id, error = %e, "the hold could not be sent");
+                    // The peer is still sending: give the user their
+                    // voice back rather than leaving them in silence.
+                    media.set_speaker_muted(false);
+                    return;
+                }
+            };
+            if let Some(response) = response {
+                let status = response.status_code();
+                if status.code() >= 300 {
+                    warn!(call_id = %call_id, code = status.code(), "the peer refused the hold");
+                    media.set_speaker_muted(false);
+                }
+            }
+            tracing::info!(call_id = %call_id, held, "the call was held");
+        });
+        Ok(())
+    }
+
     /// Set the microphone gain of a call.
     ///
     /// A multiplier: 1.0 is no change, and above 1.0 is a preamp.

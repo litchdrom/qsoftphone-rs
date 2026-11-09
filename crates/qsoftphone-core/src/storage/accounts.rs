@@ -27,7 +27,7 @@ impl<'a> AccountStore<'a> {
             let mut stmt = conn.prepare(
                 "SELECT id, label, registrar, user, password, transport, domain,
                         outbound_proxy, caller_id_header, dialed_number_header,
-                        capture_headers, crm_preset_id, created_at, updated_at
+                        capture_headers, crm_preset_id, ringtone_file, created_at, updated_at
                  FROM accounts
                  ORDER BY label COLLATE NOCASE, id",
             )?;
@@ -46,7 +46,7 @@ impl<'a> AccountStore<'a> {
             let mut stmt = conn.prepare(
                 "SELECT id, label, registrar, user, password, transport, domain,
                         outbound_proxy, caller_id_header, dialed_number_header,
-                        capture_headers, crm_preset_id, created_at, updated_at
+                        capture_headers, crm_preset_id, ringtone_file, created_at, updated_at
                  FROM accounts WHERE id = ?1",
             )?;
             let mut rows = stmt.query(params![id])?;
@@ -78,8 +78,8 @@ impl<'a> AccountStore<'a> {
                 "INSERT INTO accounts
                     (id, label, registrar, user, password, transport, domain,
                      outbound_proxy, caller_id_header, dialed_number_header,
-                     capture_headers, crm_preset_id, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                     capture_headers, crm_preset_id, ringtone_file, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(id) DO UPDATE SET
                     label                = excluded.label,
                     registrar            = excluded.registrar,
@@ -92,6 +92,7 @@ impl<'a> AccountStore<'a> {
                     dialed_number_header = excluded.dialed_number_header,
                     capture_headers      = excluded.capture_headers,
                     crm_preset_id        = excluded.crm_preset_id,
+                    ringtone_file        = excluded.ringtone_file,
                     updated_at           = excluded.updated_at",
                 params![
                     account.id,
@@ -106,6 +107,7 @@ impl<'a> AccountStore<'a> {
                     account.dialed_number_header,
                     capture,
                     account.crm_preset_id,
+                    account.ringtone_file,
                     account.created_at,
                     account.updated_at,
                 ],
@@ -160,8 +162,9 @@ fn row_to_account(row: &Row<'_>) -> rusqlite::Result<Account> {
         dialed_number_header: row.get(9)?,
         capture_headers,
         crm_preset_id: row.get(11)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
+        ringtone_file: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
     })
 }
 
@@ -216,6 +219,23 @@ mod tests {
         assert!(!store.delete(&account.id).unwrap());
         assert_eq!(store.count().unwrap(), 0);
         assert!(store.get(&account.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_ringtone_survives_a_round_trip() {
+        let db = Db::open_in_memory().unwrap();
+        let store = AccountStore::new(&db);
+
+        let mut account = Account::new("Office", "example.com", "104", "", "udp");
+        account.ringtone_file = r"C:\sounds\office.wav".to_string();
+        store.upsert(&account).unwrap();
+
+        let fetched = store.get(&account.id).unwrap().unwrap();
+        assert_eq!(fetched.ringtone_file, r"C:\sounds\office.wav");
+
+        // And it is there for every account in the list, too.
+        let listed = store.list().unwrap();
+        assert_eq!(listed[0].ringtone_file, r"C:\sounds\office.wav");
     }
 
     #[test]

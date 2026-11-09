@@ -146,6 +146,12 @@ pub struct QSoftphoneApp {
     ringing: Option<String>,
     /// The redirect of a call that is still ringing.
     redirect: RedirectState,
+    /// Whether the user has picked the call the panel is showing.
+    ///
+    /// The panel follows the call that is answered — unless the user
+    /// has picked another one that is up. That pick is theirs, and it
+    /// holds until the call they picked ends.
+    active_pinned: bool,
 }
 
 /// The state of the redirect popup.
@@ -371,6 +377,8 @@ struct Draft {
     outbound_proxy: String,
     caller_id_header: String,
     dialed_number_header: String,
+    /// The WAV file this account rings with. Empty = the app's own.
+    ringtone_file: String,
 }
 
 impl Draft {
@@ -390,6 +398,7 @@ impl Draft {
         account.outbound_proxy = self.outbound_proxy.trim().to_string();
         account.caller_id_header = self.caller_id_header.trim().to_string();
         account.dialed_number_header = self.dialed_number_header.trim().to_string();
+        account.ringtone_file = self.ringtone_file.trim().to_string();
         account
     }
 
@@ -405,6 +414,7 @@ impl Draft {
             outbound_proxy: account.outbound_proxy.clone(),
             caller_id_header: account.caller_id_header.clone(),
             dialed_number_header: account.dialed_number_header.clone(),
+            ringtone_file: account.ringtone_file.clone(),
         }
     }
 }
@@ -481,6 +491,7 @@ impl QSoftphoneApp {
             sound: qsoftphone_media::SoundPlayer::new(),
             ringing: None,
             redirect: RedirectState::default(),
+            active_pinned: false,
         };
         app.load_selected();
         // The history is read on the runtime; the rows arrive on the
@@ -507,6 +518,11 @@ impl QSoftphoneApp {
                 continue;
             }
             let call_id = event.call_id.clone();
+            // Which account the call is on. The event's own account id
+            // is a number from the core model; this is the app's
+            // account id, and it is the one the ringtone is looked up
+            // with.
+            let account_id = update.account_id.clone();
 
             let is_new = !self.call_views.contains_key(&call_id);
             let view = self
@@ -532,7 +548,7 @@ impl QSoftphoneApp {
                 _ => None,
             };
 
-            view.account_id = update.account_id.clone();
+            view.account_id = account_id.clone();
             if let Some(direction) = event.call_direction {
                 view.direction = Some(direction);
             }
@@ -576,6 +592,17 @@ impl QSoftphoneApp {
                 }
                 CallEventType::CallAnswered => {
                     view.answered = true;
+                    // The call the user has just answered is the one
+                    // they are talking to, so the panel follows it —
+                    // unless the user has picked another call that is
+                    // up, which is their choice and not ours to
+                    // overrule.
+                    //
+                    // Otherwise the keypad would send its tones to
+                    // some other call.
+                    if !self.active_pinned {
+                        self.active_call_id = Some(call_id.clone());
+                    }
                 }
                 CallEventType::TransferProgress => {
                     // §5.6: the banner says what the transfer is doing.
@@ -614,12 +641,45 @@ impl QSoftphoneApp {
             // the app — so it is touched here, after the row's borrow
             // is over.
             match sound {
-                Some(SoundAction::Ringtone) => self.start_ringtone(&call_id),
+                Some(SoundAction::Ringtone) => self.start_ringtone(&call_id, &account_id),
                 Some(SoundAction::Ringback) => self.start_ringback(&call_id),
                 Some(SoundAction::Stop) => self.stop_ringing(&call_id),
                 None => {}
             }
+
+            // And the panel follows the calls that are up.
+            //
+            // This is after the row's borrow: the rule needs to look
+            // at every call, not at this one.
+            self.refresh_active_call();
         }
+    }
+
+    /// Move the panel to a call that is up, if the one it is showing
+    /// is not.
+    ///
+    /// The panel must never stay on a call that has ended: the user
+    /// would be looking at a dead call while a live one is up, and
+    /// would have to click the call in the list to see it — and the
+    /// keypad, which sends its digits to the active call, would be
+    /// dialling a number instead of sending tones.
+    ///
+    /// The user can still pick another call that is up: this only
+    /// moves the panel when the one it is showing is over.
+    fn refresh_active_call(&mut self) {
+        let active_is_up = self.active_call().is_some_and(|active| !active.ended);
+        if active_is_up {
+            return;
+        }
+        // The call the user picked is over: the pick is over with it.
+        self.active_pinned = false;
+        // The newest call that is still up.
+        self.active_call_id = self
+            .call_order
+            .iter()
+            .rev()
+            .find(|id| self.call_views.get(*id).is_some_and(|call| !call.ended))
+            .cloned();
     }
 
     /// The history row for a finished call — §5.3.
@@ -731,6 +791,9 @@ impl QSoftphoneApp {
         match self.calls.place_call(&account.id, &target) {
             Ok(call_id) => {
                 self.active_call_id = Some(call_id.clone());
+                // The app chose this call: the panel follows it, and
+                // it is not the user's pick.
+                self.active_pinned = false;
                 self.view = View::Call;
                 self.status = format!("Calling {target}…");
                 Some(call_id)
@@ -798,10 +861,16 @@ impl QSoftphoneApp {
     /// original call: a transfer between two accounts is not a thing
     /// a softphone does.
     ///
-    /// The original call is muted while the consultation is up — the
-    /// peer must not hear the conversation with the third party. This
-    /// is a local mute, not a SIP hold: the peer is not told, and
-    /// the peer has no way of knowing that a hold happened.
+    /// The original call goes **on hold** while the consultation is up:
+    /// the peer must not hear the conversation with the third party,
+    /// and the user must not hear the peer while the consultation is
+    /// ringing — that is two sounds at once, and the user hears the
+    /// other party and the ring tone together.
+    ///
+    /// The hold is a real one (a re-INVITE with `a=sendonly`, RFC 3264
+    /// §5), as it is in the C++: `CallController::holdCall` before the
+    /// consultation is dialled, `unholdCall` when the transfer is
+    /// called off.
     fn start_consultation(&mut self, call: &CallView) {
         let target = self.transfer.target.trim().to_string();
         if target.is_empty() {
@@ -818,14 +887,26 @@ impl QSoftphoneApp {
             return;
         };
 
+        // The original leg goes on hold **first**: the user must not
+        // hear the other party while the consultation is dialling.
+        let held = self.calls.hold(&call.account_id, &call.call_id).is_ok();
+        let _ = self
+            .calls
+            .set_mic_muted(&call.account_id, &call.call_id, true);
+
         let Some(consultation) = self.place_call_on(&account, &target) else {
+            // The consultation could not be placed: give the original
+            // leg its voice back.
+            if held {
+                let _ = self.calls.unhold(&call.account_id, &call.call_id);
+            }
+            let _ = self
+                .calls
+                .set_mic_muted(&call.account_id, &call.call_id, false);
             return;
         };
         self.transfer.source_call_id = call.call_id.clone();
         self.transfer.consultation_call_id = Some(consultation);
-        let _ = self
-            .calls
-            .set_mic_muted(&call.account_id, &call.call_id, true);
         self.status = format!("Consultation to {target}…");
     }
 
@@ -849,13 +930,15 @@ impl QSoftphoneApp {
     /// Give the consultation up (§5.6).
     ///
     /// The consultation is our own leg: leaving it up would hold the
-    /// microphone for a call the user has already left.
+    /// microphone for a call the user has already left. The original
+    /// leg comes off hold — the user is talking to it again.
     fn cancel_transfer(&mut self) {
         let source = self.transfer.source_call_id.clone();
         if let Some(consultation) = self.transfer.consultation_call_id.take() {
             if let Some(call) = self.call_views.get(&source).cloned() {
                 let _ = self.calls.hangup(&call.account_id, &consultation);
                 // The original call gets its voice back.
+                let _ = self.calls.unhold(&call.account_id, &call.call_id);
                 let _ = self
                     .calls
                     .set_mic_muted(&call.account_id, &call.call_id, false);
@@ -1035,15 +1118,24 @@ impl QSoftphoneApp {
         }
     }
 
+    /// Hang a call up.
+    ///
+    /// It hangs up **that** call: hanging up a call in the list must
+    /// not take the panel to it. The panel follows the call the user
+    /// is looking at, and the user did not ask to look at this one.
+    fn hangup(&mut self, call: &CallView) {
+        match self.calls.hangup(&call.account_id, &call.call_id) {
+            Ok(()) => self.status = "Hanging up…".to_string(),
+            Err(e) => self.status = format!("Could not hang up: {e}"),
+        }
+    }
+
     /// Hang the active call up.
     fn hangup_call(&mut self) {
         let Some(call) = self.active_call().cloned() else {
             return;
         };
-        match self.calls.hangup(&call.account_id, &call.call_id) {
-            Ok(()) => self.status = "Hanging up…".to_string(),
-            Err(e) => self.status = format!("Could not hang up: {e}"),
-        }
+        self.hangup(&call);
     }
 
     /// Send a DTMF digit on the active call.
@@ -1052,7 +1144,9 @@ impl QSoftphoneApp {
             return;
         };
         if let Err(e) = self.calls.send_dtmf(&call.account_id, &call.call_id, digit) {
-            self.status = format!("Could not send the digit: {e}");
+            // The peer is named, so a tone that did not go out says
+            // where it was meant for.
+            self.status = format!("Could not send the digit to {}: {e}", call.peer);
         }
     }
 
@@ -1292,20 +1386,42 @@ impl QSoftphoneApp {
     /// file still rings.
     fn ringtone_sound(&self) -> qsoftphone_media::Sound {
         let file = self.config.audio.ringtone_file.trim().to_string();
-        let file = if file.is_empty() {
-            None
+        if file.is_empty() {
+            qsoftphone_media::Sound::Ringtone { file: None }
         } else {
-            Some(std::path::PathBuf::from(file))
-        };
-        qsoftphone_media::Sound::Ringtone { file }
+            qsoftphone_media::Sound::Ringtone {
+                file: Some(std::path::PathBuf::from(file)),
+            }
+        }
+    }
+
+    /// The ringtone for a call on an account.
+    ///
+    /// The **account's** own file comes first — that is the whole
+    /// point of a per-account ringtone: two accounts can be told apart
+    /// by the sound that comes for them. Then the app's own file, and
+    /// then the built-in tone.
+    fn ringtone_sound_for(&self, account_id: &str) -> qsoftphone_media::Sound {
+        let account_file = self
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .map(|account| account.ringtone_file.trim())
+            .unwrap_or_default();
+        if account_file.is_empty() {
+            return self.ringtone_sound();
+        }
+        qsoftphone_media::Sound::Ringtone {
+            file: Some(std::path::PathBuf::from(account_file)),
+        }
     }
 
     /// Start the ringtone for a call that is coming in.
     ///
     /// The C++ plays one too (`RingtonePlayer`): a call that rings and
     /// makes no sound is a call the user does not know about.
-    fn start_ringtone(&mut self, call_id: &str) {
-        let sound = self.ringtone_sound();
+    fn start_ringtone(&mut self, call_id: &str, account_id: &str) {
+        let sound = self.ringtone_sound_for(account_id);
         let options = self.sound_options(self.config.audio.ringtone_volume);
         self.sound.play(sound, &options);
         self.ringing = Some(call_id.to_string());
@@ -2062,6 +2178,9 @@ impl QSoftphoneApp {
                 .clicked()
             {
                 self.active_call_id = Some(call.call_id.clone());
+                // The user picked this call: the panel stays on it,
+                // even when another call is answered.
+                self.active_pinned = true;
             }
             ui.label(&call.state);
             if !call.dialed_number.is_empty() {
@@ -2072,8 +2191,7 @@ impl QSoftphoneApp {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if !call.ended && ui.button("Hang up").clicked() {
-                    self.active_call_id = Some(call.call_id.clone());
-                    self.hangup_call();
+                    self.hangup(&call);
                 }
             });
         });
@@ -2305,7 +2423,7 @@ impl QSoftphoneApp {
                 ui.heading("Consulting — complete transfer");
                 let state = self.consultation_state(&consultation_call_id);
                 ui.label(consultation_caption(state));
-                ui.weak("Original call muted.");
+                ui.weak("Original call on hold — the other party cannot hear you.");
                 ui.add_space(6.0);
                 let answered = state == ConsultationState::Answered;
                 ui.horizontal(|ui| {
@@ -2841,6 +2959,16 @@ impl QSoftphoneApp {
 
                     ui.label("Dialled number header");
                     ui.text_edit_singleline(&mut draft.dialed_number_header);
+                    ui.end_row();
+
+                    ui.label("Ringtone file");
+                    ui.text_edit_singleline(&mut draft.ringtone_file);
+                    ui.end_row();
+                    ui.label("");
+                    ui.weak(
+                        "A WAV file for this account's calls. Leave it empty for the app's \
+                         own ringtone.",
+                    );
                     ui.end_row();
                 });
         }
@@ -4842,6 +4970,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_panel_moves_to_the_call_that_is_up() {
+        // "The user must click the call to have the active screen of
+        // the call." — a call that has ended must not stay on the
+        // panel: the user would be looking at a dead call while a live
+        // one is up.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        frame(&mut app, &ctx);
+        assert_eq!(
+            app.active_call().map(|call| call.call_id.as_str()),
+            Some("call-1"),
+            "the call that is up is not on the panel"
+        );
+
+        // The call ends.
+        let mut ended = CallEvent::new(CallEventType::CallEnded);
+        ended.call_id = "call-1".to_string();
+        ended.call_direction = Some(Direction::Incoming);
+        ended.call_state = "ended".to_string();
+        bus.publish("acct-ui-1", ended);
+        frame(&mut app, &ctx);
+
+        // A new call comes in.
+        let mut incoming = incoming_event();
+        incoming.call_id = "call-2".to_string();
+        incoming.caller = "sip:7777@sip.example.com".to_string();
+        bus.publish("acct-ui-1", incoming);
+        frame(&mut app, &ctx);
+
+        assert_eq!(
+            app.active_call().map(|call| call.call_id.as_str()),
+            Some("call-2"),
+            "the panel did not follow the call that is up"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_panel_follows_the_call_that_was_answered() {
+        // The call the user has just answered is the one they are
+        // talking to. The panel follows it, and the keypad — which
+        // sends its tones to the active call — with it.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        // One call is up.
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        frame(&mut app, &ctx);
+
+        // A second call comes in and is answered.
+        let mut incoming = incoming_event();
+        incoming.call_id = "call-2".to_string();
+        incoming.caller = "sip:7777@sip.example.com".to_string();
+        bus.publish("acct-ui-1", incoming);
+        frame(&mut app, &ctx);
+
+        let mut ok = CallEvent::new(CallEventType::CallAnswered);
+        ok.call_id = "call-2".to_string();
+        ok.call_direction = Some(Direction::Incoming);
+        ok.call_state = "connected".to_string();
+        bus.publish("acct-ui-1", ok);
+        frame(&mut app, &ctx);
+
+        assert_eq!(
+            app.active_call().map(|call| call.call_id.as_str()),
+            Some("call-2"),
+            "the panel did not follow the call that was answered"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_panel_stays_on_the_call_the_user_picked() {
+        // The user picked a call in the list: the panel stays on it,
+        // even when another call is answered. The pick is theirs.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        frame(&mut app, &ctx);
+
+        // A second call, and it is **outgoing**: an incoming call that
+        // is ringing puts the modal up, and the modal is modal.
+        let mut second = CallEvent::new(CallEventType::OutgoingCallInitiated);
+        second.call_id = "call-2".to_string();
+        second.call_direction = Some(Direction::Outgoing);
+        second.call_state = "initiating".to_string();
+        second.callee = "sip:7777@sip.example.com".to_string();
+        bus.publish("acct-ui-1", second);
+        let mut ok = CallEvent::new(CallEventType::CallAnswered);
+        ok.call_id = "call-2".to_string();
+        ok.call_direction = Some(Direction::Outgoing);
+        ok.call_state = "connected".to_string();
+        bus.publish("acct-ui-1", ok);
+        frame(&mut app, &ctx);
+
+        // The panel follows the call that was answered.
+        assert_eq!(
+            app.active_call().map(|call| call.call_id.as_str()),
+            Some("call-2"),
+            "the panel did not follow the call that was answered"
+        );
+
+        // The user picks the first call in the list.
+        let output = frame(&mut app, &ctx);
+        let row = button_at(&output, "←  Alice").expect("the call list has no row for the call");
+        click_at(&mut app, &ctx, row);
+        frame(&mut app, &ctx);
+
+        assert_eq!(
+            app.active_call().map(|call| call.call_id.as_str()),
+            Some("call-1"),
+            "the panel did not go to the call the user picked"
+        );
+        assert!(app.active_pinned, "the pick did not stick");
+
+        // Another call is answered: the panel stays where the user put
+        // it.
+        let mut third = CallEvent::new(CallEventType::OutgoingCallInitiated);
+        third.call_id = "call-3".to_string();
+        third.call_direction = Some(Direction::Outgoing);
+        third.call_state = "initiating".to_string();
+        third.callee = "sip:8888@sip.example.com".to_string();
+        bus.publish("acct-ui-1", third);
+        let mut ok = CallEvent::new(CallEventType::CallAnswered);
+        ok.call_id = "call-3".to_string();
+        ok.call_direction = Some(Direction::Outgoing);
+        ok.call_state = "connected".to_string();
+        bus.publish("acct-ui-1", ok);
+        frame(&mut app, &ctx);
+
+        assert_eq!(
+            app.active_call().map(|call| call.call_id.as_str()),
+            Some("call-1"),
+            "the panel was taken away from the call the user picked"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_keypad_sends_its_tones_to_the_call_that_is_up() {
+        // The keypad sends to the active call. If the panel is on a
+        // dead call, the digits dial a number instead of being sent as
+        // tones — and the user hears nothing.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        // A call that comes in and ends.
+        let mut incoming = incoming_event();
+        incoming.call_id = "call-1".to_string();
+        bus.publish("acct-ui-1", incoming);
+        let mut ended = CallEvent::new(CallEventType::CallEnded);
+        ended.call_id = "call-1".to_string();
+        ended.call_direction = Some(Direction::Incoming);
+        ended.call_state = "ended".to_string();
+        bus.publish("acct-ui-1", ended);
+        frame(&mut app, &ctx);
+
+        // A call that is up.
+        let mut second = incoming_event();
+        second.call_id = "call-2".to_string();
+        second.caller = "sip:7777@sip.example.com".to_string();
+        bus.publish("acct-ui-1", second);
+        let mut ok = CallEvent::new(CallEventType::CallAnswered);
+        ok.call_id = "call-2".to_string();
+        ok.call_direction = Some(Direction::Incoming);
+        ok.call_state = "connected".to_string();
+        bus.publish("acct-ui-1", ok);
+        frame(&mut app, &ctx);
+
+        // The key sends a tone — to the call that is up, not to the
+        // dead one.
+        app.view = View::Call;
+        let output = frame(&mut app, &ctx);
+        let five = button_at(&output, "5").expect("the keypad has no 5");
+        click_at(&mut app, &ctx, five);
+
+        assert!(
+            app.dial_number.is_empty(),
+            "the key dialled the number during the call: {:?}",
+            app.dial_number
+        );
+        assert!(
+            app.status.contains("7777"),
+            "the tone did not go to the call that is up: {:?}",
+            app.status
+        );
+    }
+
+    #[tokio::test]
     async fn the_keypad_is_in_the_middle_of_the_call_page() {
         // "Why is it not in the middle of the window?" — it is now
         // between the number card and the calls, in the middle of the
@@ -5994,6 +6313,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_transfer_popup_says_the_original_call_is_on_hold() {
+        // "I can hear the called line and the ring tone in the same
+        // time. Normal is calling leg went hold." — the original leg
+        // goes on hold, and the popup says so, because a leg that goes
+        // quiet without saying why looks like a fault.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        frame(&mut app, &ctx);
+
+        app.transfer.open = true;
+        app.transfer.source_call_id = "call-1".to_string();
+        app.transfer.consultation_call_id = Some("call-2".to_string());
+        app.transfer.target = "200".to_string();
+
+        frame(&mut app, &ctx);
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("on hold"),
+            "the popup does not say the original call is on hold:\n{text}"
+        );
+    }
+
     #[test]
     fn the_diagnosis_does_not_move_the_buttons_under_it() {
         // The sentence appears and disappears as the levels move, and
@@ -6112,6 +6458,62 @@ mod tests {
             "the ringtone went on after the call was answered"
         );
         assert!(!app.sound.is_playing(), "the ringtone did not stop");
+    }
+
+    #[tokio::test]
+    async fn an_account_can_have_its_own_ringtone() {
+        // The point of a per-account ringtone: two accounts can be
+        // told apart by the sound that comes for them.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let account_id = app.accounts[0].id.clone();
+
+        app.config.audio.ringtone_file = r"C:\sounds\global.wav".to_string();
+        app.accounts[0].ringtone_file = r"C:\sounds\office.wav".to_string();
+
+        let sound = app.ringtone_sound_for(&account_id);
+        match sound {
+            qsoftphone_media::Sound::Ringtone { file: Some(path) } => assert_eq!(
+                path,
+                std::path::PathBuf::from(r"C:\sounds\office.wav"),
+                "the account's own ringtone was not used"
+            ),
+            _ => panic!("the account's own ringtone was not used"),
+        }
+
+        // An account with no file of its own falls back to the app's.
+        app.accounts[0].ringtone_file.clear();
+        match app.ringtone_sound_for(&account_id) {
+            qsoftphone_media::Sound::Ringtone { file: Some(path) } => assert_eq!(
+                path,
+                std::path::PathBuf::from(r"C:\sounds\global.wav"),
+                "the app's ringtone was not used"
+            ),
+            _ => panic!("the app's ringtone was not used"),
+        }
+
+        // And with neither, the built-in tone: a softphone with no
+        // ringtone file still rings.
+        app.config.audio.ringtone_file.clear();
+        assert!(
+            matches!(
+                app.ringtone_sound_for(&account_id),
+                qsoftphone_media::Sound::Ringtone { file: None }
+            ),
+            "the built-in tone was not used"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_account_page_has_a_ringtone_field() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        app.view = View::Account;
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Ringtone file"),
+            "the account page has no ringtone field:\n{text}"
+        );
     }
 
     #[tokio::test]

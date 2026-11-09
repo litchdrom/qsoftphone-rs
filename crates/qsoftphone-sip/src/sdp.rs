@@ -93,6 +93,32 @@ pub struct Answer {
     pub port: u16,
 }
 
+/// The direction of a media stream (RFC 3264 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Both ways: `a=sendrecv`.
+    SendRecv,
+    /// We send, we do not receive: `a=sendonly`.
+    ///
+    /// This is a **hold**. The peer answers `a=recvonly` and stops
+    /// sending, so the far end goes quiet — which is what the user
+    /// hears when the other leg of an attended transfer is ringing.
+    SendOnly,
+    /// Nothing at all: `a=inactive`.
+    Inactive,
+}
+
+impl Direction {
+    /// The `a=` line for this direction.
+    pub fn as_attribute(self) -> &'static str {
+        match self {
+            Direction::SendRecv => "a=sendrecv",
+            Direction::SendOnly => "a=sendonly",
+            Direction::Inactive => "a=inactive",
+        }
+    }
+}
+
 /// The offer: one audio stream with the codecs this build speaks.
 ///
 /// `address` is the `c=` line — the host the peer should send RTP to.
@@ -102,6 +128,20 @@ pub struct Answer {
 /// named `G722/8000` — the 8 kHz clock of RFC 3551 §4.5.2, not the
 /// 16 kHz of the audio.
 pub fn offer_sdp(address: &str, port: u16, session_id: u64, codecs: &[Codec]) -> Vec<u8> {
+    offer_sdp_with_direction(address, port, session_id, codecs, Direction::SendRecv)
+}
+
+/// The offer, with the direction the stream should have.
+///
+/// The direction is what a **hold** is: the offer of a hold says
+/// `a=sendonly`, and the peer answers `a=recvonly` and stops sending.
+pub fn offer_sdp_with_direction(
+    address: &str,
+    port: u16,
+    session_id: u64,
+    codecs: &[Codec],
+    direction: Direction,
+) -> Vec<u8> {
     let payload_types: Vec<String> = codecs
         .iter()
         .map(|codec| codec.static_payload_type().to_string())
@@ -126,8 +166,9 @@ pub fn offer_sdp(address: &str, port: u16, session_id: u64, codecs: &[Codec]) ->
          m=audio {port} RTP/AVP {payload_types}\r\n\
          {rtpmaps}\
          a=ptime:20\r\n\
-         a=sendrecv\r\n",
+         {direction}\r\n",
         payload_types = payload_types.join(" "),
+        direction = direction.as_attribute(),
     );
     sdp.into_bytes()
 }
