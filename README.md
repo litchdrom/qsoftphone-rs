@@ -9,7 +9,7 @@ identity resolution, the call event contract, the history rules and
 the transfer construction all have to behave identically, including the
 bugs that have already been fixed there.
 
-**Status: M5 complete.** The workspace builds, the test suite passes, the
+**Status: M6.1 complete.** The workspace builds, the test suite passes, the
 app starts and exits cleanly, an account can be registered against a SIP
 registrar with digest authentication (MD5 and SHA-256), and calls can be
 placed and received over that registration — outbound INVITE, inbound
@@ -61,7 +61,16 @@ consultation that is already up — and the peer reports the progress of
 the new leg over `NOTIFY`s, which the banner on the call turns into
 words. When the new leg is answered the original leg is **released**, so
 the user is not left talking to the old peer under a banner that says
-"Transferred". See [Milestones](#milestones).
+"Transferred". The softphone now makes **sounds of its own**: a call that
+comes in **rings** — the ringtone is a WAV file of the user's or the
+built-in tone, and both of them are picked in the settings, with a preview
+button — and a call we made **rings back**, with a generated 440 Hz tone,
+whenever the far end answers with a `180 Ringing` that carries no SDP, so
+there is nothing to hear. A call that is still ringing can be
+**redirected**: the incoming-call screen answers the `INVITE` with a `302
+Moved Temporarily` and a `Contact` naming the target, so the call is
+forwarded without ever being answered. See
+[Milestones](#milestones).
 
 ---
 
@@ -3394,6 +3403,152 @@ No new package.
 
 ---
 
+## M6 — The sounds the softphone makes for itself, and the call that is redirected
+
+### What happens
+
+Three things, asked for together:
+
+1. **A call that comes in rings.** The softphone plays a ringtone of its
+   own while the call is ringing — the C++'s `RingtonePlayer`. The ringtone
+   is picked in the settings: a WAV file of the user's, or the built-in
+   tone.
+2. **A call we made rings back.** When the phone we called answers with a
+   `180 Ringing` that carries no SDP, there is nothing to hear, so the
+   softphone makes its own ringback — the C++'s `RingbackPlayer`.
+3. **A call that is still ringing can be redirected.** The incoming-call
+   screen has a **Redirect** button: it answers the `INVITE` with a `302
+   Moved Temporarily` and a `Contact` naming the target. The call is never
+   answered — this is forwarding without answering.
+
+### The ringtone is generated, not shipped
+
+The C++ ships `src/ui/assets/ringtone.wav`: 8 kHz mono 16-bit, six seconds
+long, two seconds of tone and four of silence. This build **makes** that
+sound instead of shipping it: 440 Hz and 480 Hz together, two seconds on and
+four off, with a 20 ms fade at each end so it does not click.
+
+That is a deliberate trade. A binary asset has to be built, copied next to
+the executable and found at run time, and a softphone that cannot find its
+ringtone file rings silently — the one failure a user cannot forgive. The
+generated tone is the same shape of sound and it is always there.
+
+A WAV file **is** honoured when the settings name one: `audio.ringtone_file`
+is read as 16-bit PCM, mono or stereo (a stereo file is mixed down to
+mono), and resampled to the device's own rate. A file that cannot be read
+is not a reason to be silent: the built-in tone plays instead, and the log
+says why.
+
+### The ringback plays only when there is nothing to hear
+
+The ringback is a single 440 Hz tone, a second in every four — the C++'s
+`RingbackPlayer`, which synthesises it with pjmedia's tone generator rather
+than reading a file.
+
+It plays on **one** condition: the peer answered our `INVITE` with a `180
+Ringing` (or `183 Session Progress`) that carried **no SDP**. That is the
+ordinary ringback from a PBX, and there is no RTP in it — nothing is being
+sent to the speaker, so the softphone makes the sound itself.
+
+If the `180` **does** carry an SDP, the peer is already sending audio, and
+the softphone keeps quiet: a ringback on top of the peer's own ringtone is
+two rings at once. The fact travels on the event as `has_early_media` —
+the SIP layer knows what the response carried, and the app, which owns the
+sound, decides what to do about it.
+
+> **Early media itself is not implemented.** The media still starts at the
+> `200 OK`, so a `180` **with** an SDP gives silence until the call is
+> answered. That is a separate piece of work, and the ringback does not
+> pretend otherwise: it stays quiet exactly when there *is* media to come.
+
+### The redirect is a `302`, and it is called "Redirect"
+
+RFC 3261 §21.4's `302 Moved Temporarily` is the forwarding answer: the
+caller is told to try somewhere else, and where is in the `Contact`.
+
+The button is called **Redirect** and not **Transfer** on purpose. The call
+page already has a button called *Transfer*, and it does something else
+entirely — it sends a `REFER` and asks the peer to put a new leg up, with
+the far end on hold until the new leg answers. Two buttons with the same
+name and different meanings are a trap, and the names are also the
+difference between "I am moving this call" and "I am not taking this call".
+
+The `302` goes out through the **cloned transaction sender**, because
+rsipstack's `InviteDialog::reject` cannot add a `Contact` — and a `302`
+without a `Contact` is a `302` that says nothing. The response is built by
+hand from the request (the `Via`, the `From`, the `To`, the `Call-ID` and
+the `CSeq` are copied) and the `Contact` is pushed onto it.
+
+The target is written the way the app writes every other number: `200`
+becomes `sip:200@<the registrar>`, so the caller is sent to the same place
+the app would have dialled.
+
+### The sound is played on a thread of its own
+
+`SoundPlayer` lives in the media crate. It opens the speaker itself, on a
+thread of its own, and the interface never waits for it (§6): `play()`
+returns at once, `stop()` sets a flag and does not join, and the *next*
+play joins the previous thread on its own thread.
+
+The C++ mixes the ringtone into the same conference bridge the call uses.
+This build cannot: the media crate opens a **pair** of devices per call, and
+a second stream on the same Windows device is the shared-mode case — it
+works, and the two streams are mixed by the audio engine.
+
+The sound belongs to a **call**: the ringtone stops when that call is
+answered, and the ringback when it is. Another call ending does not silence
+it.
+
+### The 60-second watchdog
+
+The C++'s two players both have it, and it is worth keeping: pjsip 2.14 has
+a path where the call is torn down so fast that the disconnected state
+never reaches the UI, and without the cap the tone would play for ever.
+This build has no such path — but a call that rings for ever is still a
+fault, so the player caps every sound at a minute.
+
+### The settings are global, as they are in the C++
+
+The ringtone file and the two volumes live in the `audio` section of the
+config file, which is **app-level**. A per-account ringtone would need a
+column on the account and a migration, and the C++ does not have one
+either — so the first version is the one that matches the reference.
+
+The defaults are the ones the C++ uses, except the inbound ringtone's
+volume: `ringtone_volume` is **0.9** here and 0.7 there, and the backlog
+said to align it when the player landed. The ringback is 0.7 in both.
+
+### The settings page scrolls now
+
+The settings page grew a section, and it was already close to the bottom of
+the window: the echo test — the thing that answers "is my microphone
+working?" — was falling off the bottom and could not be reached. The page
+is now in a scroll area, and the ringtone section was made compact enough
+that everything fits in the default window anyway.
+
+### The dependency cost: nothing
+
+No new package. The tones are made with `f32` maths, the WAV is read with
+`std::fs`, and the player is `cpal` — which M4 already brought in.
+
+### What is *not* in M6
+
+* **The ringtone is not per account.** One ringtone for the application, as
+  in the C++. A per-account ringtone needs an account column and a
+  migration.
+* **Early media is not implemented.** The media starts at the `200 OK`, so a
+  `180` with an SDP is silent until the call is answered.
+* **The redirect is not a `SIP 302` with a `Reason` header**, and it does
+  not follow the call after it: the app marks the call as redirected and
+  stops watching it.
+* **The sound is not mixed into the call.** It is a second stream on the
+  same device, not the same conference bridge.
+* **M6's other items are not started**: the accounts UI, the transport
+  picker, the SIP domain and the outbound proxy. This milestone is the
+  three things that were asked for; the rest of M6 is still M6.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -3440,7 +3595,8 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M4.15** | The volume controls, and the preamp: the microphone gain is applied for the first time, it goes above unity, and both directions have a knob — live on the call page, and as the default in the settings | **done** |
 | **M4.16** | The call is said once: the media logged what the call did when it stopped *and* again when the session was dropped, so every call was in the log twice | **done** |
 | **M5** | Transfer: blind and attended REFER per §5.6, a `Replaces` that names the consultation by all three of its identifiers, the NOTIFY progress over RFC 3515 §3.4, the original leg released when the new leg is answered, and the PBX feature code | **done** |
-| M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | |
+| **M6.1** | The sounds and the redirect: a ringtone on an incoming call with a file and a volume in the settings, a generated ringback on a `180` without SDP, and a `302 Moved Temporarily` from the incoming-call screen | **done** |
+| M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
 
@@ -3459,8 +3615,8 @@ none of them is lost and none of them disturbs the order above.
 | **Opus, as a third codec** | M6 | The next codec after G.722. It needs a pure-Rust encoder (`opus-rs`, which brings `fearless_simd` and `libm` with it), the RFC 7587 RTP framing, and — the hard part — a **third-party `codec_opus` module on the PBX**: Asterisk does not ship one, so the PBX has to be built with it before a single Opus call is possible. |
 | **Expandable history, with the call time and the SIP code** | **done in M3** | The **data** was already there: the `calls` table has `duration_sec`, `sip_code` and `hangup_cause`. The UI was the missing part, and M3 has it: the history page's row shows the number, the duration, the time and the SIP status code, and expands to the full URI, the cause and the exact timestamps. |
 | **NAT traversal for the media plane** | M5 | The signalling side already does what it can: the public `Contact` is learned from the `received`/`rport` the registrar echoes (RFC 3581), the binding is refreshed before it expires, and Asterisk's OPTIONS keepalive is answered. M4 bound a **real** port and the SDP names it — but it is the **local** port, and a NAT that rewrites it will break the call. At the very least the SDP has to carry the NAT-mapped port and the stack has to accept the symmetric RTP a NAT sends back from a different source port; beyond that, `rtc` 0.21.1 already ships `ice`, `stun` and `turn` as unconditional dependencies, so full ICE with host/srflx/relay candidates is available without adding a crate. |
-| **Configurable, playable ring tone for incoming calls, in the main settings** | M6 | The config keys are already there: `audio.ringtone_file` (empty = the bundled default) and `audio.ringtone_volume`. What is missing is the **player** — and the **Settings → Audio** page: a file picker, a volume slider and a preview. The C++ reference is `RingtonePlayer`. M4 opened a sound card, so the player is now possible. |
-| **A generated ring tone when a call is ringing and there is no media** | M5 | A **synthesised** tone, not a file: it starts on 180 Ringing when there is no RTP to carry audio, so an incoming call still rings audibly. It needs a sound card, not RTP — and M4 opened one, so the player is now possible. |
+| **Configurable, playable ring tone for incoming calls, in the main settings** | **done in M6.1** | The settings page has a **RINGTONE** section: the WAV file, a preview button and two levels. The player is in the media crate (`SoundPlayer`) — the C++ reference is `RingtonePlayer`. The built-in tone is generated rather than shipped as a binary. |
+| **A generated ring tone when a call is ringing and there is no media** | **done in M6.1** | A **synthesised** tone, not a file: it starts on a `180 Ringing` that carries no SDP, so an outgoing call still rings audibly. The C++ reference is `RingbackPlayer`. |
 
 **Why NAT traversal is on this list and not in M2.** In M2 the SDP named
 port 4000, and nothing bound it. Against the real Asterisk the call
@@ -3503,7 +3659,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 372 tests, all passing.
+* `cargo test --workspace` — 392 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -3583,6 +3739,25 @@ player lands.
   popup has the C++'s two phases: one to name a target and pick the
   method, and one — while the consultation is dialling — that says where
   the consultation is and offers **Complete transfer**.
+* **An incoming call rings.** The event starts the ringtone, and the test
+  checks that the player is playing.
+* **A call we made rings back — but only when there is nothing to hear.**
+  The loopback peer answers the `INVITE` with a `180 Ringing` that carries
+  no SDP, and the ringback starts. The peer answers the same way *with* an
+  SDP — that is early media, and the peer's own audio is coming — and the
+  test checks that the ringback does **not** start.
+* **A ringing call can be redirected.** The peer calls us, the app answers
+  the `INVITE` with a `302 Moved Temporarily`, and the `Contact` on it
+  names the target that was asked for (`sip:200@…`), not the caller's own
+  address.
+* **A sound does not play for ever.** The watchdog caps every sound at a
+  minute; the test uses a shorter cap and checks that the sound stops and
+  that the player says it is not playing any more.
+* **The settings page has the ringtone, and the page is reachable.** The
+  file field, the preview button and the two levels are on the page, and
+  the page scrolls — the echo test used to fall off the bottom of the
+  window, and a setting that cannot be reached is a setting that does not
+  exist.
 * **The page does not jump when the levels move.** The diagnosis under
   the meters gets a space of its own that does not change size, so the
   buttons under it never move.
@@ -3990,6 +4165,28 @@ player lands.
   a second extension will show is whether the far end is bridged the
   way the user expects — that is a question about the PBX's dialplan,
   not about the app.
+* **The ringtone and the ringback have not been heard.** The tones are
+  made, the WAV is read and the decision is tested — and the sound
+  itself has not been through a speaker, because no call has rung yet:
+  see the next bullet. The cadences are the C++'s (440 + 480 Hz, two
+  seconds on and four off; 440 Hz, one second on and three off), and the
+  file reader is proved against WAVs the test writes itself. The test
+  suite uses a **silent** player, so a run does not beep through every
+  test; the machine's own card (a Realtek headphone output) was found by
+  the media crate when it was called live.
+* **The user's own Asterisk answers at once, so it cannot ring.** A live
+  call to extension 104 came back `100 Trying` and then `200 OK` — no
+  `180 Ringing` at all — and extension 559 (the echo extension) is the
+  same. Two consequences: the **ringback** cannot be exercised against
+  this PBX, because a PBX that answers at once never rings, and the
+  **redirect** cannot be exercised either, because a redirect needs an
+  *inbound* call and the only client on this machine is this app. Both
+  need a phone that calls 104, or a second extension that rings.
+* **The redirect has not been tried against the real Asterisk.** The `302`
+  and its `Contact` are proved against the hand-written peer, over a real
+  socket. What Asterisk does with a `302` — whether it follows the
+  `Contact`, and what the caller's phone sees — is a question about the
+  PBX, and it is the one to check on the next inbound call.
 * **The remote session has not been tested against one.** This machine
   is at the console, so `GetSystemMetrics(SM_REMOTESESSION)` returns
   false here and the notice is exercised by a test that forces it on.

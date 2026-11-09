@@ -409,6 +409,13 @@ struct PeerOptions {
     /// dialog answers `481 Call/Transaction Does Not Exist` — which is
     /// what a PBX does after a transfer.
     bye_status: Option<&'static str>,
+    /// Whether the `180 Ringing` carries the SDP.
+    ///
+    /// That is **early media**: the peer is sending audio before the
+    /// call is answered. The ordinary `180 Ringing` carries no body at
+    /// all, and there is nothing to hear — which is why the softphone
+    /// makes its own ringback for it.
+    early_media: bool,
 }
 
 /// A registrar and call agent on one socket.
@@ -545,7 +552,15 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
                 );
 
                 // Ring first, then answer.
-                let ringing = response(&text, "180 Ringing", &[], "");
+                //
+                // The `180 Ringing` may carry the SDP: that is early
+                // media, and the softphone has something to hear then.
+                // The ordinary one carries no body at all.
+                let ringing = if options.early_media {
+                    response(&text, "180 Ringing", &[], PEER_SDP)
+                } else {
+                    response(&text, "180 Ringing", &[], "")
+                };
                 socket.send_to(ringing.as_bytes(), from).await.expect("180");
                 // The Contact has to name the address the peer can
                 // actually be reached at — it is where the ACK and the
@@ -771,6 +786,7 @@ async fn an_outgoing_call_connects_and_hangs_up() {
             transfer: None,
             public_address: None,
             bye_status: None,
+            early_media: false,
         },
     ));
 
@@ -882,6 +898,7 @@ async fn an_incoming_call_rings_before_the_user_answers() {
             transfer: None,
             public_address: None,
             bye_status: None,
+            early_media: false,
         },
     ));
 
@@ -1003,6 +1020,7 @@ async fn a_ringing_incoming_call_is_declined_when_it_is_hung_up() {
             transfer: None,
             public_address: None,
             bye_status: None,
+            early_media: false,
         },
     ));
 
@@ -1067,6 +1085,7 @@ async fn a_dtmf_digit_arrives_as_an_event() {
             transfer: None,
             public_address: None,
             bye_status: None,
+            early_media: false,
         },
     ));
 
@@ -1120,6 +1139,7 @@ async fn a_dtmf_digit_is_sent_as_an_info_request() {
             transfer: None,
             public_address: None,
             bye_status: None,
+            early_media: false,
         },
     ));
 
@@ -1211,6 +1231,7 @@ fn a_call_placed_off_the_runtime_does_not_take_the_app_down() {
             transfer: None,
             public_address: None,
             bye_status: None,
+            early_media: false,
         },
     ));
 
@@ -1279,6 +1300,7 @@ async fn a_challenged_invite_is_answered_with_the_account_digest() {
             transfer: None,
             public_address: None,
             bye_status: None,
+            early_media: false,
         },
     ));
 
@@ -1423,6 +1445,7 @@ async fn an_in_dialog_request_carries_the_public_contact() {
             transfer: None,
             public_address: Some(PUBLIC_ADDRESS),
             bye_status: None,
+            early_media: false,
         },
     ));
 
@@ -1511,6 +1534,7 @@ async fn a_bye_the_peer_does_not_know_still_ends_the_call() {
             transfer: None,
             public_address: None,
             bye_status: Some("481 Call/Transaction Does Not Exist"),
+            early_media: false,
         },
     ));
 
@@ -1588,6 +1612,7 @@ async fn a_blind_transfer_reaches_the_peer_and_releases_the_original_call() {
             transfer: Some(TransferScript::Answered),
             public_address: None,
             bye_status: None,
+            early_media: false,
         },
     ));
 
@@ -1680,6 +1705,7 @@ async fn the_attended_transfer_names_the_consultation() {
             transfer: Some(TransferScript::Answered),
             public_address: None,
             bye_status: None,
+            early_media: false,
         },
     ));
 
@@ -1822,6 +1848,7 @@ async fn a_feature_code_transfer_is_typed_as_dtmf() {
             transfer: None,
             public_address: None,
             bye_status: None,
+            early_media: false,
         },
     ));
 
@@ -1888,6 +1915,7 @@ async fn a_transfer_that_cannot_route_leaves_the_original_call_up() {
             transfer: Some(TransferScript::NoRoute),
             public_address: None,
             bye_status: None,
+            early_media: false,
         },
     ));
 
@@ -1944,5 +1972,200 @@ async fn a_transfer_that_cannot_route_leaves_the_original_call_up() {
             .expect("observations lock")
             .saw_request("BYE"),
         "the original leg was hung up by a transfer that failed"
+    );
+}
+
+/// A call that is still ringing can be redirected.
+///
+/// A `302 Moved Temporarily` (RFC 3261 §21.4): the caller is told to
+/// try somewhere else, and where is in the `Contact`. The call is
+/// never answered — this is forwarding without answering, and it is
+/// what the user asked for: a button on the ringing screen that hands
+/// the call on.
+#[tokio::test]
+async fn a_ringing_call_can_be_redirected() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: true,
+            dtmf: None,
+            challenge_invite: false,
+            transfer: None,
+            public_address: None,
+            bye_status: None,
+            early_media: false,
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-loopback-redirect".to_string();
+    stack.registrations.start(&account, 0);
+
+    let mut seen = Vec::new();
+    let incoming = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::IncomingCall,
+        Duration::from_secs(5),
+    )
+    .await;
+    let incoming = incoming.expect("the incoming call never arrived");
+
+    // The call is still ringing: it has not been answered.
+    stack
+        .calls
+        .redirect(&account.id, &incoming.call_id, "200")
+        .expect("the call was not redirected");
+
+    // The peer got the `302`.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let redirect = loop {
+        let found = observations
+            .lock()
+            .expect("observations lock")
+            .response("302 Moved Temporarily");
+        if let Some(raw) = found {
+            break raw;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("the peer never got the 302 Moved Temporarily");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    // The `Contact` says where to try next — and it names the target
+    // that was asked for, not the caller's own address.
+    let contact = header_value(&redirect, "Contact").expect("the 302 had no Contact");
+    assert!(
+        contact.contains("sip:200@"),
+        "the 302 does not name the target: {contact}"
+    );
+
+    // It is a response to the call, and it is a final one: the call is
+    // over, and it was never answered.
+    assert!(
+        !observations
+            .lock()
+            .expect("observations lock")
+            .saw_request("BYE"),
+        "the redirected call was hung up instead of redirected"
+    );
+}
+
+/// A `180 Ringing` that carries no SDP means there is nothing to hear.
+///
+/// The peer's `180 Ringing` is the ordinary one: no body at all. The
+/// softphone has to know that, because it makes its own ringback when
+/// there is nothing to hear — and it must not make one over the peer's
+/// own audio.
+#[tokio::test]
+async fn a_ringing_without_media_says_that_there_is_none() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+            transfer: None,
+            public_address: None,
+            bye_status: None,
+            early_media: false,
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-loopback-no-early-media".to_string();
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut seen = Vec::new();
+    stack
+        .calls
+        .place_call(&account.id, "100")
+        .expect("the call was placed");
+
+    let ringing = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::OutgoingCallRinging,
+        Duration::from_secs(5),
+    )
+    .await;
+    let ringing = ringing.expect("the call never rang");
+    assert!(
+        !ringing.has_early_media,
+        "a 180 Ringing without an SDP was taken for early media"
+    );
+}
+
+/// A `180 Ringing` that carries the SDP means the peer is sending
+/// audio already.
+///
+/// That is early media, and it is the one case where the softphone
+/// must keep quiet: the peer is already making a sound, and a ringback
+/// on top of it is two rings at once.
+#[tokio::test]
+async fn a_ringing_with_media_says_that_there_is_some() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+            transfer: None,
+            public_address: None,
+            bye_status: None,
+            early_media: true,
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-loopback-early-media".to_string();
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut seen = Vec::new();
+    stack
+        .calls
+        .place_call(&account.id, "100")
+        .expect("the call was placed");
+
+    let ringing = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::OutgoingCallRinging,
+        Duration::from_secs(5),
+    )
+    .await;
+    let ringing = ringing.expect("the call never rang");
+    assert!(
+        ringing.has_early_media,
+        "a 180 Ringing with an SDP was not taken for early media"
     );
 }

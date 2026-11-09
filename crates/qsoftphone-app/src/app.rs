@@ -132,6 +132,43 @@ pub struct QSoftphoneApp {
     media_updates: Receiver<MediaUpdate>,
     /// The way back to the runtime that does the work.
     media_updates_tx: Sender<MediaUpdate>,
+    /// The sounds the softphone makes on its own: the ringtone and the
+    /// ringback.
+    ///
+    /// The player opens the speaker on a thread of its own, so neither
+    /// the interface nor the SIP stack waits for it (§6).
+    sound: qsoftphone_media::SoundPlayer,
+    /// The call that is ringing, when one is.
+    ///
+    /// The sound belongs to a call: the ringtone stops when that call
+    /// is answered, and the ringback when it is. Another call ending
+    /// must not silence it.
+    ringing: Option<String>,
+    /// The redirect of a call that is still ringing.
+    redirect: RedirectState,
+}
+
+/// The state of the redirect popup.
+///
+/// §5.7's modal has a third button: the call can be sent somewhere
+/// else before it is answered.
+#[derive(Debug, Clone, Default)]
+struct RedirectState {
+    /// Whether the redirect is being asked for.
+    open: bool,
+    /// Where the call is going.
+    target: String,
+}
+
+/// What a call event asks the sound to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoundAction {
+    /// A call is coming in: ring.
+    Ringtone,
+    /// The phone we called is ringing: ring back.
+    Ringback,
+    /// The call is over: stop.
+    Stop,
 }
 
 /// What the background media work has to say.
@@ -441,6 +478,9 @@ impl QSoftphoneApp {
             echo_levels: None,
             media_updates,
             media_updates_tx,
+            sound: qsoftphone_media::SoundPlayer::new(),
+            ringing: None,
+            redirect: RedirectState::default(),
         };
         app.load_selected();
         // The history is read on the runtime; the rows arrive on the
@@ -481,6 +521,17 @@ impl QSoftphoneApp {
                 self.call_order.push(call_id.clone());
             }
 
+            // What the sound does is decided before the call's row is
+            // borrowed: the player belongs to the app, not to the row.
+            let sound = match event.event_type {
+                CallEventType::IncomingCall => Some(SoundAction::Ringtone),
+                CallEventType::OutgoingCallRinging if !event.has_early_media => {
+                    Some(SoundAction::Ringback)
+                }
+                CallEventType::CallAnswered | CallEventType::CallEnded => Some(SoundAction::Stop),
+                _ => None,
+            };
+
             view.account_id = update.account_id.clone();
             if let Some(direction) = event.call_direction {
                 view.direction = Some(direction);
@@ -517,7 +568,15 @@ impl QSoftphoneApp {
                     view.peer_uri = event.callee.clone();
                     view.peer = sip_uri_user_part(&event.callee);
                 }
-                CallEventType::CallAnswered => view.answered = true,
+                CallEventType::OutgoingCallRinging => {
+                    // The peer's `180 Ringing` carried no SDP, so there
+                    // is no early media to hear: the softphone makes
+                    // its own ringback, the way the C++'s
+                    // `RingbackPlayer` does.
+                }
+                CallEventType::CallAnswered => {
+                    view.answered = true;
+                }
                 CallEventType::TransferProgress => {
                     // §5.6: the banner says what the transfer is doing.
                     view.transfer_progress = event.transfer_progress;
@@ -548,7 +607,17 @@ impl QSoftphoneApp {
 
             // The call panel follows the newest call that is not over.
             if !view.ended && self.active_call_id.is_none() {
-                self.active_call_id = Some(call_id);
+                self.active_call_id = Some(call_id.clone());
+            }
+
+            // The sound belongs to the call, and the player belongs to
+            // the app — so it is touched here, after the row's borrow
+            // is over.
+            match sound {
+                Some(SoundAction::Ringtone) => self.start_ringtone(&call_id),
+                Some(SoundAction::Ringback) => self.start_ringback(&call_id),
+                Some(SoundAction::Stop) => self.stop_ringing(&call_id),
+                None => {}
             }
         }
     }
@@ -934,6 +1003,38 @@ impl QSoftphoneApp {
         }
     }
 
+    /// Redirect the call that is ringing to somewhere else.
+    ///
+    /// A `302 Moved Temporarily`: the caller is told to try the target
+    /// instead, and the call is never answered — this is forwarding
+    /// without answering.
+    fn redirect_call(&mut self, call: &CallView) {
+        let target = self.redirect.target.trim().to_string();
+        if target.is_empty() {
+            self.status = "There is no number to redirect the call to.".to_string();
+            return;
+        }
+        match self
+            .calls
+            .redirect(&call.account_id, &call.call_id, &target)
+        {
+            Ok(()) => {
+                self.status = format!("Redirected to {target}.");
+                self.redirect.open = false;
+                self.redirect.target.clear();
+                // The call is over as far as this app is concerned: the
+                // caller has been sent somewhere else, and nobody is
+                // going to answer this one. The `302` is the final
+                // response, so the dialog ends on its own.
+                if let Some(view) = self.call_views.get_mut(&call.call_id) {
+                    view.ended = true;
+                    view.state = "redirected".to_string();
+                }
+            }
+            Err(e) => self.status = format!("Could not redirect the call: {e}"),
+        }
+    }
+
     /// Hang the active call up.
     fn hangup_call(&mut self) {
         let Some(call) = self.active_call().cloned() else {
@@ -1181,6 +1282,79 @@ impl QSoftphoneApp {
     /// session, over a call that is long gone.
     fn sound_card_is_busy(&self) -> bool {
         self.call_views.values().any(|view| !view.ended)
+    }
+
+    /// The ringtone the settings name.
+    ///
+    /// The file is the one the settings name. An empty setting is the
+    /// built-in tone — the C++'s own `ringtone.wav`, made here rather
+    /// than read from a file, so that a softphone with no ringtone
+    /// file still rings.
+    fn ringtone_sound(&self) -> qsoftphone_media::Sound {
+        let file = self.config.audio.ringtone_file.trim().to_string();
+        let file = if file.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(file))
+        };
+        qsoftphone_media::Sound::Ringtone { file }
+    }
+
+    /// Start the ringtone for a call that is coming in.
+    ///
+    /// The C++ plays one too (`RingtonePlayer`): a call that rings and
+    /// makes no sound is a call the user does not know about.
+    fn start_ringtone(&mut self, call_id: &str) {
+        let sound = self.ringtone_sound();
+        let options = self.sound_options(self.config.audio.ringtone_volume);
+        self.sound.play(sound, &options);
+        self.ringing = Some(call_id.to_string());
+    }
+
+    /// Play the ringtone so the user can hear what they picked.
+    ///
+    /// It goes on like any other ringtone — the button turns into
+    /// "Stop" — because the ringtone is a cadence and not a clip.
+    fn preview_ringtone(&mut self) {
+        let sound = self.ringtone_sound();
+        let options = self.sound_options(self.config.audio.ringtone_volume);
+        self.sound.play(sound, &options);
+    }
+
+    /// Start the ringback for a call that is ringing at the other end.
+    ///
+    /// The peer's `180 Ringing` carried no SDP, so there is no early
+    /// media to hear: the softphone makes its own sound, the way the
+    /// C++'s `RingbackPlayer` does — a single 440 Hz tone, a second in
+    /// every four.
+    fn start_ringback(&mut self, call_id: &str) {
+        let options = self.sound_options(self.config.audio.ringback_volume);
+        self.sound.play(qsoftphone_media::Sound::Ringback, &options);
+        self.ringing = Some(call_id.to_string());
+    }
+
+    /// Stop the sound that belongs to a call.
+    ///
+    /// Only that call's sound: another call ending must not silence the
+    /// ringtone of the call that is still ringing.
+    fn stop_ringing(&mut self, call_id: &str) {
+        if self.ringing.as_deref() == Some(call_id) {
+            self.sound.stop();
+            self.ringing = None;
+        }
+    }
+
+    /// How a sound is played: the speaker and the volume.
+    fn sound_options(&self, volume: f32) -> qsoftphone_media::SoundOptions {
+        let speaker = self.config.media.speaker.trim().to_string();
+        qsoftphone_media::SoundOptions {
+            speaker: if speaker.is_empty() {
+                None
+            } else {
+                Some(speaker)
+            },
+            volume,
+        }
     }
 
     /// Play the test sound through the speaker.
@@ -1684,7 +1858,42 @@ impl QSoftphoneApp {
                     if ui.button("Decline").clicked() {
                         self.decline_call();
                     }
+                    // The button is called "Redirect" and not
+                    // "Transfer" because it is a `302 Moved
+                    // Temporarily` — a redirect — and because the call
+                    // page already has a button called "Transfer" that
+                    // does something else. Two buttons with the same
+                    // name and different meanings are a trap.
+                    if ui.button("Redirect").clicked() {
+                        self.redirect.open = true;
+                    }
                 });
+
+                // The redirect: where the call should go instead.
+                //
+                // A `302 Moved Temporarily` — the caller is told to try
+                // somewhere else, and the call is never answered. It is
+                // inside the incoming-call modal on purpose: a second
+                // popup on top of a popup that cannot be closed is a
+                // popup the user cannot get out of.
+                if self.redirect.open {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label("Redirect to");
+                    ui.text_edit_singleline(&mut self.redirect.target);
+                    ui.horizontal(|ui| {
+                        if ui.button("Redirect").clicked() {
+                            self.redirect_call(&call);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.redirect.open = false;
+                            self.redirect.target.clear();
+                        }
+                    });
+                    ui.weak(
+                        "The caller is told to try this number instead. The call is not answered.",
+                    );
+                }
             });
         }
 
@@ -2702,6 +2911,23 @@ impl QSoftphoneApp {
     /// what the softphone speaks, not what one call is — and a list of
     /// three of them in the middle of the dialer is noise.
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
+        // The page scrolls.
+        //
+        // The settings grew — the ringtone and the ringback are on it
+        // now — and on a small window the bottom of the page used to
+        // fall off the screen. A setting that is out of sight is a
+        // setting that does not exist, and the echo test is the one
+        // that answers "is my microphone working?".
+        egui::ScrollArea::vertical()
+            .id_salt("settings")
+            .show(ui, |ui| self.draw_settings_body(ui));
+    }
+
+    /// The settings themselves.
+    ///
+    /// The page is drawn inside a scroll area, so it can be as long as
+    /// it has to be.
+    fn draw_settings_body(&mut self, ui: &mut egui::Ui) {
         // The devices are read on the runtime (§3); ask for them the
         // first time this page is shown.
         self.load_devices();
@@ -2782,6 +3008,63 @@ impl QSoftphoneApp {
         }
         ui.add_space(4.0);
         ui.weak("Above 0 dB is a preamp: the microphone is turned up, and the room with it.");
+        ui.add_space(10.0);
+
+        // The ringtone and the ringback (§5.6's companion: the C++ has
+        // a `RingtonePlayer` and a `RingbackPlayer`).
+        ui.label(egui::RichText::new("RINGTONE").strong().size(11.0));
+        ui.separator();
+
+        // The file and the preview, on one row.
+        //
+        // The page is a page: a setting that takes a row of its own
+        // pushes the rest of the page down, and a page that does not
+        // fit in the window is a page with a half of it out of sight.
+        ui.horizontal(|ui| {
+            ui.label("Ringtone file");
+            let mut file = self.config.audio.ringtone_file.clone();
+            let response = ui.add_sized([240.0, 18.0], egui::TextEdit::singleline(&mut file));
+            if response.changed() {
+                self.config.audio.ringtone_file = file.trim().to_string();
+            }
+            if response.lost_focus() {
+                self.save_settings();
+            }
+            // The preview: hear it without making a call.
+            let playing = self.sound.is_playing();
+            if ui
+                .button(if playing { "Stop" } else { "Play it" })
+                .clicked()
+            {
+                if playing {
+                    self.sound.stop();
+                } else {
+                    self.preview_ringtone();
+                }
+            }
+        });
+        ui.weak("A WAV file. Leave it empty for the built-in tone: two tones at 440 and 480 Hz, two seconds on and four off.");
+
+        // The two levels. They are not gains on a signal — they are how
+        // loud the sounds are — so they are plain fractions.
+        ui.horizontal(|ui| {
+            let mut ringtone = self.config.audio.ringtone_volume;
+            let ringtone_response = draw_level_knob(ui, "Ringtone", &mut ringtone);
+            if ringtone_response.changed() {
+                self.config.audio.ringtone_volume = ringtone;
+            }
+            let mut ringback = self.config.audio.ringback_volume;
+            let ringback_response = draw_level_knob(ui, "Ringback", &mut ringback);
+            if ringback_response.changed() {
+                self.config.audio.ringback_volume = ringback;
+            }
+            // The file is written when the drag ends: writing it on
+            // every step of a drag would write it sixty times a
+            // second, on the thread that draws the window.
+            if ringtone_response.drag_stopped() || ringback_response.drag_stopped() {
+                self.save_settings();
+            }
+        });
         ui.add_space(10.0);
 
         ui.label(egui::RichText::new("SOUND CARD").strong().size(11.0));
@@ -3203,6 +3486,28 @@ fn draw_volume_knob(
         );
         ui.label(
             egui::RichText::new(format!("{decibels:+.0} dB"))
+                .small()
+                .color(egui::Color32::GRAY),
+        );
+        response
+    })
+    .inner
+}
+
+/// Draw a slider for a level that is a plain fraction, from 0 to 1.
+///
+/// The call's volumes are in decibels, because they are gains on a
+/// signal. The ringtone and the ringback are not gains on a signal:
+/// they are how loud a sound is, and a fraction is what that is.
+fn draw_level_knob(ui: &mut egui::Ui, label: &str, level: &mut f32) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let response = ui.add_sized(
+            [110.0, 18.0],
+            egui::Slider::new(level, 0.0..=1.0).show_value(false),
+        );
+        ui.label(
+            egui::RichText::new(format!("{:.0}%", *level * 100.0))
                 .small()
                 .color(egui::Color32::GRAY),
         );
@@ -3669,6 +3974,11 @@ mod tests {
             bus.clone(),
             receiver,
         );
+
+        // The tests do not beep. The player still knows what it would
+        // be playing, so the decision is still tested — a test suite
+        // that rings through every run is a suite people stop running.
+        app.sound = qsoftphone_media::SoundPlayer::silent();
 
         // The store is empty, so the account is put in directly. The
         // id is what the call events are keyed by.
@@ -5772,6 +6082,164 @@ mod tests {
         assert!(
             text.contains("Transfer failed: no route to target"),
             "the banner does not say the target could not be reached:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_incoming_call_rings() {
+        // A call that rings and makes no sound is a call the user does
+        // not know about. The C++ plays a ringtone too
+        // (`RingtonePlayer`).
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        let mut incoming = incoming_event();
+        incoming.call_id = "call-ring".to_string();
+        bus.publish("acct-ui-1", incoming);
+        frame(&mut app, &ctx);
+
+        assert_eq!(app.ringing.as_deref(), Some("call-ring"));
+        assert!(app.sound.is_playing(), "the incoming call did not ring");
+
+        // Answering it stops the ringtone.
+        let mut ok = CallEvent::new(CallEventType::CallAnswered);
+        ok.call_id = "call-ring".to_string();
+        bus.publish("acct-ui-1", ok);
+        frame(&mut app, &ctx);
+
+        assert!(
+            app.ringing.is_none(),
+            "the ringtone went on after the call was answered"
+        );
+        assert!(!app.sound.is_playing(), "the ringtone did not stop");
+    }
+
+    #[tokio::test]
+    async fn an_outgoing_call_that_is_ringing_has_a_ringback() {
+        // The peer's `180 Ringing` carried no SDP: there is no early
+        // media to hear, so the softphone makes its own sound — the
+        // C++'s `RingbackPlayer`.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        let mut ringing = CallEvent::new(CallEventType::OutgoingCallRinging);
+        ringing.call_id = "call-out".to_string();
+        ringing.call_direction = Some(Direction::Outgoing);
+        ringing.has_early_media = false;
+        bus.publish("acct-ui-1", ringing);
+        frame(&mut app, &ctx);
+
+        assert_eq!(app.ringing.as_deref(), Some("call-out"));
+        assert!(
+            app.sound.is_playing(),
+            "the outgoing call did not ring back at the user"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_outgoing_call_with_early_media_has_no_ringback() {
+        // The peer is sending audio: there is something to hear, and a
+        // ringback on top of it is two rings at once.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        let mut ringing = CallEvent::new(CallEventType::OutgoingCallRinging);
+        ringing.call_id = "call-out".to_string();
+        ringing.call_direction = Some(Direction::Outgoing);
+        ringing.has_early_media = true;
+        bus.publish("acct-ui-1", ringing);
+        frame(&mut app, &ctx);
+
+        assert!(app.ringing.is_none());
+        assert!(
+            !app.sound.is_playing(),
+            "the ringback played over the early media"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_settings_have_a_ringtone() {
+        // The ringtone is a setting: the file, and how loud it is.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.config.audio.ringtone_file = "C:/sounds/desk.wav".to_string();
+        app.config.audio.ringtone_volume = 0.25;
+        app.config.audio.ringback_volume = 0.5;
+        app.view = View::Settings;
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+
+        assert!(
+            text.contains("RINGTONE"),
+            "the settings page has no ringtone section:\n{text}"
+        );
+        assert!(
+            text.contains("Ringtone file"),
+            "the settings page has no ringtone file field:\n{text}"
+        );
+        assert!(
+            text.contains("25%"),
+            "the ringtone level does not say where it is:\n{text}"
+        );
+        assert!(
+            text.contains("50%"),
+            "the ringback level does not say where it is:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_incoming_call_can_be_redirected() {
+        // A call that is still ringing can be sent somewhere else: a
+        // `302 Moved Temporarily`, and the call is never answered.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        let mut incoming = incoming_event();
+        incoming.call_id = "call-ring".to_string();
+        bus.publish("acct-ui-1", incoming);
+
+        // Two frames: the first one is egui's sizing pass for the
+        // modal.
+        frame(&mut app, &ctx);
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Redirect"),
+            "the incoming call has no redirect button:\n{text}"
+        );
+
+        // The button opens the target field.
+        let redirect = button_at(&output, "Redirect").expect("the redirect button is not there");
+        click_at(&mut app, &ctx, redirect);
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Redirect to"),
+            "the redirect did not ask for a target:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_without_a_target_says_so() {
+        // An empty target is not a redirect to nowhere — it is a
+        // mistake, and the user is told about it.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        let mut incoming = incoming_event();
+        incoming.call_id = "call-ring".to_string();
+        bus.publish("acct-ui-1", incoming);
+        frame(&mut app, &ctx);
+
+        let call = app.incoming_call().cloned().expect("no incoming call");
+        app.redirect_call(&call);
+
+        assert!(
+            app.status.contains("no number"),
+            "the app did not say what was wrong: {}",
+            app.status
         );
     }
 }

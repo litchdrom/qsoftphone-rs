@@ -1056,7 +1056,7 @@ impl Speaker {
 
 /// Find a device by name, or the system default when the name is
 /// empty.
-fn find_device(host: &Host, name: Option<&str>, input: bool) -> Option<Device> {
+pub(crate) fn find_device(host: &Host, name: Option<&str>, input: bool) -> Option<Device> {
     device_candidates(host, name, input).into_iter().next()
 }
 

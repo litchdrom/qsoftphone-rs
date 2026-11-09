@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use rsipstack::dialog::dialog_layer::DialogLayer;
 use rsipstack::dialog::invite_dialog::InviteDialog;
 use rsipstack::platform::CancellationToken;
+use rsipstack::sip::Request;
 use rsipstack::transaction::endpoint::Endpoint;
+use rsipstack::transaction::transaction::TransactionEventSender;
 
 use qsoftphone_core::model::account::Account;
 use qsoftphone_media::{MediaConfig, MediaSession};
@@ -65,6 +67,15 @@ pub struct AccountSession {
     /// is the *server's* address when the call went through a PBX. A
     /// `Refer-To` that names the server is a transfer to the server.
     targets: Mutex<HashMap<String, String>>,
+    /// The INVITE and the transaction of each call that is still
+    /// ringing.
+    ///
+    /// A `302 Moved Temporarily` is a final response to the INVITE, and
+    /// the transaction is what carries it. The transaction itself
+    /// belongs to the dialog's handler, so what is kept here is the
+    /// sender that the handler reads, and the INVITE the response is
+    /// built from.
+    ringing_calls: Mutex<HashMap<String, (Request, TransactionEventSender)>>,
     /// What the media of a call should be.
     ///
     /// The settings are global, as they were in the C++: the `media`
@@ -92,6 +103,7 @@ impl AccountSession {
             media: Mutex::new(HashMap::new()),
             consultations: Mutex::new(HashMap::new()),
             targets: Mutex::new(HashMap::new()),
+            ringing_calls: Mutex::new(HashMap::new()),
             media_config,
         })
     }
@@ -140,6 +152,37 @@ impl AccountSession {
     pub fn forget(&self, call_id: &str) {
         self.dialogs.lock().expect("dialog lock").remove(call_id);
         self.targets.lock().expect("targets lock").remove(call_id);
+        self.ringing_calls
+            .lock()
+            .expect("ringing lock")
+            .remove(call_id);
+    }
+
+    /// Remember the INVITE and the transaction of a call that is
+    /// ringing.
+    ///
+    /// A `302 Moved Temporarily` is a final response to the INVITE: the
+    /// transaction is what carries it, and the INVITE is what the
+    /// response is built from.
+    pub fn remember_ringing(
+        &self,
+        call_id: &str,
+        request: Request,
+        responder: TransactionEventSender,
+    ) {
+        self.ringing_calls
+            .lock()
+            .expect("ringing lock")
+            .insert(call_id.to_string(), (request, responder));
+    }
+
+    /// The INVITE and the transaction of a call that is ringing.
+    pub fn ringing_call(&self, call_id: &str) -> Option<(Request, TransactionEventSender)> {
+        self.ringing_calls
+            .lock()
+            .expect("ringing lock")
+            .get(call_id)
+            .cloned()
     }
 
     /// Remember what a call was placed to.

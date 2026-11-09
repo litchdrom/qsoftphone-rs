@@ -128,6 +128,13 @@ pub struct CallEvent {
     pub sip_code: i32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub hangup_cause: String,
+    /// Whether the peer's provisional response carried media.
+    ///
+    /// A `180 Ringing` **without** an SDP is the ordinary case: the
+    /// peer is not sending any audio yet, so there is nothing to hear
+    /// and the softphone makes its own ringback.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub has_early_media: bool,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub duration_sec: i64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -208,6 +215,7 @@ impl CallEvent {
             call_state: String::new(),
             sip_code: 0,
             hangup_cause: String::new(),
+            has_early_media: false,
             duration_sec: 0,
             digit: String::new(),
             transfer_progress: None,

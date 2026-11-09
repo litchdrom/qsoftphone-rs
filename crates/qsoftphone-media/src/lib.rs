@@ -60,6 +60,7 @@ pub mod audio;
 pub mod codec;
 pub mod jitter;
 pub mod rtp;
+pub mod sound;
 
 pub use audio::{
     AudioError, AudioState, DeviceInfo, EchoReport, LevelSink, OutboundFrame, REMOTE_SESSION_HINT,
@@ -67,6 +68,9 @@ pub use audio::{
 };
 pub use codec::Codec;
 pub use rtp::RtpSocket;
+pub use sound::{
+    Sound, SoundError, SoundOptions, SoundPlayer, read_wav, ringback_samples, ringtone_samples,
+};
 
 /// How long the receiving thread waits before it looks at the stop
 /// flag again.

@@ -376,6 +376,43 @@ impl CallManager {
             .map_err(|e| CallError::Sip(e.to_string()))
     }
 
+    /// Redirect a call that is still ringing.
+    ///
+    /// A `302 Moved Temporarily` (RFC 3261 §21.4): the caller is told
+    /// to try somewhere else, and where is in the `Contact`. The call
+    /// is never answered — this is forwarding without answering, and it
+    /// is what a PBX does when a call is redirected.
+    ///
+    /// The target is a number or a SIP URI, and it is made into a URI
+    /// the same way a dialled number is: a bare number goes to the
+    /// account's registrar.
+    pub fn redirect(&self, account_id: &str, call_id: &str, target: &str) -> Result<(), CallError> {
+        let session = self
+            .sessions
+            .get(account_id)
+            .ok_or(CallError::NotRegistered)?;
+
+        let (request, responder) = session.ringing_call(call_id).ok_or(CallError::NoSuchCall)?;
+
+        let target_uri = normalise_sip_target(target, &session.account.registrar);
+        let uri: Uri = target_uri
+            .parse()
+            .map_err(|_| CallError::BadTarget(target_uri.clone()))?;
+
+        let mut response = crate::incoming::make_response(&request, StatusCode::MovedTemporarily);
+        // RFC 3261 §21.4: the 3xx carries where to try next.
+        response
+            .headers
+            .push(rsipstack::sip::headers::typed::Contact::from(uri).into());
+
+        responder
+            .send(rsipstack::transaction::transaction::TransactionEvent::Respond(response))
+            .map_err(|_| CallError::NoSuchCall)?;
+
+        tracing::info!(call_id = %call_id, target = %target_uri, "the call was redirected");
+        Ok(())
+    }
+
     /// Hang up.
     ///
     /// §5.5: no status code is forced. The stack picks the right one
@@ -746,6 +783,14 @@ pub async fn handle_incoming_invite(
     let call_id = dialog.id().call_id.clone();
     session.remember(&call_id, dialog.clone());
 
+    // The INVITE and the transaction of the call, so that a `302
+    // Moved Temporarily` can be sent while it is still ringing.
+    //
+    // The transaction belongs to the handler below, so what is kept is
+    // the sender the handler reads — and the INVITE the response is
+    // built from.
+    session.remember_ringing(&call_id, request.clone(), tx.tu_sender.clone());
+
     // §5.4 — the 180 Ringing, immediately.
     //
     // The Contact is the public one, the same address the `200 OK`
@@ -864,6 +909,12 @@ async fn watch_dialog(
                     event.call_direction = Some(direction);
                     event.call_state = "ringing".to_string();
                     event.sip_code = response.status_code.code() as i32;
+                    // Whether the peer is sending any audio yet. A `180
+                    // Ringing` without an SDP is the ordinary case, and
+                    // there is nothing to hear — so the softphone makes
+                    // its own ringback for it.
+                    event.has_early_media =
+                        !response.body.iter().all(|byte| byte.is_ascii_whitespace());
                     bus.publish(&account_id, event);
                 }
             }
