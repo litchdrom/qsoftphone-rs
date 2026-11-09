@@ -11,10 +11,21 @@
 //!   Refer-To: <sip:bob@target.example.com;method=INVITE?Replaces=<call-id>%40<host>>
 //! ```
 //!
-//! Note the shape of the attended form: in rsipstack the `Replaces`
-//! dialog identifier is a **URI parameter inside the Refer-To
-//! value**, not a separate `Replaces` header. That is the form the
-//! test suite expects, and it is what Asterisk and Kamailio accept.
+//! Note the shape of the attended form: the `Replaces` dialog
+//! identifier is a **URI parameter inside the Refer-To value** (RFC
+//! 3515 §2.1). It is also sent as a **`Replaces` header** (RFC 3891
+//! §3.1), because the two are not the same thing to the server:
+//!
+//! * a server that reads the URI parameter finds the dialog itself;
+//! * a server that reads the **header** — and Asterisk does
+//!   (`ast_sip_get_replaces()`) — does not look at the URI at all.
+//!
+//! With only the URI parameter, Asterisk could not find the
+//! consultation and treated the transfer as one to another machine: the
+//! user pressed "Complete transfer" and the server answered "no route
+//! to target" (the NOTIFY said `terminated;reason=noresource`) and
+//! took the consultation down. The C++ reference sends the header —
+//! pjsip's `Call::xferReplaces` builds one — so both are sent here.
 //!
 //! The C++ reference uses pjsip's `Call::xfer` for the blind case and
 //! `Call::xferReplaces` for the attended one, so pjsip builds the
@@ -110,12 +121,23 @@ pub struct ReferRequest {
     pub request_uri: String,
     /// The `Refer-To` header value.
     pub refer_to: String,
+    /// The `Replaces` header value, for an attended transfer.
+    ///
+    /// The dialog the transfer points at is named twice: as a URI
+    /// parameter in the `Refer-To` and as this header. A server reads
+    /// one or the other — and a server that reads neither cannot find
+    /// the dialog, which is a transfer to another machine.
+    pub replaces: Option<String>,
 }
 
 impl ReferRequest {
     /// The headers to put on the REFER.
     pub fn headers(&self) -> Vec<(&'static str, &str)> {
-        vec![("Refer-To", self.refer_to.as_str())]
+        let mut headers = vec![("Refer-To", self.refer_to.as_str())];
+        if let Some(replaces) = self.replaces.as_deref() {
+            headers.push(("Replaces", replaces));
+        }
+        headers
     }
 
     pub fn mode(&self) -> TransferMode {
@@ -202,6 +224,31 @@ pub fn replaces_dialog_id_with_tags(
     )
 }
 
+/// The `Replaces` header value: the dialog's Call-ID and its two tags.
+///
+/// ```text
+/// Replaces: <call-id>@<host>;to-tag=<to-tag>;from-tag=<from-tag>
+/// ```
+///
+/// RFC 3891 §3.1: the header names the dialog by the same three
+/// things the URI parameter does — the Call-ID and the two tags — but
+/// **unescaped**. A header is not a URI parameter: a server that
+/// parses the value as one cannot find the dialog, and a server that
+/// cannot find the dialog treats the transfer as one to another
+/// machine.
+///
+/// Asterisk reads this header and nothing else
+/// (`ast_sip_get_replaces()`), which is why it goes out as well as in
+/// the `Refer-To`.
+pub fn replaces_header(call_id: &str, host: &str, to_tag: &str, from_tag: &str) -> String {
+    let id = if host.is_empty() {
+        call_id.to_string()
+    } else {
+        format!("{call_id}@{host}")
+    };
+    format!("{id};to-tag={to_tag};from-tag={from_tag}")
+}
+
 /// The DTMF sequence a PBX feature-code transfer is typed as.
 ///
 /// This is how a **hardware SIP phone** transfers: the transfer key
@@ -229,6 +276,9 @@ pub fn blind_transfer(transferee_uri: &str, target_uri: &str) -> ReferRequest {
     ReferRequest {
         request_uri: transferee_uri.to_string(),
         refer_to: refer_to_blind(target_uri),
+        // A blind transfer has no dialog to replace: the peer dials a
+        // new one.
+        replaces: None,
     }
 }
 
@@ -246,6 +296,14 @@ pub fn attended_transfer(transferee_uri: &str, consultation: &Consultation) -> R
                 &consultation.from_tag,
             ),
         ),
+        // The same dialog, named the way a server that reads the
+        // header finds it.
+        replaces: Some(replaces_header(
+            &consultation.call_id,
+            &consultation.host,
+            &consultation.to_tag,
+            &consultation.from_tag,
+        )),
     }
 }
 
@@ -290,6 +348,43 @@ mod tests {
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].0, "Refer-To");
         assert_eq!(headers[0].1, "<sip:bob@target.example.com>");
+    }
+
+    #[test]
+    fn the_replaces_header_names_the_dialog_without_escaping_it() {
+        // A header is not a URI parameter: the value goes on the wire
+        // as it is, and a server that parses it as an escaped URI
+        // parameter cannot find the dialog.
+        assert_eq!(
+            replaces_header("1a2b3c", "192.0.2.4", "peer-tag", "our-tag"),
+            "1a2b3c@192.0.2.4;to-tag=peer-tag;from-tag=our-tag"
+        );
+    }
+
+    #[test]
+    fn an_attended_transfer_carries_the_replaces_header() {
+        // The server that reads the header (Asterisk does) and the one
+        // that reads the URI parameter (RFC 3515 §2.1) have to find the
+        // same dialog.
+        let consultation = Consultation {
+            uri: "sip:bob@target.example.com".into(),
+            call_id: "1a2b3c".into(),
+            host: "192.0.2.4".into(),
+            to_tag: "peer-tag".into(),
+            from_tag: "our-tag".into(),
+        };
+        let refer = attended_transfer("sip:alice@peer", &consultation);
+
+        let headers = refer.headers();
+        let replaces = headers
+            .iter()
+            .find(|(name, _)| *name == "Replaces")
+            .map(|(_, value)| *value)
+            .expect("the REFER carries no Replaces header");
+        assert_eq!(
+            replaces, "1a2b3c@192.0.2.4;to-tag=peer-tag;from-tag=our-tag",
+            "the Replaces header does not name the dialog"
+        );
     }
 
     #[test]

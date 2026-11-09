@@ -401,6 +401,36 @@ fn refer_notify(
     )
 }
 
+/// The `CANCEL` a peer sends when the party that was called hangs up
+/// while the call is still ringing.
+///
+/// RFC 3261 §9.1: the CANCEL has the **same** Request-URI as the
+/// request it cancels, and it carries that request's `Call-ID`, `From`
+/// and `To` — the dialog it belongs to. The server then answers the
+/// INVITE itself with `487 Request Terminated` (§9.2), and that is
+/// what tells the client the call is over.
+fn cancel(request: &str, peer_addr: std::net::SocketAddr) -> String {
+    let first = request.lines().next().unwrap_or_default();
+    let target = first.split_whitespace().nth(1).unwrap_or("sip:peer");
+    let mut out = format!("CANCEL {target} SIP/2.0\r\n");
+    out.push_str(&format!(
+        "Via: SIP/2.0/UDP {peer_addr};branch=z9hG4bK-peer-cancel\r\n"
+    ));
+    out.push_str("Max-Forwards: 70\r\n");
+    for name in ["From", "To", "Call-ID"] {
+        if let Some(value) = header_value(request, name) {
+            out.push_str(&format!("{name}: {value}\r\n"));
+        }
+    }
+    // The CSeq number is the one of the request being cancelled; only
+    // the method changes.
+    let cseq = header_value(request, "CSeq").unwrap_or_default();
+    let number = cseq.split_whitespace().next().unwrap_or("1");
+    out.push_str(&format!("CSeq: {number} CANCEL\r\n"));
+    out.push_str("Content-Length: 0\r\n\r\n");
+    out
+}
+
 /// What the peer reports about a transfer.
 ///
 /// The peer takes the REFER and then reports the progress of the new
@@ -444,6 +474,14 @@ struct PeerOptions {
     /// all, and there is nothing to hear — which is why the softphone
     /// makes its own ringback for it.
     early_media: bool,
+    /// Whether the peer cancels the call while it is still ringing.
+    ///
+    /// This is what the far end hanging up during the consultation
+    /// looks like on the wire: the server cancels the INVITE it is
+    /// handling and answers it with `487 Request Terminated` (RFC 3261
+    /// §9.2). Asterisk does exactly this when the party that was
+    /// called gives up while the call is still ringing.
+    cancel_the_call: bool,
 }
 
 /// A registrar and call agent on one socket.
@@ -614,6 +652,23 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
                     response(&text, "180 Ringing", &[], "")
                 };
                 socket.send_to(ringing.as_bytes(), from).await.expect("180");
+
+                // The far end gives up while the call is still
+                // ringing: the server cancels the INVITE and answers
+                // it with `487` (RFC 3261 §9.2).
+                if options.cancel_the_call {
+                    socket
+                        .send_to(cancel(&text, peer_addr).as_bytes(), from)
+                        .await
+                        .expect("peer CANCEL");
+                    let message = response(&text, "487 Request Terminated", &[], "");
+                    socket
+                        .send_to(message.as_bytes(), from)
+                        .await
+                        .expect("487 reply");
+                    continue;
+                }
+
                 // The Contact has to name the address the peer can
                 // actually be reached at — it is where the ACK and the
                 // BYE are sent.
@@ -839,6 +894,7 @@ async fn an_outgoing_call_connects_and_hangs_up() {
             public_address: None,
             bye_status: None,
             early_media: false,
+            cancel_the_call: false,
         },
     ));
 
@@ -951,6 +1007,7 @@ async fn an_incoming_call_rings_before_the_user_answers() {
             public_address: None,
             bye_status: None,
             early_media: false,
+            cancel_the_call: false,
         },
     ));
 
@@ -1073,6 +1130,7 @@ async fn a_ringing_incoming_call_is_declined_when_it_is_hung_up() {
             public_address: None,
             bye_status: None,
             early_media: false,
+            cancel_the_call: false,
         },
     ));
 
@@ -1138,6 +1196,7 @@ async fn a_dtmf_digit_arrives_as_an_event() {
             public_address: None,
             bye_status: None,
             early_media: false,
+            cancel_the_call: false,
         },
     ));
 
@@ -1192,6 +1251,7 @@ async fn a_dtmf_digit_is_sent_as_an_info_request() {
             public_address: None,
             bye_status: None,
             early_media: false,
+            cancel_the_call: false,
         },
     ));
 
@@ -1284,6 +1344,7 @@ fn a_call_placed_off_the_runtime_does_not_take_the_app_down() {
             public_address: None,
             bye_status: None,
             early_media: false,
+            cancel_the_call: false,
         },
     ));
 
@@ -1353,6 +1414,7 @@ async fn a_challenged_invite_is_answered_with_the_account_digest() {
             public_address: None,
             bye_status: None,
             early_media: false,
+            cancel_the_call: false,
         },
     ));
 
@@ -1498,6 +1560,7 @@ async fn an_in_dialog_request_carries_the_public_contact() {
             public_address: Some(PUBLIC_ADDRESS),
             bye_status: None,
             early_media: false,
+            cancel_the_call: false,
         },
     ));
 
@@ -1587,6 +1650,7 @@ async fn a_bye_the_peer_does_not_know_still_ends_the_call() {
             public_address: None,
             bye_status: Some("481 Call/Transaction Does Not Exist"),
             early_media: false,
+            cancel_the_call: false,
         },
     ));
 
@@ -1665,6 +1729,7 @@ async fn a_blind_transfer_reaches_the_peer_and_releases_the_original_call() {
             public_address: None,
             bye_status: None,
             early_media: false,
+            cancel_the_call: false,
         },
     ));
 
@@ -1758,6 +1823,7 @@ async fn the_attended_transfer_names_the_consultation() {
             public_address: None,
             bye_status: None,
             early_media: false,
+            cancel_the_call: false,
         },
     ));
 
@@ -1847,6 +1913,24 @@ async fn the_attended_transfer_names_the_consultation() {
         !refer_to.contains("sip:peer@"),
         "the Refer-To must not name the server's contact: {refer_to}"
     );
+
+    // The same dialog is named in the `Replaces` **header** (RFC 3891
+    // §3.1), which is the one Asterisk reads: a server that cannot
+    // find the dialog treats the transfer as one to another machine,
+    // and answers "no route to target".
+    let replaces = header_value(&refer, "Replaces").expect("the REFER had no Replaces header");
+    assert!(
+        replaces.contains(&consultation_call_id),
+        "the Replaces does not name the consultation's Call-ID: {replaces}"
+    );
+    assert!(
+        replaces.contains("to-tag=peer-tag"),
+        "the Replaces does not carry the dialog's to-tag: {replaces}"
+    );
+    assert!(
+        replaces.contains("from-tag="),
+        "the Replaces does not carry the dialog's from-tag: {replaces}"
+    );
 }
 
 /// The DTMF digits the peer received, in order.
@@ -1901,6 +1985,7 @@ async fn a_feature_code_transfer_is_typed_as_dtmf() {
             public_address: None,
             bye_status: None,
             early_media: false,
+            cancel_the_call: false,
         },
     ));
 
@@ -1968,6 +2053,7 @@ async fn a_transfer_that_cannot_route_leaves_the_original_call_up() {
             public_address: None,
             bye_status: None,
             early_media: false,
+            cancel_the_call: false,
         },
     ));
 
@@ -2051,6 +2137,7 @@ async fn a_call_can_be_held() {
             public_address: None,
             bye_status: None,
             early_media: false,
+            cancel_the_call: false,
         },
     ));
 
@@ -2181,6 +2268,7 @@ async fn a_ringing_call_can_be_redirected() {
             public_address: None,
             bye_status: None,
             early_media: false,
+            cancel_the_call: false,
         },
     ));
 
@@ -2265,6 +2353,7 @@ async fn a_ringing_without_media_says_that_there_is_none() {
             public_address: None,
             bye_status: None,
             early_media: false,
+            cancel_the_call: false,
         },
     ));
 
@@ -2320,6 +2409,7 @@ async fn a_ringing_with_media_says_that_there_is_some() {
             public_address: None,
             bye_status: None,
             early_media: true,
+            cancel_the_call: false,
         },
     ));
 
@@ -2349,5 +2439,71 @@ async fn a_ringing_with_media_says_that_there_is_some() {
     assert!(
         ringing.has_early_media,
         "a 180 Ringing with an SDP was not taken for early media"
+    );
+}
+
+/// A call the far end cancels while it is still ringing.
+///
+/// This is the consultation of an attended transfer dying: the party
+/// that was called gives up, the server cancels the INVITE and answers
+/// it with `487 Request Terminated` (RFC 3261 §9.2). The client has to
+/// hear about it — a consultation that died in silence leaves the
+/// transfer popup offering a transfer to a call that is gone.
+#[tokio::test]
+async fn a_call_the_peer_cancels_ends() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+            transfer: None,
+            public_address: None,
+            bye_status: None,
+            early_media: false,
+            cancel_the_call: true,
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-loopback-cancelled".to_string();
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut seen = Vec::new();
+    stack
+        .calls
+        .place_call(&account.id, "100")
+        .expect("the call was placed");
+
+    let ended = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallEnded,
+        Duration::from_secs(5),
+    )
+    .await;
+    let ended = ended.expect("the cancelled call never ended");
+    assert_eq!(
+        ended.sip_code, 487,
+        "the call did not end with the code the server gave"
+    );
+
+    // And the call was never up: the peer cancelled it while it was
+    // still ringing.
+    assert!(
+        !seen
+            .iter()
+            .any(|event| event.event_type == CallEventType::CallAnswered),
+        "a call that was cancelled was reported as answered"
     );
 }

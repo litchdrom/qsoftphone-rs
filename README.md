@@ -3651,6 +3651,126 @@ already knows how to send, and a flag that was already there.
 
 ---
 
+## M6.3 — The consultation that dies
+
+*"Case atd transfer with refer — if transferee dest does cancel the call with
+cancel or other error code, complete transfer and cancel consultation still
+presented. If user hit complete transfer that hanging up the call."*
+
+### What the log showed
+
+The user's own log (`qsoftphone.log.2026-11-09`, 21:25) has the whole
+story in eleven lines:
+
+```
+21:25:39.683  INVITE sip:105@193.178.169.164:5161   <- the consultation
+21:25:39.935  200 OK                                 <- the target answered
+21:25:43.191  REFER sip:asterisk@193.178.169.164:5161   <- "Complete transfer"
+21:25:43.442  202 Accepted
+21:25:43.444  NOTIFY  Subscription-State: active
+21:25:43.444  NOTIFY  Subscription-State: terminated;reason=noresource
+21:25:43.446  BYE  (the consultation)
+21:25:43.447  BYE  (the original call)               <- ours
+```
+
+Three things were wrong, and one more turned up on the way.
+
+### The popup did not follow the consultation
+
+The transferee destination can end the consultation itself: it hangs up,
+it cancels, or the call fails with an error code. The app noticed none of
+it — the transfer popup went on offering **"Complete transfer"** and
+**"Cancel consultation"** for a call that was already gone.
+
+The popup now **follows the consultation**. When the consultation ends:
+
+* the popup closes,
+* the original leg comes **off hold** — the hold was ours, put there
+  for the consultation, and the user is talking to that peer again,
+* the status line says **"The consultation ended — the transfer was
+  called off"**.
+
+That is the C++'s rule, in `Dialer.qml`: the popup polls the
+consultation call's state every tick, and when that call dies it calls
+`_cleanupConsult()` — unhold the source, clear the consult state, close
+the popup — and the transfer-status banner takes over for the user.
+
+The popup also refuses to offer the buttons for a consultation that is
+over. A button that cannot work is a button that must not be there:
+pressing it would send a REFER for a call that is gone, and §5.6 takes
+the original leg down with it.
+
+### "Complete transfer" on a dead consultation hung the call up
+
+The REFER for a consultation that is over is a transfer that cannot
+work. The peer answers it with a failure, and §5.6 releases the original
+leg when the NOTIFY reports the transfer as done — so the user lost the
+call they were in.
+
+Two guards now:
+
+* the **button** is only there for a consultation that is alive and
+  answered, and
+* the **action** refuses a consultation that is not up:
+  *"The consultation is over — there is nothing to transfer."* Nothing
+  goes on the wire.
+
+### A transfer that failed puts the original call back on the line
+
+The policy in this README already says that a failed transfer keeps the
+original call up, so the user can retry. But the leg was still **on
+hold** — the hold belonged to the consultation, and the consultation is
+over. The hold comes off now, and the microphone comes back with it.
+
+### The `Replaces` was in the wrong place
+
+The log's `noresource` is the server saying **"no route to target"**:
+it could not find the consultation dialog, so it treated the transfer as
+one to another machine.
+
+The dialog was named as a **URI parameter** inside the `Refer-To`:
+
+```
+Refer-To: <sip:105@193.178.169.164:5161;method=INVITE?Replaces=5ed9369c...>
+```
+
+That is the form RFC 3515 §2.1 shows — and the form a server that
+reads the URI parameter finds. Asterisk reads the **`Replaces` header**
+(`ast_sip_get_replaces()`) and does not look at the URI at all, so it
+never saw the dialog. The C++ reference is pjsip's `Call::xferReplaces`,
+which builds a **header**.
+
+So the header goes out as well, with the same three identifiers and
+unescaped (a header is not a URI parameter):
+
+```
+Replaces: 5ed9369c7ccc4c29913befe04e089e74@restsend.com;to-tag=35583397-...;from-tag=CLDOGrFp>
+```
+
+Both forms name the same dialog, so a server that reads either one
+finds it.
+
+### The dependency cost: nothing
+
+No new package: a header that rsipstack already knows how to carry as
+an unknown header, a flag on the transfer state, and the rules that were
+already in the C++.
+
+### What is *not* in M6.3
+
+* **The CANCEL is not answered.** rsipstack 0.7.9 drops an incoming
+  CANCEL for a call that is not up yet — the client transaction is not
+  confirmed, and the stack only replies to a CANCEL on a confirmed
+  server dialog. The `487` that follows it is what ends the call, and
+  the app hears that; answering the CANCEL would need a patch to the
+  stack.
+* **The consultation is not dialled again after a failure.** The user
+  presses "Complete transfer" again, or calls the target themselves.
+* **A blind transfer is not affected.** There is no consultation and no
+  hold in that case, so there is nothing to take back.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -3699,6 +3819,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M5** | Transfer: blind and attended REFER per §5.6, a `Replaces` that names the consultation by all three of its identifiers, the NOTIFY progress over RFC 3515 §3.4, the original leg released when the new leg is answered, and the PBX feature code | **done** |
 | **M6.1** | The sounds and the redirect: a ringtone on an incoming call with a file and a volume in the settings, a generated ringback on a 180 without SDP, and a 302 Moved Temporarily from the incoming-call screen | **done** |
 | **M6.2** | The ringtone per account, the call the panel shows, and the hold: a ringtone file on the account, the panel following the call that is up, and the attended transfer putting the original leg on hold | **done** |
+| **M6.3** | The consultation that dies: the transfer popup following the consultation, a dead consultation offering no transfer, a failed transfer putting the original call back on the line, and the `Replaces` header the server reads | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -3762,7 +3883,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 402 tests, all passing.
+* `cargo test --workspace` — 409 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -3818,7 +3939,9 @@ player lands.
 * **An attended transfer names the consultation.** The `Refer-To` carries
   `;method=INVITE?Replaces=`, and the `Replaces` is the consultation
   dialog's Call-ID with the `@` percent-encoded **and the dialog's two
-  tags** — the peer looks the dialog up by all three.
+  tags** — the peer looks the dialog up by all three. The same three
+  identifiers go out in the **`Replaces` header**, unescaped, because
+  that is the one Asterisk reads.
 * **A transfer that cannot reach its target leaves the original call
   up.** The peer ends the subscription and the body says `486` or
   `503`; the progress comes back as a failure, and no `BYE` goes out.
@@ -3842,6 +3965,22 @@ player lands.
   popup has the C++'s two phases: one to name a target and pick the
   method, and one — while the consultation is dialling — that says where
   the consultation is and offers **Complete transfer**.
+* **A call the far end cancels ends.** The peer cancels the `INVITE` and
+  answers it with `487 Request Terminated` (RFC 3261 §9.2) — what
+  Asterisk does when the party that was called gives up while the call
+  is still ringing. The call ends with that code, and it was never
+  reported as answered.
+* **The transfer popup follows the consultation.** When the consultation
+  ends, the popup closes, the original leg comes off hold and the status
+  line says so; and a popup that still holds a consultation which is
+  over offers **neither** "Complete transfer" nor "Cancel consultation".
+* **A dead consultation cannot be transferred.** The action refuses it
+  with *"The consultation is over — there is nothing to transfer"*, and
+  nothing goes on the wire.
+* **A transfer that failed puts the original call back on the line.** The
+  leg was put on hold for the consultation, so the hold comes off when
+  the transfer fails — the policy that keeps the original call up is
+  worth nothing if the call is left silent.
 * **An incoming call rings.** The event starts the ringtone, and the test
   checks that the player is playing.
 * **A call we made rings back — but only when there is nothing to hear.**
@@ -4276,6 +4415,25 @@ player lands.
   it that way. The `Replaces` now carries the tags as well — whether
   Asterisk takes it is the open question, and it is the one to check on
   the next call with a second extension.
+* **The attended transfer against the user's Asterisk said "no route to
+  target" — and M6.3 says why.** The user's own log (21:25 and 21:26 on
+  2026-11-09) has the whole exchange: the consultation was answered, the
+  `REFER` went out, Asterisk answered `202 Accepted` and then two
+  `NOTIFY`s, the last one `terminated;reason=noresource`, and it took
+  the consultation down. "No route to target" is Asterisk saying it
+  could not find the dialog — and it could not, because the dialog was
+  named as a **URI parameter** and Asterisk reads the **`Replaces`
+  header**. The header now goes out as well (M6.3). Whether Asterisk
+  then bridges the way the user expects is the open question, and it
+  needs the next call with a second extension.
+* **The consultation dying has not been seen against the real PBX.** The
+  app's reaction to it — the popup closing, the original leg coming off
+  hold — is proved against the peer in this repository, which cancels the
+  `INVITE` and answers it with `487` the way Asterisk does when the
+  party that was called gives up while the call is still ringing. What
+  the user's PBX does in that moment is not known from the log: the
+  `BYE` in it came **after** the `REFER`, so the consultation died
+  because the transfer failed rather than because the target hung up.
 * **The attended transfer has not been seen through yet.** Against the
   user's Asterisk the `Replaces` was accepted — the dialog was found,
   and Asterisk put the transfer in motion — but the progress never came

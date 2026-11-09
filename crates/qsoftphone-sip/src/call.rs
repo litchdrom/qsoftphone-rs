@@ -38,7 +38,7 @@ use qsoftphone_core::model::account::Account;
 use qsoftphone_core::model::call_event::{CallEvent, CallEventType, Direction};
 use qsoftphone_core::sip::identity;
 use qsoftphone_core::sip::refer::{
-    TransferProgress, attended_transfer, blind_transfer, feature_code_sequence,
+    ReferRequest, TransferProgress, attended_transfer, blind_transfer, feature_code_sequence,
 };
 use qsoftphone_core::sip::uri::normalise_sip_target;
 use qsoftphone_media::{Codec, MediaConfig, MediaSession, MediaStatus};
@@ -511,7 +511,7 @@ impl CallManager {
 
         let peer = dialog.snapshot().remote_uri.to_string();
         let refer = blind_transfer(&peer, &target_uri);
-        self.send_refer(account_id, call_id, dialog, refer.refer_to)
+        self.send_refer(account_id, call_id, dialog, refer)
     }
 
     /// Transfer a call to a consultation that is already up — the
@@ -559,7 +559,7 @@ impl CallManager {
         // transfer works, so the watcher has to know which one it is.
         session.remember_consultation(call_id, consultation_call_id);
 
-        self.send_refer(account_id, call_id, dialog, refer.refer_to)
+        self.send_refer(account_id, call_id, dialog, refer)
     }
 
     /// Send the REFER itself.
@@ -567,12 +567,18 @@ impl CallManager {
     /// The dialog has to be up: a REFER on a call that is not
     /// established is a REFER the stack throws away without saying
     /// so.
+    ///
+    /// The `Replaces` header goes with it when there is one: it is how
+    /// the peer finds the dialog the transfer points at (RFC 3891
+    /// §3.1). The `Refer-To` carries the same dialog as a URI
+    /// parameter (RFC 3515 §2.1) — a server reads one or the other,
+    /// and Asterisk reads the header.
     fn send_refer(
         &self,
         account_id: &str,
         call_id: &str,
         dialog: InviteDialog,
-        refer_to: String,
+        refer: ReferRequest,
     ) -> Result<(), CallError> {
         if !matches!(dialog.state(), DialogState::Confirmed(_, _)) {
             return Err(CallError::Sip("the call is not up yet".to_string()));
@@ -581,8 +587,13 @@ impl CallManager {
         let account_id = account_id.to_string();
         let call_id = call_id.to_string();
         let bus = self.bus.clone();
+        let refer_to = refer.refer_to.clone();
+        let headers = refer
+            .replaces
+            .as_ref()
+            .map(|replaces| vec![Header::Other("Replaces".to_string(), replaces.clone())]);
         self.handle.spawn(async move {
-            let response = match dialog.refer(refer_to, None, None).await {
+            let response = match dialog.refer(refer_to, headers, None).await {
                 Ok(response) => response,
                 Err(e) => {
                     warn!(call_id = %call_id, error = %e, "the REFER could not be sent");

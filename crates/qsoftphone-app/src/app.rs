@@ -310,6 +310,13 @@ struct TransferState {
     /// attended one; both are dialplan extensions, so which one is
     /// right depends on the server.
     prefix: String,
+    /// Whether the source call is on hold because of the consultation.
+    ///
+    /// The hold is **ours** — we put the leg on hold so the user
+    /// would not hear the old peer while the consultation was up — so
+    /// we are the ones who take it off again when the consultation is
+    /// over or the transfer failed.
+    source_held: bool,
 }
 
 impl Default for TransferState {
@@ -321,6 +328,7 @@ impl Default for TransferState {
             open: false,
             feature_code: false,
             prefix: "*2".to_string(),
+            source_held: false,
         }
     }
 }
@@ -548,6 +556,9 @@ impl QSoftphoneApp {
                 _ => None,
             };
 
+            // Whether the transfer failed — the hold comes off then.
+            let mut failed = false;
+
             view.account_id = account_id.clone();
             if let Some(direction) = event.call_direction {
                 view.direction = Some(direction);
@@ -612,6 +623,10 @@ impl QSoftphoneApp {
                         event.transfer_code,
                         &event.transfer_reason,
                     );
+                    // A transfer that failed leaves the original call
+                    // up (§5.6) — and the leg was put on hold for the
+                    // consultation, so it comes off hold now.
+                    failed = event.transfer_progress == Some(TransferProgress::Failed);
                 }
                 CallEventType::CallEnded => {
                     view.ended = true;
@@ -635,6 +650,26 @@ impl QSoftphoneApp {
             // The call panel follows the newest call that is not over.
             if !view.ended && self.active_call_id.is_none() {
                 self.active_call_id = Some(call_id.clone());
+            }
+
+            // The consultation of an attended transfer is over: there
+            // is nothing left to transfer to, so the popup must not
+            // keep offering a transfer that cannot work — and the
+            // original leg comes off hold.
+            //
+            // This is after the row's borrow: the rule needs to look
+            // at the transfer, not at this one.
+            if event.event_type == CallEventType::CallEnded
+                && self.transfer.open
+                && self.transfer.consultation_call_id.as_deref() == Some(call_id.as_str())
+            {
+                self.consultation_ended();
+            }
+
+            // A transfer that failed leaves the original call up, and
+            // the leg comes off the hold we put on it.
+            if failed {
+                self.release_the_held_source();
             }
 
             // The sound belongs to the call, and the player belongs to
@@ -907,7 +942,52 @@ impl QSoftphoneApp {
         };
         self.transfer.source_call_id = call.call_id.clone();
         self.transfer.consultation_call_id = Some(consultation);
+        // The hold is ours: it is taken off again when the
+        // consultation is over or the transfer failed.
+        self.transfer.source_held = held;
         self.status = format!("Consultation to {target}…");
+    }
+
+    /// The consultation is over: there is nothing left to transfer to.
+    ///
+    /// The transferee destination can end the consultation itself —
+    /// it hangs up, it cancels, or the call fails with an error code —
+    /// and then the popup must not keep offering a transfer that
+    /// cannot work. The C++ does the same: when the consultation call
+    /// dies, it closes the popup, unholds the original call and clears
+    /// the consult state (`_cleanupConsult` in `Dialer.qml`).
+    ///
+    /// The original leg comes **off hold**: the hold was ours, put
+    /// there for the consultation, and the user is talking to that peer
+    /// again.
+    fn consultation_ended(&mut self) {
+        self.transfer.consultation_call_id = None;
+        self.transfer.open = false;
+        // The original leg comes **off hold**: the hold was ours, put
+        // there for the consultation, and the user is talking to that
+        // peer again.
+        self.release_the_held_source();
+        self.status = "The consultation ended — the transfer was called off.".to_string();
+    }
+
+    /// Take the original leg off hold.
+    ///
+    /// The hold is **ours**: we put the leg on hold so the user would
+    /// not hear the old peer while the consultation was up. So we are
+    /// the ones who take it off again — when the consultation is over,
+    /// or when the transfer failed and the call stays up (§5.6).
+    fn release_the_held_source(&mut self) {
+        if !self.transfer.source_held {
+            return;
+        }
+        self.transfer.source_held = false;
+        let source = self.transfer.source_call_id.clone();
+        if let Some(call) = self.call_views.get(&source).cloned() {
+            let _ = self.calls.unhold(&call.account_id, &call.call_id);
+            let _ = self
+                .calls
+                .set_mic_muted(&call.account_id, &call.call_id, false);
+        }
     }
 
     /// Send the REFER that points at the consultation (§5.6).
@@ -915,6 +995,20 @@ impl QSoftphoneApp {
         let Some(consultation) = self.transfer.consultation_call_id.clone() else {
             return;
         };
+        // The consultation has to be **up**: a REFER that points at a
+        // call that is over is a transfer that cannot work. The peer
+        // answers it with a failure, and §5.6 takes the original leg
+        // down with it — so the user would lose the call they were
+        // in.
+        let state = self.consultation_state(&consultation);
+        if state != ConsultationState::Answered {
+            self.status = if state == ConsultationState::Ended {
+                "The consultation is over — there is nothing to transfer.".to_string()
+            } else {
+                "The consultation has not answered yet — there is nothing to transfer.".to_string()
+            };
+            return;
+        }
         match self
             .calls
             .transfer_attended(&call.account_id, &call.call_id, &consultation)
@@ -945,6 +1039,7 @@ impl QSoftphoneApp {
             }
         }
         self.transfer.open = false;
+        self.transfer.source_held = false;
         self.status = "The transfer was cancelled.".to_string();
     }
 
@@ -2420,8 +2515,24 @@ impl QSoftphoneApp {
                 });
             }
             Some(consultation_call_id) => {
-                ui.heading("Consulting — complete transfer");
                 let state = self.consultation_state(&consultation_call_id);
+                if state == ConsultationState::Ended {
+                    // The consultation is over — the transferee
+                    // destination hung up, cancelled, or the call
+                    // failed. There is nothing left to transfer to, and
+                    // a button that cannot work is a button that must
+                    // not be there: pressing it would send a REFER for a
+                    // call that is gone, and §5.6 takes the original
+                    // leg down with it.
+                    ui.heading("The consultation ended");
+                    ui.label("The target is not there any more — there is nothing to transfer to.");
+                    ui.add_space(6.0);
+                    if ui.button("Close").clicked() {
+                        self.transfer.open = false;
+                    }
+                    return;
+                }
+                ui.heading("Consulting — complete transfer");
                 ui.label(consultation_caption(state));
                 ui.weak("Original call on hold — the other party cannot hear you.");
                 ui.add_space(6.0);
@@ -2455,9 +2566,15 @@ impl QSoftphoneApp {
     /// The C++ polls the call model for this
     /// (`transferPopup._consultState`); here the call views carry the
     /// same thing.
+    ///
+    /// A call the app has **no view of** is one it has not heard from
+    /// yet — the consultation has just been placed and its first event
+    /// is on its way. It is not a consultation that ended: the views
+    /// are never thrown away, so a call that is over still has one,
+    /// and that one says so.
     fn consultation_state(&self, call_id: &str) -> ConsultationState {
         let Some(view) = self.call_views.get(call_id) else {
-            return ConsultationState::Ended;
+            return ConsultationState::Dialling;
         };
         if view.ended {
             return ConsultationState::Ended;
@@ -6337,6 +6454,177 @@ mod tests {
         assert!(
             text.contains("on hold"),
             "the popup does not say the original call is on hold:\n{text}"
+        );
+    }
+
+    /// The consultation of an attended transfer, as the app sees it.
+    fn a_consultation_that_is_answered() -> CallEvent {
+        let mut answered = CallEvent::new(CallEventType::CallAnswered);
+        answered.call_id = "call-2".to_string();
+        answered.call_direction = Some(Direction::Outgoing);
+        answered.call_state = "connected".to_string();
+        answered
+    }
+
+    /// The consultation dying: the transferee destination hung up, or
+    /// cancelled, or the call failed with an error code.
+    fn a_consultation_that_ended() -> CallEvent {
+        let mut ended = CallEvent::new(CallEventType::CallEnded);
+        ended.call_id = "call-2".to_string();
+        ended.call_direction = Some(Direction::Outgoing);
+        ended.call_state = "ended".to_string();
+        ended.sip_code = 487;
+        ended
+    }
+
+    #[tokio::test]
+    async fn the_transfer_popup_closes_when_the_consultation_dies() {
+        // The user's report: "if transferee dest does cancel the call
+        // with cancel or other error code - complete transfer and
+        // cancel consultation still presented".
+        //
+        // The consultation is gone, so the popup must not keep
+        // offering a transfer that cannot work — and the original leg
+        // comes off the hold we put on it.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        frame(&mut app, &ctx);
+
+        app.transfer.open = true;
+        app.transfer.source_call_id = "call-1".to_string();
+        app.transfer.consultation_call_id = Some("call-2".to_string());
+        app.transfer.source_held = true;
+        app.transfer.target = "200".to_string();
+
+        // The consultation is answered: the popup offers the transfer.
+        bus.publish("acct-ui-1", a_consultation_that_is_answered());
+        frame(&mut app, &ctx);
+        frame(&mut app, &ctx);
+        let output = frame(&mut app, &ctx);
+        assert!(
+            screen_text(&output).contains("Complete transfer"),
+            "the popup does not offer the transfer:\n{}",
+            screen_text(&output)
+        );
+
+        // And then it dies.
+        bus.publish("acct-ui-1", a_consultation_that_ended());
+        frame(&mut app, &ctx);
+        frame(&mut app, &ctx);
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+
+        assert!(
+            !text.contains("Complete transfer"),
+            "the popup still offers the transfer:\n{text}"
+        );
+        assert!(
+            !text.contains("Cancel consultation"),
+            "the popup still offers to cancel a consultation that is over:\n{text}"
+        );
+        assert!(
+            !app.transfer.open,
+            "the popup is still open after the consultation died"
+        );
+        assert!(
+            !app.transfer.source_held,
+            "the original call is still on hold after the consultation died"
+        );
+        assert!(
+            app.status.contains("consultation ended"),
+            "the app does not say what happened: {}",
+            app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn the_transfer_popup_does_not_offer_a_transfer_for_a_dead_consultation() {
+        // The consultation died while the popup was closed, and the
+        // popup is then shown with the consultation the app still
+        // remembers: the buttons it offers are for a call that is not
+        // there, and they must not be there.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        frame(&mut app, &ctx);
+
+        bus.publish("acct-ui-1", a_consultation_that_ended());
+        frame(&mut app, &ctx);
+
+        app.transfer.open = true;
+        app.transfer.source_call_id = "call-1".to_string();
+        app.transfer.consultation_call_id = Some("call-2".to_string());
+
+        frame(&mut app, &ctx);
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            !text.contains("Complete transfer"),
+            "the popup offers a transfer to a consultation that is over:\n{text}"
+        );
+        assert!(
+            text.contains("consultation ended"),
+            "the popup does not say what happened:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_consultation_cannot_be_transferred() {
+        // "If user hit complete transfer that hanging up the call." — a
+        // REFER for a call that is over is a transfer that cannot work,
+        // and §5.6 takes the original leg down with it. So the app must
+        // not send one.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        frame(&mut app, &ctx);
+
+        app.transfer.consultation_call_id = Some("call-2".to_string());
+        let call = app
+            .call_views
+            .get("call-1")
+            .cloned()
+            .expect("the call is not there");
+        app.complete_attended_transfer(&call);
+
+        assert!(
+            app.status.contains("nothing to transfer"),
+            "the app does not say why: {}",
+            app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transfer_that_failed_puts_the_original_call_back_on_the_line() {
+        // §5.6: a transfer that failed leaves the original call up —
+        // and the leg was put on hold for the consultation, so the
+        // hold comes off: the user is talking to that peer again.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        frame(&mut app, &ctx);
+
+        app.transfer.source_call_id = "call-1".to_string();
+        app.transfer.source_held = true;
+
+        let mut progress = CallEvent::new(CallEventType::TransferProgress);
+        progress.call_id = "call-1".to_string();
+        progress.transfer_progress = Some(TransferProgress::Failed);
+        progress.transfer_code = 503;
+        progress.transfer_reason = "Service Unavailable".to_string();
+        bus.publish("acct-ui-1", progress);
+        frame(&mut app, &ctx);
+
+        assert!(
+            !app.transfer.source_held,
+            "the original call is still on hold after a transfer that failed"
         );
     }
 
