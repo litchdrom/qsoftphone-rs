@@ -32,10 +32,11 @@ use rsipstack::sip::{Auth, Header, HeadersExt, Scheme, StatusCode, ToTypedHeader
 use rsipstack::transaction::Transaction;
 use rsipstack::transaction::key::TransactionRole;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tracing::warn;
+use tracing::{info, warn};
 
 use qsoftphone_core::model::account::Account;
 use qsoftphone_core::model::call_event::{CallEvent, CallEventType, Direction};
+use qsoftphone_core::sip::custom_headers::{self, HeaderVars};
 use qsoftphone_core::sip::identity;
 use qsoftphone_core::sip::refer::{
     ReferRequest, TransferProgress, attended_transfer, blind_transfer, feature_code_sequence,
@@ -250,6 +251,12 @@ impl CallManager {
             // credential the stack treats the challenge as the final
             // response and the call dies before it rings.
             credential: credential_of(&account),
+            // The account's own extra headers: the ticket number, the
+            // CRM id, the queue. They go on the INVITE and nowhere else
+            // — a header that only means something on a call is
+            // dropped on the way out, so the REGISTER says nothing
+            // about it.
+            headers: custom_headers_of(&account, target),
             ..Default::default()
         };
 
@@ -1276,6 +1283,62 @@ pub fn aor_of(account: &Account) -> String {
         account.domain.trim().to_string()
     };
     format!("sip:{}@{host}", account.user)
+}
+
+/// The extra headers this account puts on its calls.
+///
+/// The list is the account's own, and the values are resolved against
+/// the call that is going out: the same account dials different
+/// numbers, and a header that has to be the same every time is not
+/// worth having.
+///
+/// `target` is what the user dialled — the number as it was typed,
+/// before it became a URI.
+///
+/// `None` when the account has no headers at all, so a request goes
+/// out exactly as it did before the account had any.
+fn custom_headers_of(account: &Account, target: &str) -> Option<Vec<Header>> {
+    if account.custom_headers.is_empty() {
+        return None;
+    }
+
+    // The app puts no display name on its `From`, so the name the call
+    // goes out under is the account's user part. That is what `$callerid`
+    // resolves to — for an outgoing call the caller is us.
+    let vars = HeaderVars {
+        caller_id: account.user.clone(),
+        called: target.trim().to_string(),
+        user: account.user.clone(),
+        account: account.label.clone(),
+    };
+
+    let built = custom_headers::build(&account.custom_headers, &vars);
+    if built.is_empty() {
+        // Every header had a name that is not a header name. Say so:
+        // the user asked for something and got nothing.
+        warn!(
+            account = %account.label,
+            "every custom header of this account has a name that is not a header name; \
+             none of them went out"
+        );
+        return None;
+    }
+
+    // The names only: a value can carry a ticket number or a name, and
+    // the log is not the place for it.
+    let names = built
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    info!(account = %account.label, headers = %names, "the call goes out with its own headers");
+
+    Some(
+        built
+            .into_iter()
+            .map(|(name, value)| Header::Other(name, value))
+            .collect(),
+    )
 }
 
 /// The digest credential of an account.

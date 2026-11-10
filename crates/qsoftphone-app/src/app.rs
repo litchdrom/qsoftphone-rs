@@ -21,6 +21,7 @@ use qsoftphone_core::model::history::{
     format_duration, history_direction,
 };
 use qsoftphone_core::paths::AppPaths;
+use qsoftphone_core::sip::custom_headers::is_valid_name;
 use qsoftphone_core::sip::refer::TransferProgress;
 use qsoftphone_core::sip::uri::sip_uri_user_part;
 use qsoftphone_core::storage::{AccountStore, Db};
@@ -413,6 +414,12 @@ struct Draft {
     dialed_number_header: String,
     /// The WAV file this account rings with. Empty = the app's own.
     ringtone_file: String,
+    /// The extra headers this account puts on its calls.
+    ///
+    /// A name and a value, in the order the user put them in. A row
+    /// with no name is not a header and is dropped when the account is
+    /// saved.
+    custom_headers: Vec<(String, String)>,
 }
 
 impl Draft {
@@ -433,6 +440,7 @@ impl Draft {
         account.caller_id_header = self.caller_id_header.trim().to_string();
         account.dialed_number_header = self.dialed_number_header.trim().to_string();
         account.ringtone_file = self.ringtone_file.trim().to_string();
+        account.custom_headers = Self::clean_headers(&self.custom_headers);
         account
     }
 
@@ -449,7 +457,27 @@ impl Draft {
             caller_id_header: account.caller_id_header.clone(),
             dialed_number_header: account.dialed_number_header.clone(),
             ringtone_file: account.ringtone_file.clone(),
+            custom_headers: account.custom_headers.clone(),
         }
+    }
+
+    /// The headers that are worth keeping.
+    ///
+    /// A row with no name is not a header — the user typed a value and
+    /// left the name blank, or cleared the name — so it is dropped when
+    /// the account is saved. A row with a name and no value **is** one:
+    /// `X-Ticket:` with nothing after it is a header with an empty
+    /// value, and a PBX can want that.
+    ///
+    /// The name is checked for legality here as well as on the way out,
+    /// so the user is told while the account is still open rather than
+    /// when the next call goes out.
+    fn clean_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+        headers
+            .iter()
+            .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+            .filter(|(name, _)| !name.is_empty())
+            .collect()
     }
 }
 
@@ -3329,6 +3357,59 @@ impl QSoftphoneApp {
             });
         }
 
+        // The extra headers this account puts on its calls.
+        //
+        // They are their own block rather than two more rows of the
+        // grid: there is one of them per header, and a grid row holds
+        // one field.
+        ui.separator();
+        ui.label(egui::RichText::new("CUSTOM HEADERS").strong().size(11.0));
+        ui.weak(
+            "Extra headers to send on the calls this account makes — a ticket number, \
+             a CRM id, the queue.",
+        );
+
+        let draft = &mut self.edit_account;
+        // The row to take out, applied after the loop: the list is
+        // borrowed while it is being drawn.
+        let mut remove: Option<usize> = None;
+        for (index, (name, value)) in draft.custom_headers.iter_mut().enumerate() {
+            // Checked before the row is drawn, so the warning is not
+            // painted inside the row's own rectangle.
+            let trimmed = name.trim().to_string();
+            let broken = !trimmed.is_empty() && !is_valid_name(&trimmed);
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(name)
+                        .id_source(("custom_header_name", index))
+                        .desired_width(140.0)
+                        .hint_text("X-var1"),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(value)
+                        .id_source(("custom_header_value", index))
+                        .desired_width(180.0)
+                        .hint_text("value"),
+                );
+                if ui.button("Remove").clicked() {
+                    remove = Some(index);
+                }
+            });
+            if broken {
+                ui.label(
+                    egui::RichText::new("\"{trimmed}\" is not a header name — it will not go out.")
+                        .small()
+                        .color(egui::Color32::from_rgb(231, 76, 60)),
+                );
+            }
+        }
+        if let Some(index) = remove {
+            draft.custom_headers.remove(index);
+        }
+        if ui.button("+ Add a header").clicked() {
+            draft.custom_headers.push((String::new(), String::new()));
+        }
+
         ui.horizontal(|ui| {
             if ui.button("Save").clicked() {
                 self.save_selected();
@@ -4637,6 +4718,104 @@ mod tests {
         app.view = View::Account;
         let output = frame(&mut app, &ctx);
         assert!(!output.shapes.is_empty(), "the frame drew nothing");
+    }
+
+    #[tokio::test]
+    async fn the_account_editor_shows_the_accounts_own_headers() {
+        // The extra headers the account puts on its calls are edited
+        // with the account: they are per-account policy, and a policy
+        // that lives on another page is a policy nobody edits.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.accounts[0].custom_headers = vec![
+            ("X-var1".to_string(), "one".to_string()),
+            ("X-var2".to_string(), "$called".to_string()),
+        ];
+        app.load_selected();
+        app.view = View::Account;
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("X-var1"),
+            "the header is not on the account page:\n{text}"
+        );
+        assert!(
+            text.contains("one"),
+            "the header's value is not on the account page:\n{text}"
+        );
+        assert!(
+            text.contains("X-var2"),
+            "the second header is not on the account page:\n{text}"
+        );
+        assert!(
+            text.contains("$called"),
+            "the template is not shown as it was typed:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_account_editor_says_when_a_header_name_is_not_one() {
+        // A name with a space in it would split the message in two.
+        // The user is told while the account is open, not when the
+        // next call goes out.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.accounts[0].custom_headers = vec![("X bad".to_string(), "one".to_string())];
+        app.load_selected();
+        app.view = View::Account;
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("is not a header name"),
+            "the account page does not say why the header will not go out:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_headers_survive_the_round_trip_through_the_editor() {
+        let mut account = Account::new("Office", "sip.example.com:5060", "104", "pw", "udp");
+        account.custom_headers = vec![
+            ("X-var1".to_string(), "one".to_string()),
+            ("X-var2".to_string(), "$called".to_string()),
+        ];
+
+        let draft = Draft::from_account(&account);
+        assert_eq!(draft.custom_headers.len(), 2);
+
+        let saved = draft.to_account();
+        assert_eq!(saved.custom_headers, account.custom_headers);
+    }
+
+    #[test]
+    fn a_header_with_no_name_is_not_saved() {
+        // The user typed a value and left the name blank, or cleared
+        // the name. It is not a header, so it is not saved.
+        let mut account = Account::new("Office", "sip.example.com:5060", "104", "pw", "udp");
+        account.custom_headers = vec![
+            ("".to_string(), "one".to_string()),
+            ("X-var1".to_string(), "two".to_string()),
+        ];
+
+        let saved = Draft::from_account(&account).to_account();
+        assert_eq!(saved.custom_headers.len(), 1);
+        assert_eq!(saved.custom_headers[0].0, "X-var1");
+    }
+
+    #[test]
+    fn a_header_with_a_name_and_no_value_is_saved() {
+        // `X-Ticket:` with nothing after it is a header with an empty
+        // value, and a PBX can want that.
+        let mut account = Account::new("Office", "sip.example.com:5060", "104", "pw", "udp");
+        account.custom_headers = vec![("X-Ticket".to_string(), String::new())];
+
+        let saved = Draft::from_account(&account).to_account();
+        assert_eq!(saved.custom_headers.len(), 1);
+        assert_eq!(saved.custom_headers[0].0, "X-Ticket");
+        assert_eq!(saved.custom_headers[0].1, "");
     }
 
     #[tokio::test]

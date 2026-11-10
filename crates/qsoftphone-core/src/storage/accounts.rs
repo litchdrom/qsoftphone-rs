@@ -27,7 +27,8 @@ impl<'a> AccountStore<'a> {
             let mut stmt = conn.prepare(
                 "SELECT id, label, registrar, user, password, transport, domain,
                         outbound_proxy, caller_id_header, dialed_number_header,
-                        capture_headers, crm_preset_id, ringtone_file, created_at, updated_at
+                        capture_headers, custom_headers, crm_preset_id, ringtone_file,
+                        created_at, updated_at
                  FROM accounts
                  ORDER BY label COLLATE NOCASE, id",
             )?;
@@ -46,7 +47,8 @@ impl<'a> AccountStore<'a> {
             let mut stmt = conn.prepare(
                 "SELECT id, label, registrar, user, password, transport, domain,
                         outbound_proxy, caller_id_header, dialed_number_header,
-                        capture_headers, crm_preset_id, ringtone_file, created_at, updated_at
+                        capture_headers, custom_headers, crm_preset_id, ringtone_file,
+                        created_at, updated_at
                  FROM accounts WHERE id = ?1",
             )?;
             let mut rows = stmt.query(params![id])?;
@@ -72,14 +74,16 @@ impl<'a> AccountStore<'a> {
         account.updated_at = now_ms();
 
         let capture = serde_json::to_string(&account.capture_headers)?;
+        let custom = serde_json::to_string(&account.custom_headers)?;
 
         self.db.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO accounts
                     (id, label, registrar, user, password, transport, domain,
                      outbound_proxy, caller_id_header, dialed_number_header,
-                     capture_headers, crm_preset_id, ringtone_file, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                     capture_headers, custom_headers, crm_preset_id, ringtone_file,
+                     created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                  ON CONFLICT(id) DO UPDATE SET
                     label                = excluded.label,
                     registrar            = excluded.registrar,
@@ -91,6 +95,7 @@ impl<'a> AccountStore<'a> {
                     caller_id_header     = excluded.caller_id_header,
                     dialed_number_header = excluded.dialed_number_header,
                     capture_headers      = excluded.capture_headers,
+                    custom_headers       = excluded.custom_headers,
                     crm_preset_id        = excluded.crm_preset_id,
                     ringtone_file        = excluded.ringtone_file,
                     updated_at           = excluded.updated_at",
@@ -106,6 +111,7 @@ impl<'a> AccountStore<'a> {
                     account.caller_id_header,
                     account.dialed_number_header,
                     capture,
+                    custom,
                     account.crm_preset_id,
                     account.ringtone_file,
                     account.created_at,
@@ -149,6 +155,22 @@ fn row_to_account(row: &Row<'_>) -> rusqlite::Result<Account> {
             Vec::new()
         }
     };
+    // The custom headers are a list of pairs. A column that cannot be
+    // read is an account whose headers are lost, not an account that
+    // cannot be loaded — so the malformed value is a warning and the
+    // account still comes back.
+    let custom: String = row.get(11)?;
+    let custom_headers = match serde_json::from_str::<Vec<(String, String)>>(&custom) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                account_id = %id,
+                error = %e,
+                "account has malformed custom_headers; treating as empty"
+            );
+            Vec::new()
+        }
+    };
     Ok(Account {
         id,
         label: row.get(1)?,
@@ -161,10 +183,11 @@ fn row_to_account(row: &Row<'_>) -> rusqlite::Result<Account> {
         caller_id_header: row.get(8)?,
         dialed_number_header: row.get(9)?,
         capture_headers,
-        crm_preset_id: row.get(11)?,
-        ringtone_file: row.get(12)?,
-        created_at: row.get(13)?,
-        updated_at: row.get(14)?,
+        custom_headers,
+        crm_preset_id: row.get(12)?,
+        ringtone_file: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
     })
 }
 
@@ -251,6 +274,41 @@ mod tests {
         let fetched = store.get(&account.id).unwrap().unwrap();
         assert_eq!(fetched.capture_headers, vec!["X-Ticket", "X-Region"]);
         assert_eq!(fetched.caller_id_header, "X-Caller-Name");
+    }
+
+    #[test]
+    fn the_custom_headers_survive_a_round_trip() {
+        let db = Db::open_in_memory().unwrap();
+        let store = AccountStore::new(&db);
+
+        let mut account = Account::new("Office", "example.com", "104", "", "udp");
+        account.custom_headers = vec![
+            ("X-var1".to_string(), "one".to_string()),
+            ("X-var2".to_string(), "$called".to_string()),
+        ];
+        store.upsert(&account).unwrap();
+
+        let fetched = store.get(&account.id).unwrap().unwrap();
+        assert_eq!(fetched.custom_headers.len(), 2);
+        assert_eq!(fetched.custom_headers[0].0, "X-var1");
+        assert_eq!(fetched.custom_headers[0].1, "one");
+        assert_eq!(fetched.custom_headers[1].0, "X-var2");
+        assert_eq!(
+            fetched.custom_headers[1].1, "$called",
+            "the template is stored as it was typed — it is resolved per call"
+        );
+    }
+
+    #[test]
+    fn an_account_with_no_custom_headers_has_none() {
+        let db = Db::open_in_memory().unwrap();
+        let store = AccountStore::new(&db);
+
+        let account = Account::new("Office", "example.com", "104", "", "udp");
+        store.upsert(&account).unwrap();
+
+        let fetched = store.get(&account.id).unwrap().unwrap();
+        assert!(fetched.custom_headers.is_empty());
     }
 
     #[test]

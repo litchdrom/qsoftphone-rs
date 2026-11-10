@@ -125,7 +125,7 @@ qsoftphone-rs/
     │   ├── logging.rs             tracing -> rotating file + stderr
     │   ├── model/                 account, call event, history record
     │   ├── paths.rs               per-OS config / data / log dirs
-    │   ├── sip/                   pure SIP functions (uri, identity, refer)
+    │   ├── sip/                   pure SIP functions (uri, identity, refer, headers)
     │   └── storage/               SQLite: accounts, contacts, history
     ├── qsoftphone-media/          the media plane: RTP, G.711, G.722, the sound card
     │   ├── audio.rs               the microphone, the speaker, the resampling
@@ -4065,6 +4065,108 @@ a rule the RFCs already imply.
 
 ---
 
+## M6.6 — The headers an account puts on its own calls
+
+*"Dynamic headers per accounts. Like X-var1= X-var2= …"*
+
+### What there is now
+
+Every account has its own list of extra headers, and they go out on the
+calls that account makes:
+
+| | |
+|---|---|
+| Where they are edited | the account page, under **CUSTOM HEADERS** |
+| Where they go | the **INVITE** of every call that account places |
+| What they may be | any header name that is a token (RFC 3261 §20) |
+| What the value may be | text, or a variable (§ below) |
+
+The list is the account's own and the order is the user's: `X-var1` first
+is `X-var1` first on the wire.
+
+They are edited **with the account**, not on a page of their own. They
+are per-account policy, and a policy that lives on another page is a
+policy nobody edits — the same reason the account's own ringtone lives
+there too (M6.2).
+
+### The value may be a variable
+
+The second half of the request — *"nice to have possibility to use some
+app variable as values like $callerid $called"* — is the value being a
+**template**:
+
+| Variable | What it is |
+|---|---|
+| `$callerid` | the name the call goes out under: the display name on our `From`, and the account's user part when there is no display name |
+| `$called` | the number that was dialled — what the user typed, before it became a URI |
+| `$user` | the account's SIP user part |
+| `$account` | the account's label — "Office", "Home" |
+
+So an account can say `X-Dialed-Number: $called` and every call carries
+the number it was actually made to.
+
+The template is resolved **when the call goes out**, not when the
+account is saved: the same account dials different numbers, and a header
+that has to be the same every time is not worth having.
+
+Two rules make this safe:
+
+* **A variable that is not one of ours stays as it was.** `$nosuchthing`
+  is left exactly as it is typed, and a value that happens to contain a
+  dollar sign — `cost: $100` — does not lose it. A value that silently
+  became empty is worse than one that is wrong in the open.
+* **A `$` that is not followed by a name is a literal `$`.**
+
+### A header with a broken name does not go out
+
+A header name is a **token** (RFC 3261 §20): printable ASCII without
+the separators. `X var1` — with a space — is not a header name at all:
+it would split the message in two, and a peer that parses the request
+strictly will refuse the whole thing.
+
+So:
+
+* the account page **says so** while the account is open —
+  *"X var1 is not a header name — it will not go out."* — and
+* the SIP layer **drops it** on the way out.
+
+The rest of the list still goes out. One broken header is worth less
+than the call, and a call with no headers at all is a call that cannot
+break in this way.
+
+### Where the headers go, and where they do not
+
+They go on the **INVITE** and nowhere else. A header that only means
+something on a call is not something the registration should carry, and
+the REGISTER goes out exactly as it did before.
+
+An account with **no** headers sends a request with **no** headers — the
+header list is `None` rather than an empty list, so the request is
+byte-for-byte what it was before the account had any.
+
+### The dependency cost: nothing
+
+No new package: a column in the accounts table (a list of name/value
+pairs, stored as JSON — the way the capture allowlist already is), a
+pure function in the core for the templates, and the `InviteOption`'s
+own `headers` field, which rsipstack has always had.
+
+### What is *not* in M6.6
+
+* **The headers do not go on the REGISTER.** A PBX that wants something
+  at sign-in is a different ask; the list here is about calls.
+* **The headers are not on the re-INVITE, the BYE or the DTMF.** They
+  are the account's own header on the request that starts the call.
+* **A header name is not checked against the headers the stack owns.**
+  A user who names a header `Contact` gets a second `Contact` on the
+  request; the stack's own header is not replaced. The list is for the
+  headers the SIP headers do not carry.
+* **There is no per-contact header.** The list belongs to the account,
+  not to the number that is called — a header that changed with the
+  number would be a different feature.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -4116,6 +4218,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.3** | The consultation that dies: the transfer popup following the consultation, a dead consultation offering no transfer, a failed transfer putting the original call back on the line, and the `Replaces` header the server reads | **done** |
 | **M6.4** | The file the user picks: a native **Browse…** dialog for the ringtone, on the settings page and on the account editor, with the WAV filter, the **Reset** button, and a file that is checked before it is accepted | **done** |
 | **M6.5** | The transfer completed while the target is ringing: **Complete transfer** is live as soon as the target rings, the server finishes the transfer, and a consultation that dies after the REFER is the server's business rather than the user calling it off | **done** |
+| **M6.6** | The headers an account puts on its own calls: a per-account list of `X-var1=…` that goes on the INVITE, with `$callerid` / `$called` / `$user` / `$account` as the values | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -4179,7 +4282,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 429 tests, all passing.
+* `cargo test --workspace` — 452 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -4294,6 +4397,22 @@ player lands.
 * **The button is not live before the target rings.** The popup says
   *"The transfer can be completed once the target rings"*, and the button
   is greyed out until then.
+* **A call goes out with its account's own headers.** The loopback peer
+  reads the INVITE off the wire: `X-var1` is there with its value, and
+  the value that was a **template** has been resolved against the call —
+  `$called` is the number that was dialled and `$callerid` is the
+  account's user part.
+* **A header with a broken name does not go out.** A name with a space
+  in it is not a header name (RFC 3261 §20) — it would split the message
+  in two — so it is dropped on the way out and the good header next to
+  it still goes.
+* **An account with no headers sends none.** The request is the one it
+  was before the account had any.
+* **The account page says when a header name is not one.** The user is
+  told while the account is open, not when the next call goes out.
+* **The headers survive a database round trip**, and an account in a
+  database from before the feature still opens — with no headers, and
+  with its ringtone and everything else intact.
 * **An incoming call rings.** The event starts the ringtone, and the test
   checks that the player is playing.
 * **A call we made rings back — but only when there is nothing to hear.**
@@ -4685,6 +4804,12 @@ player lands.
 
 **Not verified:**
 
+* **The custom headers have not been seen on a real PBX.** The headers
+  are proved on the wire against the peer in this repository — the
+  INVITE carries them, the templates are resolved against the call, and
+  a broken name is dropped. What has not been tried is the user's own
+  Asterisk reading a header it was configured to read, which is the
+  only thing that proves the *names* are the ones the PBX expects.
 * **No third-party softphone has been called.** The calls in the test
   suite were made against the hand-written peer in this repository; the
   Asterisk run above ended in a `404`. The SIP messages on the wire are

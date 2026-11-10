@@ -43,6 +43,20 @@ pub struct Account {
     pub dialed_number_header: String,
     /// Allowlist of extra headers that may leave the core.
     pub capture_headers: Vec<String>,
+    /// The extra headers this account puts on its **outgoing** calls.
+    ///
+    /// A PBX often wants something on the INVITE that the SIP headers
+    /// do not carry — a ticket number, a CRM id, the queue the call is
+    /// for. Every account has its own list: `X-var1=…`, `X-var2=…`.
+    ///
+    /// The value may be a **template**: `$callerid`, `$called`, `$user`
+    /// and `$account` are replaced with what the call has at the
+    /// moment it goes out.
+    ///
+    /// A header whose name is not a legal header name (RFC 3261 §20) is
+    /// dropped on the way out — a message with a broken header in it is
+    /// a message the peer may refuse.
+    pub custom_headers: Vec<(String, String)>,
     /// Which CRM plugin handles this account. Empty = local contacts.
     pub crm_preset_id: String,
     /// The WAV file this account rings with.

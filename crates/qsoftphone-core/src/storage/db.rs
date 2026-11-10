@@ -66,6 +66,7 @@ impl Db {
                     caller_id_header     TEXT    NOT NULL DEFAULT '',
                     dialed_number_header TEXT    NOT NULL DEFAULT '',
                     capture_headers      TEXT    NOT NULL DEFAULT '[]',
+                    custom_headers       TEXT    NOT NULL DEFAULT '[]',
                     crm_preset_id        TEXT    NOT NULL DEFAULT '',
                     ringtone_file        TEXT    NOT NULL DEFAULT '',
                     created_at           INTEGER NOT NULL DEFAULT 0,
@@ -126,6 +127,10 @@ impl Db {
             // The default matters: the rows that are already there get
             // an empty ringtone, not a null one.
             ("accounts", "ringtone_file", "TEXT NOT NULL DEFAULT ''"),
+            // The extra headers an account puts on its outgoing calls.
+            // A list of name/value pairs, stored as JSON — the same way
+            // the capture allowlist is.
+            ("accounts", "custom_headers", "TEXT NOT NULL DEFAULT '[]'"),
         ];
         self.with_conn(|conn| {
             for (table, column, ty) in additions {
@@ -305,6 +310,62 @@ mod tests {
         assert!(has_column, "ringtone_file should have been added");
         assert_eq!(label, "Office", "the old account must survive");
         assert_eq!(ringtone, "", "the new column starts empty");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_older_accounts_table_gains_the_custom_headers_column() {
+        // The extra headers an account puts on its calls are a column
+        // added after the first release: an older database has to be
+        // brought up to it, and the account that is already in it has to
+        // survive with no headers rather than with none at all.
+        let dir = std::env::temp_dir().join(format!("qsoftphone-mig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accounts.sqlite");
+
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE accounts (
+                    id                   TEXT    PRIMARY KEY,
+                    label                TEXT    NOT NULL DEFAULT '',
+                    registrar            TEXT    NOT NULL DEFAULT '',
+                    user                 TEXT    NOT NULL DEFAULT '',
+                    password             TEXT    NOT NULL DEFAULT '',
+                    transport            TEXT    NOT NULL DEFAULT 'udp',
+                    domain               TEXT    NOT NULL DEFAULT '',
+                    outbound_proxy       TEXT    NOT NULL DEFAULT '',
+                    caller_id_header     TEXT    NOT NULL DEFAULT '',
+                    dialed_number_header TEXT    NOT NULL DEFAULT '',
+                    capture_headers      TEXT    NOT NULL DEFAULT '[]',
+                    crm_preset_id        TEXT    NOT NULL DEFAULT '',
+                    created_at           INTEGER NOT NULL DEFAULT 0,
+                    updated_at           INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO accounts (id, label, user) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["old-account", "Office", "104"],
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let headers: String = db
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare("SELECT custom_headers FROM accounts")?;
+                let mut rows = stmt.query([])?;
+                let row = rows.next()?.expect("the old account is still there");
+                Ok(row.get(0)?)
+            })
+            .unwrap();
+
+        assert_eq!(
+            headers, "[]",
+            "the new column starts empty, so the account has no headers"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

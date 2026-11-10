@@ -1030,6 +1030,239 @@ async fn an_outgoing_call_connects_and_hangs_up() {
     );
 }
 
+/// The account's own headers go out on the call.
+///
+/// A PBX often wants something on the INVITE that the SIP headers do
+/// not carry — a ticket number, a CRM id, the queue. Every account has
+/// its own list of them, and they go on the calls that account makes.
+#[tokio::test]
+async fn the_call_goes_out_with_the_accounts_own_headers() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+            transfer: None,
+            public_address: None,
+            bye_status: None,
+            early_media: false,
+            cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-custom-headers".to_string();
+    // The account's own headers. The second value is a **template**:
+    // it is resolved when the call goes out, not when it is saved.
+    account.custom_headers = vec![
+        ("X-var1".to_string(), "one".to_string()),
+        ("X-var2".to_string(), "$called".to_string()),
+        ("X-var3".to_string(), "for $callerid".to_string()),
+    ];
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut seen = Vec::new();
+    stack
+        .calls
+        .place_call(&account.id, "100")
+        .expect("the call was placed");
+    let answered = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallAnswered,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(answered.is_some(), "the call was never answered");
+
+    // The peer saw the INVITE, and the headers are on it.
+    let invite = {
+        let observations = observations.lock().expect("observations lock");
+        observations
+            .raw
+            .iter()
+            .find(|message| message.starts_with("INVITE"))
+            .cloned()
+            .expect("the peer never saw the INVITE")
+    };
+
+    assert_eq!(
+        header_value(&invite, "X-var1").as_deref(),
+        Some("one"),
+        "the account's header is not on the INVITE:\n{invite}"
+    );
+    assert_eq!(
+        header_value(&invite, "X-var2").as_deref(),
+        Some("100"),
+        "the template was not resolved against the call:\n{invite}"
+    );
+    assert_eq!(
+        header_value(&invite, "X-var3").as_deref(),
+        Some("for 104"),
+        "the template was not resolved inside the value:\n{invite}"
+    );
+}
+
+/// A header whose name is not a header name does not go out.
+///
+/// A name with a space in it would split the message in two, and a peer
+/// that parses it strictly will refuse the whole request. One broken
+/// header is worth less than the call.
+#[tokio::test]
+async fn a_header_with_a_broken_name_does_not_go_out() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+            transfer: None,
+            public_address: None,
+            bye_status: None,
+            early_media: false,
+            cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-broken-header".to_string();
+    account.custom_headers = vec![
+        ("X good".to_string(), "one".to_string()),
+        ("X-fine".to_string(), "two".to_string()),
+    ];
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut seen = Vec::new();
+    stack
+        .calls
+        .place_call(&account.id, "100")
+        .expect("the call was placed");
+    let answered = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallAnswered,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(answered.is_some(), "the call was never answered");
+
+    let invite = {
+        let observations = observations.lock().expect("observations lock");
+        observations
+            .raw
+            .iter()
+            .find(|message| message.starts_with("INVITE"))
+            .cloned()
+            .expect("the peer never saw the INVITE")
+    };
+
+    assert!(
+        header_value(&invite, "X good").is_none(),
+        "a header with a space in its name went out:\n{invite}"
+    );
+    assert_eq!(
+        header_value(&invite, "X-fine").as_deref(),
+        Some("two"),
+        "the good header was dropped with the bad one:\n{invite}"
+    );
+}
+
+/// An account with no headers sends a request that has none.
+///
+/// The headers are only there when the account has some: a request that
+/// goes out exactly as it did before is a request that cannot break.
+#[tokio::test]
+async fn an_account_with_no_headers_sends_none() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+            transfer: None,
+            public_address: None,
+            bye_status: None,
+            early_media: false,
+            cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-no-headers".to_string();
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut seen = Vec::new();
+    stack
+        .calls
+        .place_call(&account.id, "100")
+        .expect("the call was placed");
+    let answered = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallAnswered,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(answered.is_some(), "the call was never answered");
+
+    let invite = {
+        let observations = observations.lock().expect("observations lock");
+        observations
+            .raw
+            .iter()
+            .find(|message| message.starts_with("INVITE"))
+            .cloned()
+            .expect("the peer never saw the INVITE")
+    };
+
+    // The stack's own headers are there; none of the account's are.
+    assert!(
+        !invite.to_lowercase().contains("x-var"),
+        "the account has no headers, so none went out:\n{invite}"
+    );
+    assert!(
+        invite.contains("User-Agent:"),
+        "the request is a normal SIP request:\n{invite}"
+    );
+}
+
 #[tokio::test]
 async fn an_incoming_call_rings_before_the_user_answers() {
     init_tracing();
