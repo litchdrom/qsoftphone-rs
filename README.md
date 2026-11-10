@@ -110,6 +110,13 @@ profile:
 $env:QSOFTPHONE_HOME = "C:\tmp\qsoftphone"
 ```
 
+**The dev build keeps no incremental cache.** `[profile.dev] incremental =
+false` in the workspace `Cargo.toml`: the cache for this tree grows to
+several gigabytes — egui, the font stack and the Windows bindings are
+recompiled over and over, and every one of them leaves a cache behind.
+A clean rebuild of this workspace takes about twenty seconds, and the
+disk is worth more than the seconds it saves.
+
 ---
 
 ## Layout

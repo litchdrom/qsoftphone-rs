@@ -69,3 +69,9 @@ egui = "0.37"
 [profile.dev]
 opt-level = 0
 debug = 1
+# The incremental cache for this workspace grows to several gigabytes:
+# egui, the font stack and the Windows bindings are recompiled over and
+# over, and every one of them leaves a cache behind. The disk is worth
+# more here than the seconds it saves — a clean rebuild of this
+# workspace takes about twenty seconds.
+incremental = false
