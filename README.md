@@ -4233,6 +4233,11 @@ They are on the server **that account is registered with** — the same
 domain, or the same registrar's host — because the same number on
 another server is a different person.
 
+The list is typed, and there is a **Use my contacts** button next to it:
+the contacts are the people the user calls, so they are the obvious
+list of extensions to watch, and a list that is typed out by hand is a
+list that goes stale.
+
 An account watches nothing until it is told to, and it sends no
 subscription at all until it is **registered**: a subscription needs an
 endpoint to go out on, and there is no endpoint until the account is
@@ -4443,7 +4448,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 477 tests, all passing.
+* `cargo test --workspace` — 478 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -4591,7 +4596,8 @@ player lands.
   document replaces everything that is known; a `partial` one changes
   one dialog and leaves the others — which is what RFC 3903 says.
 * **The lamps are in the left panel, below the accounts**, and the
-  account page takes the list of extensions to watch.
+  account page takes the list of extensions to watch — typed, or taken
+  from the contacts with one button.
 * **An incoming call rings.** The event starts the ringtone, and the test
   checks that the player is playing.
 * **A call we made rings back — but only when there is nothing to hear.**

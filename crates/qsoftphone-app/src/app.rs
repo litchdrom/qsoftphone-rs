@@ -3524,7 +3524,23 @@ impl QSoftphoneApp {
             "The lamps in the left panel say whether these extensions are free, busy or \
              ringing. They are on the same server as this account.",
         );
-        ui.text_edit_singleline(&mut self.edit_account.blf_extensions);
+        ui.horizontal(|ui| {
+            ui.text_edit_singleline(&mut self.edit_account.blf_extensions);
+            // The contacts are the people the user calls, so they are
+            // the obvious list of extensions to watch — and a list that
+            // is typed out by hand is a list that goes stale.
+            if ui.button("Use my contacts").clicked() {
+                let contacts = qsoftphone_core::storage::Contacts::new(&self.db)
+                    .list()
+                    .unwrap_or_default();
+                let extensions: Vec<String> = contacts
+                    .iter()
+                    .map(|contact| contact.phone.trim().to_string())
+                    .filter(|phone| !phone.is_empty())
+                    .collect();
+                self.edit_account.blf_extensions = extensions.join(", ");
+            }
+        });
 
         ui.horizontal(|ui| {
             if ui.button("Save").clicked() {
@@ -4984,6 +5000,35 @@ mod tests {
 
         // A duplicate is one extension watched once.
         assert_eq!(Draft::split_extensions("105, 105"), vec!["105"]);
+    }
+
+    #[tokio::test]
+    async fn the_watched_extensions_can_be_taken_from_the_contacts() {
+        // The contacts are the people the user calls, so they are the
+        // obvious list of extensions to watch — and a list that is
+        // typed out by hand is a list that goes stale.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        let contact = qsoftphone_core::storage::Contact {
+            phone: "105".to_string(),
+            display_name: "Bob".to_string(),
+            ..Default::default()
+        };
+        qsoftphone_core::storage::Contacts::new(&app.db)
+            .upsert(&contact)
+            .expect("the contact was saved");
+
+        app.view = View::Account;
+        let output = frame(&mut app, &ctx);
+        let button = button_at(&output, "Use my contacts").expect("there is no button");
+        click_at(&mut app, &ctx, button);
+
+        assert_eq!(
+            app.edit_account.blf_extensions, "105",
+            "the contacts did not fill the list"
+        );
     }
 
     #[tokio::test]
