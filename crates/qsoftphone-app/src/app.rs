@@ -14,7 +14,7 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use eframe::egui;
 use qsoftphone_core::config::AppConfig;
-use qsoftphone_core::model::account::{Account, now_ms};
+use qsoftphone_core::model::account::{Account, BlfEntry, now_ms};
 use qsoftphone_core::model::call_event::{CallEventType, Direction};
 use qsoftphone_core::model::history::{
     CallRecord, CallResult, Direction as HistoryDirection, LocalTime, classify_result,
@@ -425,9 +425,8 @@ struct Draft {
     custom_headers: Vec<(String, String)>,
     /// The extensions whose Busy Lamp Field this account watches.
     ///
-    /// A comma-separated list of extension numbers, the way a user
-    /// writes them: `105, 106, 107`.
-    blf_extensions: String,
+    /// A pair: the extension to watch, and the number to dial for it.
+    blf_extensions: Vec<BlfEntry>,
 }
 
 impl Draft {
@@ -449,7 +448,7 @@ impl Draft {
         account.dialed_number_header = self.dialed_number_header.trim().to_string();
         account.ringtone_file = self.ringtone_file.trim().to_string();
         account.custom_headers = Self::clean_headers(&self.custom_headers);
-        account.blf_extensions = Self::split_extensions(&self.blf_extensions);
+        account.blf_extensions = Self::clean_entries(&self.blf_extensions);
         account
     }
 
@@ -467,27 +466,26 @@ impl Draft {
             dialed_number_header: account.dialed_number_header.clone(),
             ringtone_file: account.ringtone_file.clone(),
             custom_headers: account.custom_headers.clone(),
-            blf_extensions: account.blf_extensions.join(", "),
+            blf_extensions: account.blf_extensions.clone(),
         }
     }
 
-    /// The extensions out of a comma-separated list.
+    /// The watched extensions that are worth keeping.
     ///
-    /// A list a user typed may have spaces, empty entries and a trailing
-    /// comma. None of them is an extension, and a duplicate is one
-    /// extension watched once.
-    fn split_extensions(text: &str) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for part in text.split(',') {
-            let extension = part.trim();
-            if extension.is_empty() {
-                continue;
-            }
-            if !out.iter().any(|seen| seen == extension) {
-                out.push(extension.to_string());
-            }
-        }
-        out
+    /// A row with no extension is not a watch — the user typed a dial
+    /// number and left the extension blank, or cleared it — so it is
+    /// dropped when the account is saved. A row with an extension and
+    /// no dial number is the ordinary case: the lamp is dialled as the
+    /// extension itself.
+    fn clean_entries(entries: &[BlfEntry]) -> Vec<BlfEntry> {
+        entries
+            .iter()
+            .map(|entry| BlfEntry {
+                watch: entry.watch.trim().to_string(),
+                dial: entry.dial.trim().to_string(),
+            })
+            .filter(|entry| !entry.watch.is_empty())
+            .collect()
     }
 
     /// The headers that are worth keeping.
@@ -626,7 +624,7 @@ impl QSoftphoneApp {
         let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() else {
             return;
         };
-        let wanted = account.blf_extensions.clone();
+        let wanted: Vec<BlfEntry> = account.blf_extensions.clone();
         let current: Vec<String> = self
             .blf
             .lamps(account_id)
@@ -635,17 +633,17 @@ impl QSoftphoneApp {
             .collect();
 
         for extension in current.iter() {
-            if !wanted.contains(extension) {
+            if !wanted.iter().any(|entry| entry.watch.trim() == *extension) {
                 self.blf.unwatch(account_id, extension);
             }
         }
-        for extension in wanted.iter() {
-            if current.contains(extension) {
+        for entry in wanted.iter() {
+            let watch = entry.watch.trim();
+            if watch.is_empty() || current.iter().any(|seen| seen == watch) {
                 continue;
             }
-            let aor = qsoftphone_sip::call::aor_for(extension, &account);
-            if let Err(e) = self.blf.watch(account_id, extension, &aor) {
-                self.status = format!("Could not watch extension {extension}: {e}");
+            if let Err(e) = self.blf.watch(account_id, entry) {
+                self.status = format!("Could not watch extension {watch}: {e}");
             }
         }
     }
@@ -3522,25 +3520,46 @@ impl QSoftphoneApp {
         );
         ui.weak(
             "The lamps in the left panel say whether these extensions are free, busy or \
-             ringing. They are on the same server as this account.",
+             ringing. Pressing a lamp dials the number in the second column — leave it \
+             empty to dial the extension itself.",
         );
-        ui.horizontal(|ui| {
-            ui.text_edit_singleline(&mut self.edit_account.blf_extensions);
-            // The contacts are the people the user calls, so they are
-            // the obvious list of extensions to watch — and a list that
-            // is typed out by hand is a list that goes stale.
-            if ui.button("Use my contacts").clicked() {
-                let contacts = qsoftphone_core::storage::Contacts::new(&self.db)
-                    .list()
-                    .unwrap_or_default();
-                let extensions: Vec<String> = contacts
-                    .iter()
-                    .map(|contact| contact.phone.trim().to_string())
-                    .filter(|phone| !phone.is_empty())
-                    .collect();
-                self.edit_account.blf_extensions = extensions.join(", ");
-            }
-        });
+
+        let draft = &mut self.edit_account;
+        // The row to take out, applied after the loop: the list is
+        // borrowed while it is being drawn.
+        let mut remove: Option<usize> = None;
+        if !draft.blf_extensions.is_empty() {
+            ui.horizontal(|ui| {
+                ui.weak("Watch");
+                ui.add_space(50.0);
+                ui.weak("Dial");
+            });
+        }
+        for (index, entry) in draft.blf_extensions.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut entry.watch)
+                        .id_source(("blf_watch", index))
+                        .desired_width(110.0)
+                        .hint_text("101"),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut entry.dial)
+                        .id_source(("blf_dial", index))
+                        .desired_width(150.0)
+                        .hint_text("same as the extension"),
+                );
+                if ui.button("Remove").clicked() {
+                    remove = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove {
+            draft.blf_extensions.remove(index);
+        }
+        if ui.button("+ Add an extension").clicked() {
+            draft.blf_extensions.push(BlfEntry::default());
+        }
 
         ui.horizontal(|ui| {
             if ui.button("Save").clicked() {
@@ -3608,35 +3627,49 @@ impl QSoftphoneApp {
     /// while nothing is happening. A lamp that has never been told
     /// anything is grey — a lamp that says "free" when the truth is
     /// "we do not know" is a lamp that lies.
+    ///
+    /// The rows are the account's **watched extensions**, not the live
+    /// subscriptions: an extension whose subscription has not been
+    /// established is still on the list, and it is still a speed dial.
+    /// That is what the list is for — a lamp is a light on a speed
+    /// dial.
     fn draw_blf_panel(&mut self, ui: &mut egui::Ui) {
         let Some(account) = self.selected_account().cloned() else {
             return;
         };
-
-        let lamps = self.blf.lamps(&account.id);
-        let watched = account.blf_extensions.len();
+        let entries = account.blf_extensions.clone();
+        let account_id = account.id.clone();
 
         ui.separator();
         ui.label(egui::RichText::new("EXTENSIONS").strong().size(11.0));
 
-        if lamps.is_empty() {
-            if watched == 0 {
-                ui.weak("No extensions are being watched.");
-            } else {
-                ui.weak("Starting…");
-            }
+        if entries.is_empty() {
+            ui.weak("No extensions are being watched.");
             return;
         }
 
-        for lamp in lamps {
+        for entry in entries {
+            let watch = entry.watch.trim().to_string();
+            let dial = entry.dial_target().to_string();
+            let state = self.blf.state_of(&account_id, &watch);
             ui.horizontal(|ui| {
-                let (r, g, b) = lamp.state.colour();
+                let (r, g, b) = state.colour();
                 let colour = egui::Color32::from_rgb(r, g, b);
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                 ui.painter().circle_filled(rect.center(), 5.0, colour);
-                ui.label(&lamp.extension);
-                ui.weak(lamp.state.label());
+                // The extension is the button: pressing it dials the
+                // number the account has for it — which is often not
+                // the extension itself.
+                if ui.selectable_label(false, &watch).clicked() {
+                    self.place_call_to(&dial);
+                }
+                if dial != watch {
+                    // The number that is actually dialled, when it is
+                    // not the extension.
+                    ui.weak(&dial);
+                }
+                ui.weak(state.label());
             });
         }
     }
@@ -4932,9 +4965,13 @@ mod tests {
         );
         sessions.insert("acct-ui-1", session);
 
-        app.blf
-            .watch("acct-ui-1", "105", "sip:105@sip.example.com")
-            .expect("the extension was not watched");
+        // The account watches an extension, and the number to dial for
+        // it is **not** the extension.
+        app.accounts[0].blf_extensions = vec![BlfEntry {
+            watch: "105".to_string(),
+            dial: "00105".to_string(),
+        }];
+        app.load_selected();
 
         let output = frame(&mut app, &ctx);
         let text = screen_text(&output);
@@ -4947,8 +4984,39 @@ mod tests {
             "the lamp is not in the panel:\n{text}"
         );
         assert!(
+            text.contains("00105"),
+            "the panel does not say what the lamp dials:\n{text}"
+        );
+        assert!(
             text.contains("unknown"),
             "the lamp does not say what it knows:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_extension_with_no_subscription_is_still_a_speed_dial() {
+        // The list is the account's **watched extensions**, not the
+        // live subscriptions: an extension whose subscription has not
+        // been established is still on the list, and it is still a
+        // speed dial. That is what a lamp on a speed dial is.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.accounts[0].blf_extensions = vec![BlfEntry {
+            watch: "105".to_string(),
+            dial: "00105".to_string(),
+        }];
+        app.load_selected();
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("105"),
+            "the extension is not on the list:\n{text}"
+        );
+        assert!(
+            text.contains("00105"),
+            "the list does not say what it dials:\n{text}"
         );
     }
 
@@ -4970,7 +5038,16 @@ mod tests {
         let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
         let ctx = egui::Context::default();
 
-        app.accounts[0].blf_extensions = vec!["105".to_string(), "106".to_string()];
+        app.accounts[0].blf_extensions = vec![
+            BlfEntry {
+                watch: "101".to_string(),
+                dial: "00101".to_string(),
+            },
+            BlfEntry {
+                watch: "102".to_string(),
+                dial: String::new(),
+            },
+        ];
         app.load_selected();
         app.view = View::Account;
 
@@ -4981,54 +5058,49 @@ mod tests {
             "the account page has no field for the watched extensions:\n{text}"
         );
         assert!(
-            text.contains("105, 106"),
-            "the watched extensions are not shown as they were set:\n{text}"
+            text.contains("101"),
+            "the watched extension is not shown as it was set:\n{text}"
+        );
+        assert!(
+            text.contains("00101"),
+            "the number to dial is not shown:\n{text}"
         );
     }
 
     #[test]
-    fn the_watched_extensions_are_read_out_of_a_list() {
-        // A list a user typed may have spaces, empty entries and a
-        // trailing comma. None of them is an extension.
-        assert_eq!(
-            Draft::split_extensions("105, 106, 107"),
-            vec!["105", "106", "107"]
-        );
-        assert_eq!(Draft::split_extensions(" 105 , 106 ,"), vec!["105", "106"]);
-        assert!(Draft::split_extensions("").is_empty());
-        assert!(Draft::split_extensions(" , , ").is_empty());
+    fn a_watched_extension_without_a_dial_number_dials_itself() {
+        // The ordinary case: the lamp is dialled as the extension.
+        let entry = BlfEntry {
+            watch: "101".to_string(),
+            dial: String::new(),
+        };
+        assert_eq!(entry.dial_target(), "101");
 
-        // A duplicate is one extension watched once.
-        assert_eq!(Draft::split_extensions("105, 105"), vec!["105"]);
+        // And the case it exists for: the extension is watched, and
+        // something else is dialled for it.
+        let entry = BlfEntry {
+            watch: "101".to_string(),
+            dial: "00101".to_string(),
+        };
+        assert_eq!(entry.dial_target(), "00101");
     }
 
-    #[tokio::test]
-    async fn the_watched_extensions_can_be_taken_from_the_contacts() {
-        // The contacts are the people the user calls, so they are the
-        // obvious list of extensions to watch — and a list that is
-        // typed out by hand is a list that goes stale.
-        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-
-        let contact = qsoftphone_core::storage::Contact {
-            phone: "105".to_string(),
-            display_name: "Bob".to_string(),
-            ..Default::default()
-        };
-        qsoftphone_core::storage::Contacts::new(&app.db)
-            .upsert(&contact)
-            .expect("the contact was saved");
-
-        app.view = View::Account;
-        let output = frame(&mut app, &ctx);
-        let button = button_at(&output, "Use my contacts").expect("there is no button");
-        click_at(&mut app, &ctx, button);
-
-        assert_eq!(
-            app.edit_account.blf_extensions, "105",
-            "the contacts did not fill the list"
-        );
+    #[test]
+    fn a_watched_extension_with_no_extension_is_dropped() {
+        // A row with no extension is not a watch.
+        let entries = vec![
+            BlfEntry {
+                watch: String::new(),
+                dial: "00101".to_string(),
+            },
+            BlfEntry {
+                watch: "102".to_string(),
+                dial: String::new(),
+            },
+        ];
+        let cleaned = Draft::clean_entries(&entries);
+        assert_eq!(cleaned.len(), 1);
+        assert_eq!(cleaned[0].watch, "102");
     }
 
     #[tokio::test]

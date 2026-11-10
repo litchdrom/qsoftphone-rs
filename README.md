@@ -4209,9 +4209,9 @@ ACCOUNTS
   Home        registered
 ─────────────
 EXTENSIONS
-  ● 105   busy
-  ● 106   free
-  ● 107   ringing
+  ● 105  00105   busy
+  ● 106           free
+  ● 107           ringing
 ```
 
 The lamp is a coloured dot and a word. Green is free, amber is
@@ -4223,20 +4223,46 @@ stopped listening" is a lamp that lies, and a softphone that shows a
 colleague as available when it cannot see them is worse than one that
 shows nothing.
 
+**The row is a button.** Pressing the extension dials it.
+
+The rows are the account's **watched extensions**, not its live
+subscriptions. An extension whose subscription has not been
+established is still on the list, and pressing it still dials it: a
+lamp is a light on a speed dial, and a speed dial that only works
+while the light is on is not a speed dial.
+
 ### Which extensions are watched
 
-Each account has its own list, on its own page:
+Each account has its own list, on its own page, and each row has **two**
+values:
 
-> **WATCHED EXTENSIONS** — 105, 106, 107
+> **WATCHED EXTENSIONS**
+>
+> | Watch | Dial | |
+> |---|---|---|
+> | 101 | 00101 | Remove |
+> | 105 | | Remove |
+> | 110 | 200 | Remove |
+
+* **Watch** is the extension whose lamp is subscribed to.
+* **Dial** is the number that is dialled when the lamp is pressed. It is
+  empty by default, and an empty one means "dial the extension itself".
+
+The two are separate because they are separate things. On many
+dialplans the extension `101` is not reached by dialling `101`: it is
+reached at `00101`, or through a queue at `200`, or through a feature
+code at `*300`. The lamp is about the **person**, and the button is
+about the **route** to them — so the watched extension and the dialled
+number are two fields, and either one can be left out.
 
 They are on the server **that account is registered with** — the same
 domain, or the same registrar's host — because the same number on
 another server is a different person.
 
-The list is typed, and there is a **Use my contacts** button next to it:
-the contacts are the people the user calls, so they are the obvious
-list of extensions to watch, and a list that is typed out by hand is a
-list that goes stale.
+The list is typed. There is no **Use my contacts** button: the
+contacts are not in the application yet, and a button that fills a list
+from a feature that is not there is a button that cannot do what it
+says.
 
 An account watches nothing until it is told to, and it sends no
 subscription at all until it is **registered**: a subscription needs an
@@ -4244,6 +4270,28 @@ endpoint to go out on, and there is no endpoint until the account is
 registered. The lamps follow the account — an extension that is added
 is watched, and one that is taken out is not — and they go when the
 account is unregistered.
+
+### The subscription goes to the registrar's port
+
+The `SUBSCRIBE` names the watched address of record in its
+Request-URI, and it names it **exactly as the account has the
+registrar** — port and all:
+
+```text
+SUBSCRIBE sip:105@193.178.169.164:5161 SIP/2.0
+```
+
+A registrar on `:5161` is not on `:5060`. The first version took the
+host and dropped the port, and the subscription went to a port where
+nobody was listening — which the user found against their own Asterisk.
+The Request-URI is now built by `normalise_sip_target`, the same
+function the call path uses for a dialled number, so the two cannot
+drift apart.
+
+The account's **own** address of record is a different thing and keeps
+its old shape — `sip:104@193.178.169.164`, with no port. An address of
+record is a name, not a destination; the port lives in the registrar,
+where the requests actually go.
 
 ### rsipstack has no out-of-dialog SUBSCRIBE
 
@@ -4319,7 +4367,8 @@ lamps are a list in the session.
   document turns into a lamp that says *busy*. What has **not** been
   run is the user's own Asterisk serving `dialog-info+simulimit` —
   that needs `res_pjsip_pubsub` and an ACL that lets the account watch
-  the extension.
+  the extension. The one thing the real server *did* say is that the
+  subscription was going to the wrong port, and that is fixed.
 * **The lamps are not the accounts' own devices.** `simulimit` says
   what the **address of record** is doing, not what each of its
   devices is doing separately. Watching one's own desk phone as a
@@ -4384,7 +4433,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.4** | The file the user picks: a native **Browse…** dialog for the ringtone, on the settings page and on the account editor, with the WAV filter, the **Reset** button, and a file that is checked before it is accepted | **done** |
 | **M6.5** | The transfer completed while the target is ringing: **Complete transfer** is live as soon as the target rings, the server finishes the transfer, and a consultation that dies after the REFER is the server's business rather than the user calling it off | **done** |
 | **M6.6** | The headers an account puts on its own calls: a per-account list of `X-var1=…` that goes on the INVITE, with `$callerid` / `$called` / `$user` / `$account` as the values | **done** |
-| **M6.7** | The Busy Lamp Field: RFC 3903 `dialog-info+simulimit` subscriptions, the `NOTIFY` documents read by hand, and the lamps in the left panel below the accounts | **done** |
+| **M6.7** | The Busy Lamp Field: RFC 3903 `dialog-info+simulimit` subscriptions, the `NOTIFY` documents read by hand, and the lamps in the left panel below the accounts — each lamp a button that dials the number the account has for that extension | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -4448,7 +4497,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 478 tests, all passing.
+* `cargo test --workspace` — 480 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -4596,8 +4645,19 @@ player lands.
   document replaces everything that is known; a `partial` one changes
   one dialog and leaves the others — which is what RFC 3903 says.
 * **The lamps are in the left panel, below the accounts**, and the
-  account page takes the list of extensions to watch — typed, or taken
-  from the contacts with one button.
+  account page takes the extensions to watch — one row each, with the
+  extension that is watched and the number that is dialled as two
+  separate fields.
+* **A lamp is a button.** Pressing the extension in the panel dials the
+  number the account has for it — `00101` for an extension watched as
+  `101` — and an extension with no dial number dials itself.
+* **An extension with no subscription is still a speed dial.** The panel
+  lists what the account watches, not what it has heard about, so a
+  lamp that is still grey is still a button that dials.
+* **The `SUBSCRIBE` goes to the registrar's port.** The Request-URI of
+  the subscription names the server the account is registered with,
+  port and all — `sip:105@193.178.169.164:5161` — which is the port
+  bug the user found against their own Asterisk.
 * **An incoming call rings.** The event starts the ringtone, and the test
   checks that the player is playing.
 * **A call we made rings back — but only when there is nothing to hear.**
@@ -5001,7 +5061,11 @@ player lands.
   the document. What has **not** been run is the user's own Asterisk
   serving `dialog-info+simulimit`: that needs `res_pjsip_pubsub`
   enabled and an ACL that lets the account watch the extension, and
-  neither is known to be there.
+  neither is known to be there. The one thing that *was* found against
+  the real Asterisk is the **port**: the subscription went to `:5060`
+  because the Request-URI had dropped the registrar's own port. That is
+  fixed, and the fix is proved on the wire — but the rest of the
+  mechanism still has not seen a real `NOTIFY`.
 * **No third-party softphone has been called.** The calls in the test
   suite were made against the hand-written peer in this repository; the
   Asterisk run above ended in a `404`. The SIP messages on the wire are

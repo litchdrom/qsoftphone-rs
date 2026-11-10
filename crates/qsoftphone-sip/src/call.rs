@@ -1276,22 +1276,32 @@ fn terminated_code(reason: &TerminatedReason) -> (u16, String) {
 ///
 /// The host is the account's domain when it has one, and the
 /// registrar's host otherwise.
-pub fn aor_of(account: &Account) -> String {
-    aor_for(&account.user, account)
-}
-
-/// The address of record of **another** extension on the same server.
 ///
-/// The Busy Lamp Field watches other people's extensions, and they are
-/// on the server this account is registered with: the same domain, or
-/// the same registrar's host.
-pub fn aor_for(user: &str, account: &Account) -> String {
+/// There is **no port** in it: this is the account's own identity — the
+/// `From` of its calls — and an address of record is a name, not a
+/// destination. The port lives in the registrar, where the requests
+/// actually go.
+pub fn aor_of(account: &Account) -> String {
     let host = if account.domain.trim().is_empty() {
         split_host_port(&account.registrar).0
     } else {
         account.domain.trim().to_string()
     };
-    format!("sip:{}@{host}", user.trim())
+    format!("sip:{}@{}", account.user.trim(), host)
+}
+
+/// The address of record of **another** extension on the same server.
+///
+/// The Busy Lamp Field watches other people's extensions, and they are
+/// on the server this account is registered with — the registrar.
+///
+/// The **port** is in there, and it has to be: a registrar on
+/// `193.178.169.164:5161` is not on `193.178.169.164:5060`, and a
+/// request that goes to the wrong port never comes back. This is the
+/// same string the call path builds — `normalise_sip_target` — so the
+/// two cannot drift apart.
+pub fn aor_for(user: &str, account: &Account) -> String {
+    normalise_sip_target(user, &account.registrar)
 }
 
 /// The extra headers this account puts on its calls.
@@ -1476,6 +1486,18 @@ mod tests {
         assert_eq!(aor_of(&account), "sip:104@sip.example.com");
         account.domain = "pbx.example.com".to_string();
         assert_eq!(aor_of(&account), "sip:104@pbx.example.com");
+    }
+
+    #[test]
+    fn the_watched_extension_is_reached_on_the_registrars_port() {
+        // The registrar is on a port of its own, and a SUBSCRIBE that
+        // goes to :5060 never comes back.
+        let account = Account::new("Office", "193.178.169.164:5161", "104", "pw", "udp");
+        assert_eq!(
+            aor_for("105", &account),
+            "sip:105@193.178.169.164:5161",
+            "the watched extension lost the port"
+        );
     }
 
     #[test]

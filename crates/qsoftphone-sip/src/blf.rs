@@ -25,9 +25,10 @@ use rsipstack::transaction::key::{TransactionKey, TransactionRole};
 use rsipstack::transaction::transaction::Transaction;
 use tracing::{info, warn};
 
+use qsoftphone_core::model::account::BlfEntry;
 use qsoftphone_core::sip::blf::{self, BlfState, Tracker};
 
-use crate::call::aor_of;
+use crate::call::{aor_for, aor_of};
 use crate::session::{AccountSession, SessionRegistry};
 
 /// The event package a Busy Lamp Field subscription asks for.
@@ -78,10 +79,19 @@ impl std::error::Error for BlfError {}
 /// One lamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlfLamp {
-    /// The extension, as the user knows it — `105`.
+    /// The extension the lamp is about.
+    ///
+    /// The extension that is **watched** — not necessarily the number
+    /// that is dialled for it.
     pub extension: String,
     /// The address of record the subscription is for.
     pub aor: String,
+    /// The number that is dialled when the lamp is pressed.
+    ///
+    /// Often **not** the extension itself: on many dialplans the
+    /// extension `101` is reached at `00101`, or through a queue at
+    /// `200`, or through a feature code at `*300`.
+    pub dial: String,
     /// What the lamp says.
     pub state: BlfState,
 }
@@ -92,10 +102,12 @@ pub struct BlfLamp {
 /// on the session's endpoint and has to be matched to it.
 #[derive(Debug, Clone)]
 pub struct BlfSubscription {
-    /// The extension, as the user knows it.
+    /// The extension the lamp is about.
     pub extension: String,
     /// The address of record we subscribed for.
     pub aor: String,
+    /// The number that is dialled when the lamp is pressed.
+    pub dial: String,
     /// The Call-ID of the SUBSCRIBE.
     ///
     /// The `NOTIFY`s carry it, and it is how the two are matched.
@@ -116,6 +128,7 @@ impl BlfSubscription {
         BlfLamp {
             extension: self.extension.clone(),
             aor: self.aor.clone(),
+            dial: self.dial.clone(),
             state: self.tracker.state(),
         }
     }
@@ -139,18 +152,28 @@ impl BlfManager {
 
     /// Watch an extension.
     ///
-    /// `aor` is the address of record to subscribe for — `sip:105@pbx`
-    /// for extension 105 on that server. The subscription is registered
-    /// **before** the SUBSCRIBE goes out: the server is allowed to send
-    /// the first `NOTIFY` before the `202 Accepted` has been read, and
-    /// a lamp that missed it would show the wrong thing.
-    pub fn watch(&self, account_id: &str, extension: &str, aor: &str) -> Result<(), BlfError> {
+    /// `entry` has **two** values: the extension to watch, and the
+    /// number to dial for it. The subscription is for the first; the
+    /// second is what pressing the lamp does, and it never goes on the
+    /// wire.
+    ///
+    /// The subscription is registered **before** the SUBSCRIBE goes
+    /// out: the server is allowed to send the first `NOTIFY` before the
+    /// `202 Accepted` has been read, and a lamp that missed it would
+    /// show the wrong thing.
+    pub fn watch(&self, account_id: &str, entry: &BlfEntry) -> Result<(), BlfError> {
         let session = self
             .sessions
             .get(account_id)
             .ok_or(BlfError::NotRegistered)?;
 
-        let request = subscribe_request(&session, aor, 1, EXPIRES_SECONDS, None, None, None)?;
+        let extension = entry.watch.trim().to_string();
+        // The address of record carries the **port**: a registrar on
+        // `193.178.169.164:5161` is not on `193.178.169.164:5060`, and
+        // a SUBSCRIBE that goes to the wrong port never comes back.
+        let aor = aor_for(&extension, &session.account);
+
+        let request = subscribe_request(&session, &aor, 1, EXPIRES_SECONDS, None, None, None)?;
         let call_id = request
             .call_id_header()
             .map_err(|e| BlfError::Sip(e.to_string()))?
@@ -165,8 +188,9 @@ impl BlfManager {
             .unwrap_or_default();
 
         session.remember_blf(BlfSubscription {
-            extension: extension.to_string(),
-            aor: aor.to_string(),
+            extension: extension.clone(),
+            aor: aor.clone(),
+            dial: entry.dial_target().to_string(),
             call_id: call_id.clone(),
             from_tag,
             to_tag: String::new(),
@@ -212,6 +236,19 @@ impl BlfManager {
             Some(session) => session.blf_lamps(),
             None => Vec::new(),
         }
+    }
+
+    /// What one extension's lamp says.
+    ///
+    /// `Unavailable` when nothing has been said about it — which is not
+    /// the same as "free", and is what an extension whose subscription
+    /// has not been established says.
+    pub fn state_of(&self, account_id: &str, extension: &str) -> BlfState {
+        self.lamps(account_id)
+            .into_iter()
+            .find(|lamp| lamp.extension == extension)
+            .map(|lamp| lamp.state)
+            .unwrap_or(BlfState::Unavailable)
     }
 }
 

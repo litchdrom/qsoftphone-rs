@@ -16,6 +16,42 @@ use serde::{Deserialize, Serialize};
 /// and stable ordering keeps those payloads diffable.
 pub type HeaderMap = std::collections::BTreeMap<String, String>;
 
+/// One watched extension, and the number that is dialled for it.
+///
+/// A Busy Lamp Field watches an **extension**, but the number that
+/// reaches it is not always the extension. On many dialplans the
+/// extension `101` is reached at `00101`, or through a queue at `200`,
+/// or through a feature code at `*300` — and dialling `101` itself
+/// rings nothing.
+///
+/// So the two are separate: `watch` is who the lamp is **about**, and
+/// `dial` is what pressing the lamp **does**.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct BlfEntry {
+    /// The extension whose state is watched.
+    pub watch: String,
+    /// The number that is dialled when the lamp is pressed.
+    ///
+    /// Empty = the watched extension itself.
+    pub dial: String,
+}
+
+impl BlfEntry {
+    /// The number to dial.
+    ///
+    /// An empty `dial` means "the extension itself" — which is the
+    /// ordinary case, and the one a user does not have to think about.
+    pub fn dial_target(&self) -> &str {
+        let dial = self.dial.trim();
+        if dial.is_empty() {
+            self.watch.trim()
+        } else {
+            dial
+        }
+    }
+}
+
 /// A SIP account as it is stored in SQLite.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -64,9 +100,12 @@ pub struct Account {
     /// extension is on the server **this** account is registered with,
     /// and the same number on another server is a different person.
     ///
+    /// Each entry has **two** values: the extension to watch, and the
+    /// number to dial for it — which is often not the same one.
+    ///
     /// Empty = no lamps. An account that watches nothing sends no
     /// subscriptions at all.
-    pub blf_extensions: Vec<String>,
+    pub blf_extensions: Vec<BlfEntry>,
     /// Which CRM plugin handles this account. Empty = local contacts.
     pub crm_preset_id: String,
     /// The WAV file this account rings with.

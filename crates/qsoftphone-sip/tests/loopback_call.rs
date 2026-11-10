@@ -1013,7 +1013,13 @@ async fn the_busy_lamp_field_says_whether_the_extension_is_on_a_call() {
 
     stack
         .blf
-        .watch(&account.id, "105", &format!("sip:105@{peer_addr}"))
+        .watch(
+            &account.id,
+            &qsoftphone_core::model::account::BlfEntry {
+                watch: "105".to_string(),
+                dial: String::new(),
+            },
+        )
         .expect("the extension was not watched");
 
     // The lamp says what the NOTIFY said.
@@ -1043,6 +1049,15 @@ async fn the_busy_lamp_field_says_whether_the_extension_is_on_a_call() {
         .expect("observations lock")
         .request("SUBSCRIBE")
         .expect("the server never saw the SUBSCRIBE");
+
+    // The Request-URI names the **port** of the server. A registrar on
+    // `193.178.169.164:5161` is not on `193.178.169.164:5060`, and a
+    // SUBSCRIBE that goes to the wrong port never comes back.
+    assert!(
+        subscribe.starts_with(&format!("SUBSCRIBE sip:105@{peer_addr} ")),
+        "the subscription does not name the server's port:\n{subscribe}"
+    );
+
     assert!(
         header_value(&subscribe, "Event").as_deref() == Some("dialog-info+simulimit"),
         "the subscription asks for the wrong event package:\n{subscribe}"
@@ -1099,7 +1114,13 @@ async fn a_server_that_does_not_serve_the_package_leaves_the_lamp_dark() {
 
     stack
         .blf
-        .watch(&account.id, "105", &format!("sip:105@{peer_addr}"))
+        .watch(
+            &account.id,
+            &qsoftphone_core::model::account::BlfEntry {
+                watch: "105".to_string(),
+                dial: String::new(),
+            },
+        )
         .expect("the extension was not watched");
 
     // Give the refusal time to arrive.

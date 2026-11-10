@@ -8,7 +8,7 @@
 use rusqlite::{Row, params};
 
 use crate::error::Result;
-use crate::model::account::{Account, now_ms};
+use crate::model::account::{Account, BlfEntry, now_ms};
 use crate::storage::db::Db;
 
 /// CRUD over the `accounts` table.
@@ -176,7 +176,7 @@ fn row_to_account(row: &Row<'_>) -> rusqlite::Result<Account> {
     };
     // The extensions whose lamps this account watches.
     let blf: String = row.get(12)?;
-    let blf_extensions = match serde_json::from_str::<Vec<String>>(&blf) {
+    let blf_extensions = match serde_json::from_str::<Vec<BlfEntry>>(&blf) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
@@ -334,11 +334,24 @@ mod tests {
         let store = AccountStore::new(&db);
 
         let mut account = Account::new("Office", "example.com", "104", "", "udp");
-        account.blf_extensions = vec!["105".to_string(), "106".to_string()];
+        account.blf_extensions = vec![
+            BlfEntry {
+                watch: "101".to_string(),
+                dial: "00101".to_string(),
+            },
+            BlfEntry {
+                watch: "102".to_string(),
+                dial: String::new(),
+            },
+        ];
         store.upsert(&account).unwrap();
 
         let fetched = store.get(&account.id).unwrap().unwrap();
-        assert_eq!(fetched.blf_extensions, vec!["105", "106"]);
+        assert_eq!(fetched.blf_extensions.len(), 2);
+        assert_eq!(fetched.blf_extensions[0].watch, "101");
+        assert_eq!(fetched.blf_extensions[0].dial, "00101");
+        assert_eq!(fetched.blf_extensions[1].watch, "102");
+        assert_eq!(fetched.blf_extensions[1].dial, "");
     }
 
     #[test]
