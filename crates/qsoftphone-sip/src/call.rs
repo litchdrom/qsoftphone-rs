@@ -69,6 +69,14 @@ pub enum CallError {
     BadTarget(String),
     /// The SIP stack refused.
     Sip(String),
+    /// The consultation cannot be pointed at yet.
+    ///
+    /// The `Replaces` names the consultation's dialog by three things
+    /// (RFC 3891 §3.1), and one of them — the tag the peer put on its
+    /// `To` — only arrives when the call first rings. A transfer that
+    /// names the dialog without it finds nothing, and the server
+    /// answers "no route to target".
+    ConsultationNotNamed,
 }
 
 impl fmt::Display for CallError {
@@ -78,6 +86,9 @@ impl fmt::Display for CallError {
             Self::NoSuchCall => write!(f, "there is no such call"),
             Self::BadTarget(target) => write!(f, "{target} is not a SIP URI"),
             Self::Sip(e) => write!(f, "{e}"),
+            Self::ConsultationNotNamed => {
+                write!(f, "the consultation has not been named by the server yet")
+            }
         }
     }
 }
@@ -521,6 +532,12 @@ impl CallManager {
     /// consultation's dialog identifier, so the peer bridges to the
     /// call that is already up instead of dialling a new target.
     ///
+    /// The consultation does **not** have to be answered: it only has
+    /// to be **up** and named. The transfer is completed by the server
+    /// — it holds the transfer and bridges when the target answers —
+    /// so the user can finish the transfer while the target is still
+    /// ringing.
+    ///
     /// The consultation is **our** leg, so when the transfer works it
     /// is released together with the original one.
     pub fn transfer_attended(
@@ -541,6 +558,17 @@ impl CallManager {
         let peer = dialog.snapshot().remote_uri.to_string();
         let mut consultation = consultation_of(&consultation);
 
+        // The `Replaces` names the consultation's dialog by its
+        // Call-ID and its two tags (RFC 3891 §3.1). The peer's tag
+        // arrives with the first response that carries one — the `180
+        // Ringing` — so a consultation that has not rung yet cannot be
+        // named, and a transfer that names it finds nothing: the
+        // server says "no route to target" and takes the transfer for
+        // one to another machine.
+        if !consultation.is_named() {
+            return Err(CallError::ConsultationNotNamed);
+        }
+
         // The `Refer-To` names the **target** of the consultation — the
         // third party the user dialled, not the server's own Contact
         // URI. pjsip does the same: it takes the consult call's remote
@@ -555,11 +583,14 @@ impl CallManager {
 
         let refer = attended_transfer(&peer, &consultation);
 
+        self.send_refer(account_id, call_id, dialog, refer)?;
+
         // The consultation goes with the original leg when the
         // transfer works, so the watcher has to know which one it is.
+        // This is after the send: a REFER that never went out has no
+        // consultation to remember.
         session.remember_consultation(call_id, consultation_call_id);
-
-        self.send_refer(account_id, call_id, dialog, refer)
+        Ok(())
     }
 
     /// Send the REFER itself.

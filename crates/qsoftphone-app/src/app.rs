@@ -326,6 +326,16 @@ struct TransferState {
     /// we are the ones who take it off again when the consultation is
     /// over or the transfer failed.
     source_held: bool,
+    /// Whether the REFER has gone out.
+    ///
+    /// After it has, the transfer is the **server's** business: it was
+    /// told to take the consultation over, and it reports how that went
+    /// over the NOTIFY (RFC 3515 §3.4). The consultation dying is then
+    /// the expected outcome rather than the transfer being called off —
+    /// and the hold stays on until the server says how it went, because
+    /// taking it off now would put the user's voice back on the old
+    /// peer's line while the server is bridging.
+    refer_sent: bool,
 }
 
 impl Default for TransferState {
@@ -338,6 +348,7 @@ impl Default for TransferState {
             feature_code: false,
             prefix: "*2".to_string(),
             source_held: false,
+            refer_sent: false,
         }
     }
 }
@@ -346,8 +357,14 @@ impl Default for TransferState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConsultationState {
     /// The consultation is being dialled.
+    ///
+    /// The target has not rung yet, so the server has not named the
+    /// call and cannot be told to take it over.
     Dialling,
     /// The target is ringing.
+    ///
+    /// The transfer can be completed here: the server holds it and
+    /// bridges when the target answers.
     Ringing,
     /// The target answered: the transfer can be completed.
     Answered,
@@ -667,11 +684,16 @@ impl QSoftphoneApp {
             // keep offering a transfer that cannot work — and the
             // original leg comes off hold.
             //
+            // The same is true once the REFER has gone out: the
+            // consultation is then the server's business, and the
+            // popup is already closed — but the app still has to know
+            // that the consultation died.
+            //
             // This is after the row's borrow: the rule needs to look
             // at the transfer, not at this one.
             if event.event_type == CallEventType::CallEnded
-                && self.transfer.open
                 && self.transfer.consultation_call_id.as_deref() == Some(call_id.as_str())
+                && (self.transfer.open || self.transfer.refer_sent)
             {
                 self.consultation_ended();
             }
@@ -955,6 +977,8 @@ impl QSoftphoneApp {
         // The hold is ours: it is taken off again when the
         // consultation is over or the transfer failed.
         self.transfer.source_held = held;
+        // A new consultation has not been handed to the server yet.
+        self.transfer.refer_sent = false;
         self.status = format!("Consultation to {target}…");
     }
 
@@ -970,9 +994,25 @@ impl QSoftphoneApp {
     /// The original leg comes **off hold**: the hold was ours, put
     /// there for the consultation, and the user is talking to that peer
     /// again.
+    ///
+    /// Unless the REFER has already gone out. Then the transfer is the
+    /// **server's**: it was told to take the consultation over, and it
+    /// reports how that went over the NOTIFY (RFC 3515 §3.4). The
+    /// consultation dying is what the server does when it bridges —
+    /// or what the target does when it gives up — and either way the
+    /// server is the one who says how it went. The hold stays on until
+    /// then: taking it off now would put the user's voice back on the
+    /// old peer's line while the server is bridging.
     fn consultation_ended(&mut self) {
+        let refer_sent = self.transfer.refer_sent;
         self.transfer.consultation_call_id = None;
         self.transfer.open = false;
+        if refer_sent {
+            self.status =
+                "The consultation ended — the server has the transfer and will say how it went."
+                    .to_string();
+            return;
+        }
         // The original leg comes **off hold**: the hold was ours, put
         // there for the consultation, and the user is talking to that
         // peer again.
@@ -1001,6 +1041,14 @@ impl QSoftphoneApp {
     }
 
     /// Send the REFER that points at the consultation (§5.6).
+    ///
+    /// The consultation does **not** have to be answered. It has to be
+    /// **up** — ringing is enough — because the transfer is completed
+    /// by the **server**: it is told to take the consultation over, it
+    /// holds the transfer, and it bridges when the target answers.
+    ///
+    /// That is what the user asked for: hear the target ring, press
+    /// "Complete transfer", and let the PBX do the rest.
     fn complete_attended_transfer(&mut self, call: &CallView) {
         let Some(consultation) = self.transfer.consultation_call_id.clone() else {
             return;
@@ -1011,13 +1059,19 @@ impl QSoftphoneApp {
         // down with it — so the user would lose the call they were
         // in.
         let state = self.consultation_state(&consultation);
-        if state != ConsultationState::Answered {
-            self.status = if state == ConsultationState::Ended {
-                "The consultation is over — there is nothing to transfer.".to_string()
-            } else {
-                "The consultation has not answered yet — there is nothing to transfer.".to_string()
-            };
-            return;
+        match state {
+            ConsultationState::Ended => {
+                self.status =
+                    "The consultation is over — there is nothing to transfer.".to_string();
+                return;
+            }
+            ConsultationState::Dialling => {
+                // The target has not rung yet, so the server has not
+                // named the call and cannot be told to take it over.
+                self.status = "The target has not rung yet — wait for the ringback.".to_string();
+                return;
+            }
+            ConsultationState::Ringing | ConsultationState::Answered => {}
         }
         match self
             .calls
@@ -1025,10 +1079,36 @@ impl QSoftphoneApp {
         {
             Ok(()) => {
                 self.transfer.open = false;
-                self.status = "Transferring…".to_string();
+                // The transfer is the server's now: it reports how it
+                // went over the NOTIFY.
+                self.transfer.refer_sent = true;
+                self.status = if state == ConsultationState::Ringing {
+                    "Transferring — the server will connect you when they answer.".to_string()
+                } else {
+                    "Transferring…".to_string()
+                };
             }
             Err(e) => self.status = format!("The transfer did not start: {e}"),
         }
+    }
+
+    /// Whether the transfer can be completed now.
+    ///
+    /// The consultation has to be **up**: a transfer that points at a
+    /// call that is over cannot work, and one that points at a call
+    /// that has not rung yet cannot be **found** by the server — the
+    /// `Replaces` names the dialog by the Call-ID and the two tags
+    /// (RFC 3891 §3.1), and the peer's tag arrives with the `180
+    /// Ringing`.
+    ///
+    /// So the transfer can be completed once the target **rings** — the
+    /// user does not have to wait for the answer, and the server
+    /// completes it when the target answers.
+    fn can_complete_transfer(&self, consultation_call_id: &str) -> bool {
+        matches!(
+            self.consultation_state(consultation_call_id),
+            ConsultationState::Ringing | ConsultationState::Answered
+        )
     }
 
     /// Give the consultation up (§5.6).
@@ -2648,22 +2728,38 @@ impl QSoftphoneApp {
                 ui.label(consultation_caption(state));
                 ui.weak("Original call on hold — the other party cannot hear you.");
                 ui.add_space(6.0);
-                let answered = state == ConsultationState::Answered;
+                // The transfer can be completed once the target is
+                // **ringing**: the server takes the consultation over
+                // and completes the transfer when the target answers.
+                // The user does not have to wait for the answer to
+                // say "yes, transfer it".
+                let can_complete = self.can_complete_transfer(&consultation_call_id);
                 ui.horizontal(|ui| {
                     if ui.button("Cancel consultation").clicked() {
                         self.cancel_transfer();
                     }
                     if ui
-                        .add_enabled(answered, egui::Button::new("Complete transfer"))
+                        .add_enabled(can_complete, egui::Button::new("Complete transfer"))
                         .clicked()
                     {
                         self.complete_attended_transfer(&call);
                     }
                 });
-                if !answered {
+                if !can_complete {
+                    // Why the button is not there. A button that cannot
+                    // work is a button that must not be there — but the
+                    // user has to be told *why*, or the popup looks
+                    // broken.
+                    ui.label(
+                        egui::RichText::new("The transfer can be completed once the target rings.")
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
+                } else if state == ConsultationState::Ringing {
                     ui.label(
                         egui::RichText::new(
-                            "The transfer can be completed once the target answers.",
+                            "The transfer can be completed now — the server will connect you \
+                             when they answer.",
                         )
                         .small()
                         .color(egui::Color32::GRAY),
@@ -6631,6 +6727,16 @@ mod tests {
         answered
     }
 
+    /// The consultation ringing: the target is being called and has not
+    /// answered yet.
+    fn a_consultation_that_is_ringing() -> CallEvent {
+        let mut ringing = CallEvent::new(CallEventType::OutgoingCallRinging);
+        ringing.call_id = "call-2".to_string();
+        ringing.call_direction = Some(Direction::Outgoing);
+        ringing.call_state = "ringing".to_string();
+        ringing
+    }
+
     /// The consultation dying: the transferee destination hung up, or
     /// cancelled, or the call failed with an error code.
     fn a_consultation_that_ended() -> CallEvent {
@@ -6750,7 +6856,11 @@ mod tests {
         run_a_call_that_stays_up(&bus, "call-1").await;
         frame(&mut app, &ctx);
 
+        // The consultation is placed and then dies.
         app.transfer.consultation_call_id = Some("call-2".to_string());
+        bus.publish("acct-ui-1", a_consultation_that_ended());
+        frame(&mut app, &ctx);
+
         let call = app
             .call_views
             .get("call-1")
@@ -6762,6 +6872,166 @@ mod tests {
             app.status.contains("nothing to transfer"),
             "the app does not say why: {}",
             app.status
+        );
+        assert!(
+            !app.transfer.refer_sent,
+            "the app handed a dead consultation to the server"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_consultation_that_has_not_rung_yet_cannot_be_transferred() {
+        // The `Replaces` names the consultation's dialog by its
+        // Call-ID and its two tags (RFC 3891 §3.1), and the peer's tag
+        // arrives with the `180 Ringing`. Before that there is no
+        // dialog to point at: the server would answer "no route to
+        // target".
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        frame(&mut app, &ctx);
+
+        // The consultation has been placed, and the app has not heard
+        // from it yet.
+        app.transfer.consultation_call_id = Some("call-2".to_string());
+        let call = app
+            .call_views
+            .get("call-1")
+            .cloned()
+            .expect("the call is not there");
+        app.complete_attended_transfer(&call);
+
+        assert!(
+            app.status.contains("not rung yet"),
+            "the app does not say why: {}",
+            app.status
+        );
+        assert!(
+            !app.transfer.refer_sent,
+            "the app handed an unnamed consultation to the server"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_transfer_can_be_completed_while_the_target_is_ringing() {
+        // The user's request: hear the target ring, say "complete the
+        // transfer", and let the server do the rest. The C++ waits for
+        // the answer (`_consultState === "answered"`); here the target
+        // only has to be **ringing**.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        app.transfer.open = true;
+        app.transfer.source_call_id = "call-1".to_string();
+        app.transfer.consultation_call_id = Some("call-2".to_string());
+
+        // The consultation rings.
+        bus.publish("acct-ui-1", a_consultation_that_is_ringing());
+        frame(&mut app, &ctx);
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Ringing the target"),
+            "the popup does not say the target is ringing:\n{text}"
+        );
+        assert!(
+            text.contains("can be completed now"),
+            "the popup does not offer the transfer while the target is ringing:\n{text}"
+        );
+
+        // And the button is there and **live**: a button that cannot
+        // work must not be there, and this one can.
+        let button = button_at(&output, "Complete transfer").expect("there is no transfer button");
+        assert!(
+            button.width() > 0.0,
+            "the transfer button has no width: {button:?}"
+        );
+        let complete = app
+            .call_views
+            .get("call-1")
+            .cloned()
+            .expect("the call is not there");
+        assert!(
+            app.can_complete_transfer("call-2"),
+            "the transfer cannot be completed while the target is ringing"
+        );
+        // The call is not registered in this test, so the REFER cannot
+        // go out — but the app must have tried, which is the proof
+        // that the button is live.
+        app.complete_attended_transfer(&complete);
+        assert!(
+            app.status.contains("did not start"),
+            "the app did not try to send the transfer: {}",
+            app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn the_transfer_button_is_not_live_before_the_target_rings() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        app.transfer.open = true;
+        app.transfer.source_call_id = "call-1".to_string();
+        app.transfer.consultation_call_id = Some("call-2".to_string());
+
+        // The consultation has been placed and the app has not heard
+        // from it yet.
+        frame(&mut app, &ctx);
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("once the target rings"),
+            "the popup does not say when the transfer can be completed:\n{text}"
+        );
+        assert!(
+            !app.can_complete_transfer("call-2"),
+            "the transfer can be completed before the target rings"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_consultation_dying_after_the_refer_is_the_servers_business() {
+        // Once the REFER has gone out, the server has the transfer: it
+        // was told to take the consultation over, and it reports how
+        // that went over the NOTIFY. The consultation dying is then
+        // what the server does when it bridges — not the user calling
+        // the transfer off.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        run_a_call_that_stays_up(&bus, "call-1").await;
+        frame(&mut app, &ctx);
+
+        app.transfer.open = true;
+        app.transfer.source_call_id = "call-1".to_string();
+        app.transfer.consultation_call_id = Some("call-2".to_string());
+        app.transfer.source_held = true;
+        // The REFER has gone out.
+        app.transfer.refer_sent = true;
+
+        bus.publish("acct-ui-1", a_consultation_that_ended());
+        frame(&mut app, &ctx);
+
+        assert!(
+            app.status.contains("the server has the transfer"),
+            "the app did not say who has the transfer now: {}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("called off"),
+            "the app says the transfer was called off, but the user did not call it off: {}",
+            app.status
+        );
+        assert!(
+            app.transfer.source_held,
+            "the original leg came off the hold while the server is bridging"
         );
     }
 

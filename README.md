@@ -3371,9 +3371,12 @@ The popup has the C++'s two phases:
   **Cancel consultation**.
 
 The **Complete transfer** button is always there — greyed out until the
-target answers, with the sentence above saying why. A button that is
+target **rings**, with the sentence above saying why. A button that is
 not there is a button the user cannot find; a button that is there and
-greyed out, under a sentence that says why, is one they can.
+greyed out, under a sentence that says why, is one they can. The C++
+greys it out until the target **answers**; M6.5 changed that, and
+[the reason](#m65--the-transfer-completed-while-the-target-is-still-ringing)
+is in RFC 3891 §3.1.
 
 Escape closes the popup, but not while a consultation is in flight:
 closing it then would leave the consultation leg up with nobody able
@@ -3937,6 +3940,131 @@ entries. The full accounting, and why it is 0.17 and not 0.18, are in
 
 ---
 
+## M6.5 — The transfer completed while the target is still ringing
+
+*"Can we add the user option to complete atd transfer with refer before
+answer. User hears ringtone and complete transfer giving completion on pbx
+logic."*
+
+### What the C++ does
+
+The C++ offers **Complete transfer** only once the consultation has
+**answered**. `src/ui/Dialer.qml` puts the condition in the button's
+`enabled`:
+
+```qml
+enabled: transferPopup._inConsultMode
+    ? (transferPopup._consultState === "answered"
+       && transferPopup._sourceCallId > 0)
+    : (transferField.text.trim().length > 0
+       && root._callId > 0)
+```
+
+So in the C++ the user **has to wait for the target to pick up** before the
+button comes alive, and the transfer is a REFER that the peer executes
+against a dialog that is already up.
+
+### What there is now
+
+The button comes alive as soon as the target **rings**, and what the user
+is told is that the server will finish it:
+
+> The transfer can be completed now — the server will connect you when
+> they answer.
+
+That is the whole of the user's request: hear the target ring, press
+**Complete transfer**, and let the PBX do the rest.
+
+This is a **deliberate difference from the C++**, and the reason is in the
+RFCs rather than in taste.
+
+### Why ringing is enough, and dialling is not
+
+The attended transfer names the dialog it is handing over, so the peer can
+bridge to it. A dialog is named by **three** things (RFC 3891 §3.1): its
+Call-ID, the tag the peer put on its `To`, and the tag we put on our
+`From`.
+
+The peer's tag arrives with the **first response that carries one** — the
+`180 Ringing`. So:
+
+| The consultation is | The dialog is named | The transfer can be completed |
+|---|---|---|
+| dialling | no — no tag yet | **no** |
+| ringing | yes | **yes** |
+| answered | yes | yes |
+| ended | — | no — there is nothing to transfer |
+
+Before the target rings there is **no dialog to point at**. A `Replaces`
+without the to-tag names nothing, the server cannot find the call, and it
+falls through to the "no route to target" path — the fault M6.3 was
+about, and the reason that milestone put the `Replaces` header on the
+wire.
+
+So the rule is: **the target has to ring, and it does not have to
+answer.**
+
+The rule is enforced twice, on purpose:
+
+* the **app** decides by the state of the consultation — ringing or
+  answered means the button is live — and says why when it is not;
+* the **SIP layer** checks the dialog itself and refuses with
+  `ConsultationNotNamed` ("the consultation has not been named by the
+  server yet") rather than sending a REFER that cannot work.
+
+The second check is the backstop. The app's rule is a rule about the
+*state*; the SIP layer's rule is a rule about the *dialog*, and the
+dialog is the thing the server has to be able to find.
+
+### After the REFER has gone out, the server owns the transfer
+
+This is the part that changed the app's behaviour, and it is the part
+that matters most.
+
+Before the REFER goes out, the transfer is **ours**: the consultation is
+up, the original leg is on hold, and if the consultation dies the user
+is talking to the old peer again.
+
+After the REFER goes out, the transfer is the **server's**. It has been
+told to take the consultation over; it holds the transfer, and it reports
+how that went over the NOTIFY (RFC 3515 §3.4). The consultation dying is
+then what the server does when it bridges — or what the target does when
+it gives up — and either way the **server** is the one who says how it
+went.
+
+So the app now says:
+
+> The consultation ended — the server has the transfer and will say how it
+> went.
+
+and **the hold stays on** until the server says so. Taking it off now
+would put the user's voice back on the old peer's line while the server
+is bridging. The hold still comes off when the transfer **fails** — that
+is the policy that keeps the original call up (§5.6), and it is unchanged.
+
+### The dependency cost: nothing
+
+No new package: a flag on the transfer state, a check on the dialog, and
+a rule the RFCs already imply.
+
+### What is *not* in M6.5
+
+* **The user's Asterisk never rings.** It answers `100 Trying` and then
+  `200 OK` — it never sends a `180 Ringing`, so on that PBX the target
+  goes from *dialling* straight to *answered* and there is no window in
+  which the button could be pressed early. The feature is proved against
+  the peer in this repository, which holds the call in the early state;
+  it has **not** been exercised against a real PBX that rings.
+* **The transfer is still the server's to complete.** Nothing here waits
+  for the target to answer and then sends a second REFER — the whole
+  point is that one REFER is enough, and the server bridges when the
+  target picks up.
+* **The C++'s rule is not changed.** The reference still waits for the
+  answer; this build deliberately does not, and the difference is
+  recorded above.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -3987,6 +4115,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.2** | The ringtone per account, the call the panel shows, and the hold: a ringtone file on the account, the panel following the call that is up, and the attended transfer putting the original leg on hold | **done** |
 | **M6.3** | The consultation that dies: the transfer popup following the consultation, a dead consultation offering no transfer, a failed transfer putting the original call back on the line, and the `Replaces` header the server reads | **done** |
 | **M6.4** | The file the user picks: a native **Browse…** dialog for the ringtone, on the settings page and on the account editor, with the WAV filter, the **Reset** button, and a file that is checked before it is accepted | **done** |
+| **M6.5** | The transfer completed while the target is ringing: **Complete transfer** is live as soon as the target rings, the server finishes the transfer, and a consultation that dies after the REFER is the server's business rather than the user calling it off | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -4050,7 +4179,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 422 tests, all passing.
+* `cargo test --workspace` — 429 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -4148,6 +4277,23 @@ player lands.
   leg was put on hold for the consultation, so the hold comes off when
   the transfer fails — the policy that keeps the original call up is
   worth nothing if the call is left silent.
+* **The transfer can be completed while the target is still ringing.** The
+  loopback peer holds the call in the early state, and the REFER goes out
+  against that still-ringing dialog: the `Replaces` on the wire carries the
+  consultation's Call-ID **and the to-tag that came with the `180
+  Ringing`**, and the transfer goes on to the answered state.
+* **A consultation that has not rung cannot be transferred.** The peer
+  rings late, so the dialog has no to-tag yet; the SIP layer refuses with
+  `ConsultationNotNamed`, and **nothing goes on the wire** — the peer
+  never saw a REFER.
+* **The consultation dying after the REFER is the server's business.** The
+  app says the server has the transfer, does not say the user called it
+  off, and **leaves the original leg on hold** — taking it off would put
+  the user's voice back on the old peer's line while the server is
+  bridging.
+* **The button is not live before the target rings.** The popup says
+  *"The transfer can be completed once the target rings"*, and the button
+  is greyed out until then.
 * **An incoming call rings.** The event starts the ringtone, and the test
   checks that the player is playing.
 * **A call we made rings back — but only when there is nothing to hear.**
@@ -4627,6 +4773,15 @@ player lands.
   a second extension will show is whether the far end is bridged the
   way the user expects — that is a question about the PBX's dialplan,
   not about the app.
+* **The transfer completed while the target rings has not been seen
+  against a real PBX.** The user's own Asterisk never sends a `180
+  Ringing`: it answers `100 Trying` and then `200 OK`, so the
+  consultation goes from *dialling* straight to *answered* and the
+  window in which the button could be pressed early does not exist
+  there. The feature is proved against the peer in this repository,
+  which holds the call in the early state — but a PBX that rings and
+  then **answers after the REFER has already gone out** is the case
+  that has not been run, and that is the case the user asked for.
 * **The ringtone and the ringback have not been heard.** The tones are
   made, the WAV is read and the decision is tested — and the sound
   itself has not been through a speaker, because no call has rung yet:

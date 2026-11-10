@@ -73,6 +73,25 @@ pub struct Consultation {
     pub from_tag: String,
 }
 
+impl Consultation {
+    /// Whether the dialog can be **named** by a `Replaces`.
+    ///
+    /// RFC 3891 §3.1 names a dialog by three things: its Call-ID, the
+    /// tag the peer put on its `To`, and the tag we put on our `From`.
+    /// The peer's tag arrives with the first response that carries one
+    /// — the `180 Ringing` — so a call that has not rung yet cannot be
+    /// named, and a `Replaces` that names it finds **nothing**.
+    ///
+    /// That is why a transfer can be completed once the target
+    /// **rings** and not a moment sooner: the server has to be able to
+    /// find the consultation to take it over. A `Replaces` with an
+    /// empty to-tag is the "no route to target" of M6.3 — the server
+    /// treats the transfer as one to another machine.
+    pub fn is_named(&self) -> bool {
+        !self.call_id.is_empty() && !self.to_tag.is_empty() && !self.from_tag.is_empty()
+    }
+}
+
 /// How a transfer is going.
 ///
 /// The codes are the ones RFC 3515 §7.1.2 puts in the body of the
@@ -446,6 +465,42 @@ mod tests {
 
         // A target pasted with spaces is still the number without them.
         assert_eq!(feature_code_sequence("*2", " 555 88 "), "*255588#");
+    }
+
+    #[test]
+    fn a_dialog_that_has_not_rung_yet_cannot_be_named() {
+        // The `Replaces` names the dialog by three things (RFC 3891
+        // §3.1), and the peer's tag is one of them. It arrives with the
+        // first response that carries one — the `180 Ringing` — so a
+        // call that has not rung yet cannot be pointed at.
+        let ringing = Consultation {
+            uri: "sip:bob@target.example.com".into(),
+            call_id: "1a2b3c".into(),
+            host: "192.0.2.4".into(),
+            to_tag: "peer-tag".into(),
+            from_tag: "our-tag".into(),
+        };
+        assert!(ringing.is_named(), "a call that has rung must be nameable");
+
+        // The peer's tag is missing: the call has not rung yet.
+        let dialling = Consultation {
+            to_tag: String::new(),
+            ..ringing.clone()
+        };
+        assert!(
+            !dialling.is_named(),
+            "a call that has not rung must not be nameable"
+        );
+
+        // And so is ours, if the stack has not made one up.
+        let untagged = Consultation {
+            from_tag: String::new(),
+            ..ringing
+        };
+        assert!(
+            !untagged.is_named(),
+            "a call with no from-tag must not be nameable"
+        );
     }
 
     #[test]

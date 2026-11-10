@@ -482,6 +482,26 @@ struct PeerOptions {
     /// §9.2). Asterisk does exactly this when the party that was
     /// called gives up while the call is still ringing.
     cancel_the_call: bool,
+    /// How long the peer holds a call in the early state, in
+    /// milliseconds, before it answers it.
+    ///
+    /// The peer sends the `180 Ringing` and then waits. That is the
+    /// window in which the client can complete a transfer while the
+    /// target is still ringing — on a real call the user has the same
+    /// window, between the target starting to ring and answering.
+    ///
+    /// `None` — the ordinary case — is no wait at all.
+    ring_for: Option<u64>,
+    /// How long the peer waits **before** it rings, in milliseconds.
+    ///
+    /// The peer's tag arrives with the `180 Ringing` (RFC 3891
+    /// §3.1), so a call that has not rung yet cannot be named by a
+    /// `Replaces`. A test that wants that state needs the ringing to
+    /// be late — otherwise the `180` may land before the test gets to
+    /// look at the call.
+    ///
+    /// `None` — the ordinary case — is no wait at all.
+    ring_delay: Option<u64>,
 }
 
 /// A registrar and call agent on one socket.
@@ -646,12 +666,30 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
                 // The `180 Ringing` may carry the SDP: that is early
                 // media, and the softphone has something to hear then.
                 // The ordinary one carries no body at all.
+                //
+                // A peer that waits before ringing is a peer whose
+                // call has **not been named** yet — the tag comes with
+                // the `180`, and without it there is no dialog for a
+                // `Replaces` to point at.
+                if let Some(milliseconds) = options.ring_delay {
+                    tokio::time::sleep(Duration::from_millis(milliseconds)).await;
+                }
                 let ringing = if options.early_media {
                     response(&text, "180 Ringing", &[], PEER_SDP)
                 } else {
                     response(&text, "180 Ringing", &[], "")
                 };
                 socket.send_to(ringing.as_bytes(), from).await.expect("180");
+
+                // The peer holds the call in the early state for a
+                // while. That is the window in which the client can
+                // complete a transfer while the target is still
+                // ringing — on a real call the user has the same
+                // window, between the target starting to ring and
+                // answering.
+                if let Some(milliseconds) = options.ring_for {
+                    tokio::time::sleep(Duration::from_millis(milliseconds)).await;
+                }
 
                 // The far end gives up while the call is still
                 // ringing: the server cancels the INVITE and answers
@@ -895,6 +933,8 @@ async fn an_outgoing_call_connects_and_hangs_up() {
             bye_status: None,
             early_media: false,
             cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
         },
     ));
 
@@ -1008,6 +1048,8 @@ async fn an_incoming_call_rings_before_the_user_answers() {
             bye_status: None,
             early_media: false,
             cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
         },
     ));
 
@@ -1131,6 +1173,8 @@ async fn a_ringing_incoming_call_is_declined_when_it_is_hung_up() {
             bye_status: None,
             early_media: false,
             cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
         },
     ));
 
@@ -1197,6 +1241,8 @@ async fn a_dtmf_digit_arrives_as_an_event() {
             bye_status: None,
             early_media: false,
             cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
         },
     ));
 
@@ -1252,6 +1298,8 @@ async fn a_dtmf_digit_is_sent_as_an_info_request() {
             bye_status: None,
             early_media: false,
             cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
         },
     ));
 
@@ -1345,6 +1393,8 @@ fn a_call_placed_off_the_runtime_does_not_take_the_app_down() {
             bye_status: None,
             early_media: false,
             cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
         },
     ));
 
@@ -1415,6 +1465,8 @@ async fn a_challenged_invite_is_answered_with_the_account_digest() {
             bye_status: None,
             early_media: false,
             cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
         },
     ));
 
@@ -1477,6 +1529,39 @@ async fn a_challenged_invite_is_answered_with_the_account_digest() {
         ),
         "the digest does not verify against the account's password"
     );
+}
+
+/// Wait for an event of a given kind **of a given call**.
+///
+/// `wait_for` takes the first event of the kind it finds, which is not
+/// enough when two calls are in flight: the original call's own `180
+/// Ringing` would answer a wait meant for the consultation's. This one
+/// looks at which call the event belongs to.
+async fn wait_for_call(
+    seen: &mut Vec<qsoftphone_core::model::call_event::CallEvent>,
+    calls: &mut CallManager,
+    kind: CallEventType,
+    call_id: &str,
+    timeout: Duration,
+) -> Option<qsoftphone_core::model::call_event::CallEvent> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        for update in calls.drain() {
+            seen.push(update.event);
+        }
+
+        if let Some(position) = seen
+            .iter()
+            .position(|e| e.event_type == kind && e.call_id == call_id)
+        {
+            return Some(seen.remove(position));
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Wait for the REFER the peer received.
@@ -1561,6 +1646,8 @@ async fn an_in_dialog_request_carries_the_public_contact() {
             bye_status: None,
             early_media: false,
             cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
         },
     ));
 
@@ -1651,6 +1738,8 @@ async fn a_bye_the_peer_does_not_know_still_ends_the_call() {
             bye_status: Some("481 Call/Transaction Does Not Exist"),
             early_media: false,
             cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
         },
     ));
 
@@ -1730,6 +1819,8 @@ async fn a_blind_transfer_reaches_the_peer_and_releases_the_original_call() {
             bye_status: None,
             early_media: false,
             cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
         },
     ));
 
@@ -1824,6 +1915,8 @@ async fn the_attended_transfer_names_the_consultation() {
             bye_status: None,
             early_media: false,
             cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
         },
     ));
 
@@ -1933,6 +2026,202 @@ async fn the_attended_transfer_names_the_consultation() {
     );
 }
 
+/// The transfer can be completed while the target is **still ringing**.
+///
+/// The user hears the target ring, says "complete the transfer", and
+/// the **server** completes it when the target answers — the softphone
+/// does not have to wait for the answer.
+///
+/// The peer holds the consultation in the early state, so the window
+/// is there to be used: the `180 Ringing` goes out, the client acts on
+/// it, and the `200 OK` comes after the REFER has been sent.
+#[tokio::test]
+async fn the_refer_goes_out_while_the_consultation_is_still_ringing() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+            transfer: Some(TransferScript::Answered),
+            public_address: None,
+            bye_status: None,
+            early_media: false,
+            cancel_the_call: false,
+            // The peer holds every call in the early state for a
+            // second: that is the window the transfer is completed in.
+            ring_for: Some(1000),
+            ring_delay: None,
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-transfer-ringing".to_string();
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut seen = Vec::new();
+    let source_call_id = stack
+        .calls
+        .place_call(&account.id, "100")
+        .expect("the original call was placed");
+    let answered = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallAnswered,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(answered.is_some(), "the original call was never answered");
+
+    // The consultation: the peer rings it and **holds** it there.
+    let consultation_call_id = stack
+        .calls
+        .place_call(&account.id, "200")
+        .expect("the consultation was placed");
+    let ringing = wait_for_call(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::OutgoingCallRinging,
+        &consultation_call_id,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(ringing.is_some(), "the consultation never rang");
+
+    // The consultation is **not** answered: the target has not picked
+    // up yet. This is the whole point of the feature.
+    assert!(
+        !seen
+            .iter()
+            .any(|event| event.call_id == consultation_call_id
+                && event.event_type == CallEventType::CallAnswered),
+        "the consultation was answered before the transfer was completed"
+    );
+
+    // The user completes the transfer now.
+    stack
+        .calls
+        .transfer_attended(&account.id, &source_call_id, &consultation_call_id)
+        .expect("the transfer did not start");
+
+    // The peer saw the REFER, and it names the consultation — with the
+    // tag the `180 Ringing` carried, which is what lets the server
+    // find the dialog it is to take over.
+    let refer = wait_for_refer(&observations).await;
+    let replaces = header_value(&refer, "Replaces").expect("the REFER had no Replaces header");
+    assert!(
+        replaces.contains(&consultation_call_id),
+        "the Replaces does not name the consultation's Call-ID: {replaces}"
+    );
+    assert!(
+        replaces.contains("to-tag=peer-tag"),
+        "the Replaces does not carry the dialog's to-tag: {replaces}"
+    );
+
+    // And the transfer goes on: the server reports the progress over
+    // the NOTIFY (RFC 3515 §3.4), and the original leg is released
+    // when it says the new leg is answered.
+    let progress =
+        wait_for_progress(&mut seen, &mut stack.calls, 200, Duration::from_secs(5)).await;
+    let progress = progress.expect("the transfer progress was never reported");
+    assert_eq!(
+        progress.transfer_progress,
+        Some(qsoftphone_core::sip::refer::TransferProgress::Answered),
+        "the transfer did not reach the answered state"
+    );
+}
+
+/// A REFER that points at a call the server has not named is refused.
+///
+/// The `Replaces` names the dialog by its Call-ID and its two tags
+/// (RFC 3891 §3.1), and the peer's tag arrives with the `180
+/// Ringing`. A `Replaces` without it names no dialog, and the server
+/// answers "no route to target" — the fault M6.3 was about.
+#[tokio::test]
+async fn a_refer_to_a_call_that_has_not_rung_is_refused() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+            transfer: Some(TransferScript::Answered),
+            public_address: None,
+            bye_status: None,
+            early_media: false,
+            cancel_the_call: false,
+            ring_for: None,
+            // The peer rings late, so the consultation really has not
+            // been named when the transfer is attempted.
+            ring_delay: Some(800),
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-transfer-unnamed".to_string();
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut seen = Vec::new();
+    let source_call_id = stack
+        .calls
+        .place_call(&account.id, "100")
+        .expect("the original call was placed");
+    let answered = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallAnswered,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(answered.is_some(), "the original call was never answered");
+
+    // A consultation that has been placed but has not rung: the server
+    // has not named it, so there is no dialog to point at.
+    let consultation_call_id = stack
+        .calls
+        .place_call(&account.id, "200")
+        .expect("the consultation was placed");
+
+    let error = stack
+        .calls
+        .transfer_attended(&account.id, &source_call_id, &consultation_call_id)
+        .expect_err("the transfer was started for a call that has not rung");
+    assert_eq!(
+        error,
+        qsoftphone_sip::CallError::ConsultationNotNamed,
+        "the wrong reason was given: {error}"
+    );
+
+    // And nothing went out on the wire.
+    assert!(
+        !observations
+            .lock()
+            .expect("observations lock")
+            .saw_request("REFER"),
+        "the REFER went out anyway"
+    );
+}
+
 /// The DTMF digits the peer received, in order.
 ///
 /// The feature code is typed one digit at a time, and the digits come
@@ -1986,6 +2275,8 @@ async fn a_feature_code_transfer_is_typed_as_dtmf() {
             bye_status: None,
             early_media: false,
             cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
         },
     ));
 
@@ -2054,6 +2345,8 @@ async fn a_transfer_that_cannot_route_leaves_the_original_call_up() {
             bye_status: None,
             early_media: false,
             cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
         },
     ));
 
@@ -2138,6 +2431,8 @@ async fn a_call_can_be_held() {
             bye_status: None,
             early_media: false,
             cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
         },
     ));
 
@@ -2269,6 +2564,8 @@ async fn a_ringing_call_can_be_redirected() {
             bye_status: None,
             early_media: false,
             cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
         },
     ));
 
@@ -2354,6 +2651,8 @@ async fn a_ringing_without_media_says_that_there_is_none() {
             bye_status: None,
             early_media: false,
             cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
         },
     ));
 
@@ -2410,6 +2709,8 @@ async fn a_ringing_with_media_says_that_there_is_some() {
             bye_status: None,
             early_media: true,
             cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
         },
     ));
 
@@ -2467,6 +2768,8 @@ async fn a_call_the_peer_cancels_ends() {
             bye_status: None,
             early_media: false,
             cancel_the_call: true,
+            ring_for: None,
+            ring_delay: None,
         },
     ));
 
