@@ -502,6 +502,15 @@ struct PeerOptions {
     ///
     /// `None` — the ordinary case — is no wait at all.
     ring_delay: Option<u64>,
+    /// The state the peer reports for a watched extension.
+    ///
+    /// A Busy Lamp Field subscription: the peer answers the `SUBSCRIBE`
+    /// and then sends a `NOTIFY` that says the extension is in this
+    /// state — `confirmed`, `terminated`, `trying`.
+    ///
+    /// `None` — the ordinary case — is a server that does not serve the
+    /// event package at all, and answers `489 Bad Event`.
+    blf_state: Option<&'static str>,
 }
 
 /// A registrar and call agent on one socket.
@@ -587,6 +596,33 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
                     .send_to(message.as_bytes(), from)
                     .await
                     .expect("REGISTER reply");
+            }
+            "SUBSCRIBE" => {
+                // The Busy Lamp Field. The client is watching an
+                // extension, and the server answers with the state.
+                let Some(state) = options.blf_state else {
+                    // A server that does not serve the event package.
+                    let message = response(&text, "489 Bad Event", &[], "");
+                    socket
+                        .send_to(message.as_bytes(), from)
+                        .await
+                        .expect("SUBSCRIBE reply");
+                    continue;
+                };
+
+                let accepted = subscribe_accepted(&text);
+                socket
+                    .send_to(accepted.as_bytes(), from)
+                    .await
+                    .expect("SUBSCRIBE reply");
+
+                // The state comes on its own NOTIFY, right after the
+                // answer — which is what a server does.
+                let notify = blf_notify(&text, peer_addr, state);
+                socket
+                    .send_to(notify.as_bytes(), from)
+                    .await
+                    .expect("peer NOTIFY");
             }
             "INVITE" => {
                 // A **re-INVITE** is a hold or an unhold: the dialog is
@@ -859,11 +895,231 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
     }
 }
 
+/// The `202 Accepted` that says a subscription is there.
+///
+/// RFC 6665 §4.1: the answer forms the dialog, so it carries a To tag
+/// — and the `NOTIFY`s come back on that dialog.
+fn subscribe_accepted(request: &str) -> String {
+    let mut out = String::from("SIP/2.0 202 Accepted\r\n");
+    for name in ["Via", "From", "To", "Call-ID", "CSeq"] {
+        if let Some(value) = header_value(request, name) {
+            let value = if name == "To" && !value.contains("tag=") {
+                format!("{value};tag={PEER_TAG}")
+            } else {
+                value
+            };
+            out.push_str(&format!("{name}: {value}\r\n"));
+        }
+    }
+    out.push_str("Expires: 3600\r\n");
+    out.push_str("Content-Length: 0\r\n\r\n");
+    out
+}
+
+/// The `NOTIFY` that carries the state of a watched extension.
+///
+/// RFC 3261 §8.1.3.3: the request's `To` carries the **recipient's**
+/// tag and its `From` the sender's, so the two ends of the dialog hold
+/// the same two tags the other way round. The body is the
+/// `dialog-info+xml` document of RFC 3903.
+fn blf_notify(request: &str, peer_addr: std::net::SocketAddr, state: &str) -> String {
+    let call_id = header_value(request, "Call-ID").unwrap_or_default();
+    let client_from = header_value(request, "From").unwrap_or_default();
+    let client_tag = tag_of(&client_from).unwrap_or_default();
+    let client_uri = uri_of(&client_from);
+    let peer_uri = uri_of(&header_value(request, "To").unwrap_or_default());
+
+    let body = format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n",
+            "<dialog-info xmlns=\"urn:ietf:params:xml:ns:dialog-info\" version=\"0\" ",
+            "state=\"full\" entity=\"{peer_uri}\">\r\n",
+            "  <dialog id=\"peer-dialog-1\" state=\"{state}\">\r\n",
+            "    <local><identity display=\"Peer\"><uri>{peer_uri}</uri></identity></local>\r\n",
+            "    <remote><identity display=\"Client\"><uri>{client_uri}</uri></identity></remote>\r\n",
+            "  </dialog>\r\n",
+            "</dialog-info>\r\n"
+        ),
+        peer_uri = peer_uri,
+        state = state,
+        client_uri = client_uri,
+    );
+
+    format!(
+        concat!(
+            "NOTIFY {client_uri} SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP {addr};branch=z9hG4bK-peer-notify\r\n",
+            "Max-Forwards: 70\r\n",
+            "From: {peer_uri};tag={PEER_TAG}\r\n",
+            "To: {client_uri};tag={client_tag}\r\n",
+            "Call-ID: {call_id}\r\n",
+            "CSeq: 1 NOTIFY\r\n",
+            "Event: dialog-info+simulimit\r\n",
+            "Subscription-State: active;expires=3600\r\n",
+            "Content-Type: application/dialog-info+xml\r\n",
+            "Content-Length: {length}\r\n",
+            "\r\n",
+            "{body}"
+        ),
+        client_uri = client_uri,
+        addr = peer_addr,
+        peer_uri = peer_uri,
+        PEER_TAG = PEER_TAG,
+        client_tag = client_tag,
+        call_id = call_id,
+        length = body.len(),
+        body = body,
+    )
+}
+
+/// The Busy Lamp Field says whether an extension is on a call.
+///
+/// The client subscribes to `dialog-info+simulimit`, the server answers
+/// with `202 Accepted` and then sends a `NOTIFY` carrying the RFC 3903
+/// document. The lamp says what the document says.
+#[tokio::test]
+async fn the_busy_lamp_field_says_whether_the_extension_is_on_a_call() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+            transfer: None,
+            public_address: None,
+            bye_status: None,
+            early_media: false,
+            cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
+            // The extension is on a call.
+            blf_state: Some("confirmed"),
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-blf".to_string();
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    stack
+        .blf
+        .watch(&account.id, "105", &format!("sip:105@{peer_addr}"))
+        .expect("the extension was not watched");
+
+    // The lamp says what the NOTIFY said.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut lamp = None;
+    while std::time::Instant::now() < deadline {
+        lamp = stack.blf.lamps(&account.id).into_iter().next();
+        if let Some(lamp) = &lamp {
+            if lamp.state != qsoftphone_core::sip::blf::BlfState::Unavailable {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let lamp = lamp.expect("the lamp never appeared");
+    assert_eq!(lamp.extension, "105");
+    assert_eq!(
+        lamp.state,
+        qsoftphone_core::sip::blf::BlfState::Busy,
+        "the extension is on a call, so the lamp says busy"
+    );
+
+    // And the subscription went out the way it should.
+    let subscribe = observations
+        .lock()
+        .expect("observations lock")
+        .request("SUBSCRIBE")
+        .expect("the server never saw the SUBSCRIBE");
+    assert!(
+        header_value(&subscribe, "Event").as_deref() == Some("dialog-info+simulimit"),
+        "the subscription asks for the wrong event package:\n{subscribe}"
+    );
+    assert!(
+        header_value(&subscribe, "Accept").as_deref() == Some("application/dialog-info+xml"),
+        "the subscription does not say what it will take:\n{subscribe}"
+    );
+    assert!(
+        header_value(&subscribe, "Expires").is_some(),
+        "the subscription has no lifetime:\n{subscribe}"
+    );
+}
+
+/// A lamp that the server will not light stays dark.
+///
+/// A server that does not serve the event package answers `489 Bad
+/// Event`. The lamp must say "unknown" — not "free": a lamp that says
+/// "free" when the truth is "we stopped listening" is a lamp that
+/// lies.
+#[tokio::test]
+async fn a_server_that_does_not_serve_the_package_leaves_the_lamp_dark() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+            transfer: None,
+            public_address: None,
+            bye_status: None,
+            early_media: false,
+            cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
+            // The server does not serve the package.
+            blf_state: None,
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-blf-refused".to_string();
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    stack
+        .blf
+        .watch(&account.id, "105", &format!("sip:105@{peer_addr}"))
+        .expect("the extension was not watched");
+
+    // Give the refusal time to arrive.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let lamps = stack.blf.lamps(&account.id);
+    assert_eq!(lamps.len(), 1, "the lamp is not there at all");
+    assert_eq!(
+        lamps[0].state,
+        qsoftphone_core::sip::blf::BlfState::Unavailable,
+        "a lamp that was never told anything must say unknown, not free"
+    );
+}
+
 /// The app's SIP stack: a registrar, a call manager and the bus
 /// between them.
 struct Stack {
     registrations: RegistrationManager,
     calls: CallManager,
+    blf: qsoftphone_sip::BlfManager,
 }
 
 fn stack(handle: tokio::runtime::Handle) -> Stack {
@@ -871,7 +1127,8 @@ fn stack(handle: tokio::runtime::Handle) -> Stack {
     let (bus, receiver) = CallBus::new();
     Stack {
         registrations: RegistrationManager::new(handle.clone(), sessions.clone(), bus.clone()),
-        calls: CallManager::new(handle, sessions, bus, receiver),
+        calls: CallManager::new(handle.clone(), sessions.clone(), bus, receiver),
+        blf: qsoftphone_sip::BlfManager::new(sessions, handle),
     }
 }
 
@@ -935,6 +1192,7 @@ async fn an_outgoing_call_connects_and_hangs_up() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -1055,6 +1313,7 @@ async fn the_call_goes_out_with_the_accounts_own_headers() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -1141,6 +1400,7 @@ async fn a_header_with_a_broken_name_does_not_go_out() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -1216,6 +1476,7 @@ async fn an_account_with_no_headers_sends_none() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -1283,6 +1544,7 @@ async fn an_incoming_call_rings_before_the_user_answers() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -1408,6 +1670,7 @@ async fn a_ringing_incoming_call_is_declined_when_it_is_hung_up() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -1476,6 +1739,7 @@ async fn a_dtmf_digit_arrives_as_an_event() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -1533,6 +1797,7 @@ async fn a_dtmf_digit_is_sent_as_an_info_request() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -1628,6 +1893,7 @@ fn a_call_placed_off_the_runtime_does_not_take_the_app_down() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -1700,6 +1966,7 @@ async fn a_challenged_invite_is_answered_with_the_account_digest() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -1881,6 +2148,7 @@ async fn an_in_dialog_request_carries_the_public_contact() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -1973,6 +2241,7 @@ async fn a_bye_the_peer_does_not_know_still_ends_the_call() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -2054,6 +2323,7 @@ async fn a_blind_transfer_reaches_the_peer_and_releases_the_original_call() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -2150,6 +2420,7 @@ async fn the_attended_transfer_names_the_consultation() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -2290,6 +2561,7 @@ async fn the_refer_goes_out_while_the_consultation_is_still_ringing() {
             // second: that is the window the transfer is completed in.
             ring_for: Some(1000),
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -2402,6 +2674,7 @@ async fn a_refer_to_a_call_that_has_not_rung_is_refused() {
             // The peer rings late, so the consultation really has not
             // been named when the transfer is attempted.
             ring_delay: Some(800),
+            blf_state: None,
         },
     ));
 
@@ -2510,6 +2783,7 @@ async fn a_feature_code_transfer_is_typed_as_dtmf() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -2580,6 +2854,7 @@ async fn a_transfer_that_cannot_route_leaves_the_original_call_up() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -2666,6 +2941,7 @@ async fn a_call_can_be_held() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -2799,6 +3075,7 @@ async fn a_ringing_call_can_be_redirected() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -2886,6 +3163,7 @@ async fn a_ringing_without_media_says_that_there_is_none() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -2944,6 +3222,7 @@ async fn a_ringing_with_media_says_that_there_is_some() {
             cancel_the_call: false,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 
@@ -3003,6 +3282,7 @@ async fn a_call_the_peer_cancels_ends() {
             cancel_the_call: true,
             ring_for: None,
             ring_delay: None,
+            blf_state: None,
         },
     ));
 

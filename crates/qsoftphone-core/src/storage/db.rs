@@ -67,6 +67,7 @@ impl Db {
                     dialed_number_header TEXT    NOT NULL DEFAULT '',
                     capture_headers      TEXT    NOT NULL DEFAULT '[]',
                     custom_headers       TEXT    NOT NULL DEFAULT '[]',
+                    blf_extensions       TEXT    NOT NULL DEFAULT '[]',
                     crm_preset_id        TEXT    NOT NULL DEFAULT '',
                     ringtone_file        TEXT    NOT NULL DEFAULT '',
                     created_at           INTEGER NOT NULL DEFAULT 0,
@@ -131,6 +132,9 @@ impl Db {
             // A list of name/value pairs, stored as JSON — the same way
             // the capture allowlist is.
             ("accounts", "custom_headers", "TEXT NOT NULL DEFAULT '[]'"),
+            // The extensions whose Busy Lamp Field an account watches.
+            // A list of extension numbers, stored as JSON.
+            ("accounts", "blf_extensions", "TEXT NOT NULL DEFAULT '[]'"),
         ];
         self.with_conn(|conn| {
             for (table, column, ty) in additions {

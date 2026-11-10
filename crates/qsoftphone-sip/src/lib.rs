@@ -24,6 +24,7 @@
 //! The behavioural reference for all of it is the C++ implementation
 //! in `../qsoftphone`.
 
+pub mod blf;
 pub mod call;
 pub mod digest;
 pub mod endpoint;
@@ -35,6 +36,7 @@ pub mod session;
 pub mod state;
 pub mod transfer;
 
+pub use blf::{BlfError, BlfLamp, BlfManager};
 pub use call::{CallBus, CallError, CallManager, CallUpdate};
 pub use digest::DigestInterop;
 pub use endpoint::{USER_AGENT, build_endpoint, split_host_port};
@@ -44,3 +46,9 @@ pub use sdp::{answer_sdp, choose_format, dtmf_relay_body, offer_sdp, offered_for
 pub use session::{AccountSession, SessionRegistry};
 pub use state::{RegistrationEvent, RegistrationState};
 pub use transfer::{TransferUpdate, consultation_of, refer_progress};
+
+// The two types an application needs to build a session of its own.
+// They are re-exported so the app does not have to depend on the SIP
+// stack's own dependency to make one.
+pub use rsipstack::platform::CancellationToken;
+pub use rsipstack::sip::Transport;

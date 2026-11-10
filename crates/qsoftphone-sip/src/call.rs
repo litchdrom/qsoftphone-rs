@@ -1277,12 +1277,21 @@ fn terminated_code(reason: &TerminatedReason) -> (u16, String) {
 /// The host is the account's domain when it has one, and the
 /// registrar's host otherwise.
 pub fn aor_of(account: &Account) -> String {
+    aor_for(&account.user, account)
+}
+
+/// The address of record of **another** extension on the same server.
+///
+/// The Busy Lamp Field watches other people's extensions, and they are
+/// on the server this account is registered with: the same domain, or
+/// the same registrar's host.
+pub fn aor_for(user: &str, account: &Account) -> String {
     let host = if account.domain.trim().is_empty() {
         split_host_port(&account.registrar).0
     } else {
         account.domain.trim().to_string()
     };
-    format!("sip:{}@{host}", account.user)
+    format!("sip:{}@{host}", user.trim())
 }
 
 /// The extra headers this account puts on its calls.
@@ -1369,7 +1378,7 @@ pub fn credential_of(account: &Account) -> Option<Credential> {
 /// The public address wins when the registrar reported one — it is the
 /// address the peer has to use to reach us. Otherwise the local
 /// address is used, which is right when there is no NAT.
-fn contact_uri(account: &Account, session: &AccountSession) -> Uri {
+pub(crate) fn contact_uri(account: &Account, session: &AccountSession) -> Uri {
     let local = session
         .endpoint
         .get_addrs()

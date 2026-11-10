@@ -27,8 +27,8 @@ impl<'a> AccountStore<'a> {
             let mut stmt = conn.prepare(
                 "SELECT id, label, registrar, user, password, transport, domain,
                         outbound_proxy, caller_id_header, dialed_number_header,
-                        capture_headers, custom_headers, crm_preset_id, ringtone_file,
-                        created_at, updated_at
+                        capture_headers, custom_headers, blf_extensions, crm_preset_id,
+                        ringtone_file, created_at, updated_at
                  FROM accounts
                  ORDER BY label COLLATE NOCASE, id",
             )?;
@@ -47,8 +47,8 @@ impl<'a> AccountStore<'a> {
             let mut stmt = conn.prepare(
                 "SELECT id, label, registrar, user, password, transport, domain,
                         outbound_proxy, caller_id_header, dialed_number_header,
-                        capture_headers, custom_headers, crm_preset_id, ringtone_file,
-                        created_at, updated_at
+                        capture_headers, custom_headers, blf_extensions, crm_preset_id,
+                        ringtone_file, created_at, updated_at
                  FROM accounts WHERE id = ?1",
             )?;
             let mut rows = stmt.query(params![id])?;
@@ -75,15 +75,16 @@ impl<'a> AccountStore<'a> {
 
         let capture = serde_json::to_string(&account.capture_headers)?;
         let custom = serde_json::to_string(&account.custom_headers)?;
+        let blf = serde_json::to_string(&account.blf_extensions)?;
 
         self.db.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO accounts
                     (id, label, registrar, user, password, transport, domain,
                      outbound_proxy, caller_id_header, dialed_number_header,
-                     capture_headers, custom_headers, crm_preset_id, ringtone_file,
-                     created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                     capture_headers, custom_headers, blf_extensions, crm_preset_id,
+                     ringtone_file, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                  ON CONFLICT(id) DO UPDATE SET
                     label                = excluded.label,
                     registrar            = excluded.registrar,
@@ -96,6 +97,7 @@ impl<'a> AccountStore<'a> {
                     dialed_number_header = excluded.dialed_number_header,
                     capture_headers      = excluded.capture_headers,
                     custom_headers       = excluded.custom_headers,
+                    blf_extensions       = excluded.blf_extensions,
                     crm_preset_id        = excluded.crm_preset_id,
                     ringtone_file        = excluded.ringtone_file,
                     updated_at           = excluded.updated_at",
@@ -112,6 +114,7 @@ impl<'a> AccountStore<'a> {
                     account.dialed_number_header,
                     capture,
                     custom,
+                    blf,
                     account.crm_preset_id,
                     account.ringtone_file,
                     account.created_at,
@@ -171,6 +174,19 @@ fn row_to_account(row: &Row<'_>) -> rusqlite::Result<Account> {
             Vec::new()
         }
     };
+    // The extensions whose lamps this account watches.
+    let blf: String = row.get(12)?;
+    let blf_extensions = match serde_json::from_str::<Vec<String>>(&blf) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                account_id = %id,
+                error = %e,
+                "account has malformed blf_extensions; treating as empty"
+            );
+            Vec::new()
+        }
+    };
     Ok(Account {
         id,
         label: row.get(1)?,
@@ -184,10 +200,11 @@ fn row_to_account(row: &Row<'_>) -> rusqlite::Result<Account> {
         dialed_number_header: row.get(9)?,
         capture_headers,
         custom_headers,
-        crm_preset_id: row.get(12)?,
-        ringtone_file: row.get(13)?,
-        created_at: row.get(14)?,
-        updated_at: row.get(15)?,
+        blf_extensions,
+        crm_preset_id: row.get(13)?,
+        ringtone_file: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
     })
 }
 
@@ -309,6 +326,31 @@ mod tests {
 
         let fetched = store.get(&account.id).unwrap().unwrap();
         assert!(fetched.custom_headers.is_empty());
+    }
+
+    #[test]
+    fn the_watched_extensions_survive_a_round_trip() {
+        let db = Db::open_in_memory().unwrap();
+        let store = AccountStore::new(&db);
+
+        let mut account = Account::new("Office", "example.com", "104", "", "udp");
+        account.blf_extensions = vec!["105".to_string(), "106".to_string()];
+        store.upsert(&account).unwrap();
+
+        let fetched = store.get(&account.id).unwrap().unwrap();
+        assert_eq!(fetched.blf_extensions, vec!["105", "106"]);
+    }
+
+    #[test]
+    fn an_account_with_no_watched_extensions_watches_nothing() {
+        let db = Db::open_in_memory().unwrap();
+        let store = AccountStore::new(&db);
+
+        let account = Account::new("Office", "example.com", "104", "", "udp");
+        store.upsert(&account).unwrap();
+
+        let fetched = store.get(&account.id).unwrap().unwrap();
+        assert!(fetched.blf_extensions.is_empty());
     }
 
     #[test]

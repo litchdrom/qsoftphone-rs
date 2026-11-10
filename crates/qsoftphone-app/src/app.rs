@@ -50,6 +50,9 @@ pub struct QSoftphoneApp {
     registrations: RegistrationManager,
     /// The calls, and the state each one is in.
     calls: CallManager,
+    /// The Busy Lamp Field: the lamps that say whether the extensions
+    /// this account watches are free, busy or ringing.
+    blf: qsoftphone_sip::BlfManager,
     /// The history, and the rows it last answered with.
     history: HistoryService,
     /// The history rows the UI shows.
@@ -420,6 +423,11 @@ struct Draft {
     /// with no name is not a header and is dropped when the account is
     /// saved.
     custom_headers: Vec<(String, String)>,
+    /// The extensions whose Busy Lamp Field this account watches.
+    ///
+    /// A comma-separated list of extension numbers, the way a user
+    /// writes them: `105, 106, 107`.
+    blf_extensions: String,
 }
 
 impl Draft {
@@ -441,6 +449,7 @@ impl Draft {
         account.dialed_number_header = self.dialed_number_header.trim().to_string();
         account.ringtone_file = self.ringtone_file.trim().to_string();
         account.custom_headers = Self::clean_headers(&self.custom_headers);
+        account.blf_extensions = Self::split_extensions(&self.blf_extensions);
         account
     }
 
@@ -458,7 +467,27 @@ impl Draft {
             dialed_number_header: account.dialed_number_header.clone(),
             ringtone_file: account.ringtone_file.clone(),
             custom_headers: account.custom_headers.clone(),
+            blf_extensions: account.blf_extensions.join(", "),
         }
+    }
+
+    /// The extensions out of a comma-separated list.
+    ///
+    /// A list a user typed may have spaces, empty entries and a trailing
+    /// comma. None of them is an extension, and a duplicate is one
+    /// extension watched once.
+    fn split_extensions(text: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for part in text.split(',') {
+            let extension = part.trim();
+            if extension.is_empty() {
+                continue;
+            }
+            if !out.iter().any(|seen| seen == extension) {
+                out.push(extension.to_string());
+            }
+        }
+        out
     }
 
     /// The headers that are worth keeping.
@@ -508,6 +537,7 @@ impl QSoftphoneApp {
         // The media settings are shared with the registrar: the codec
         // the user picks has to reach the offer that is built.
         calls.set_media_config(media_config_of(&config));
+        let blf = qsoftphone_sip::BlfManager::new(sessions.clone(), runtime.clone());
         let (media_updates_tx, media_updates) = std::sync::mpsc::channel();
         let mut app = Self {
             paths,
@@ -516,6 +546,7 @@ impl QSoftphoneApp {
             runtime: runtime.clone(),
             registrations: RegistrationManager::new(runtime.clone(), sessions.clone(), bus.clone()),
             calls,
+            blf,
             history,
             history_rows: Vec::new(),
             history_query: String::new(),
@@ -569,7 +600,60 @@ impl QSoftphoneApp {
         for event in self.registrations.drain() {
             let state = event.state.clone();
             self.status = format!("{} — {}", event.user, state.summary());
-            self.states.insert(event.account_id, state);
+            self.states.insert(event.account_id.clone(), state.clone());
+
+            // The Busy Lamp Field. An account that is registered can
+            // watch its extensions — a subscription needs a session to
+            // go out on, and there is no session until the account is
+            // registered.
+            if state.is_registered() {
+                self.sync_blf(&event.account_id);
+            } else if !matches!(state, RegistrationState::Registering) {
+                // The account is gone: the lamps go with it.
+                self.unwatch_blf(&event.account_id);
+            }
+        }
+    }
+
+    /// Watch the extensions the account says to watch, and stop
+    /// watching the ones it no longer does.
+    ///
+    /// The two lists are compared rather than the whole set replaced:
+    /// a subscription that is still there must not be torn down and
+    /// built again every time the account is saved, or the lamp would
+    /// go dark for a moment every time.
+    fn sync_blf(&mut self, account_id: &str) {
+        let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() else {
+            return;
+        };
+        let wanted = account.blf_extensions.clone();
+        let current: Vec<String> = self
+            .blf
+            .lamps(account_id)
+            .into_iter()
+            .map(|lamp| lamp.extension)
+            .collect();
+
+        for extension in current.iter() {
+            if !wanted.contains(extension) {
+                self.blf.unwatch(account_id, extension);
+            }
+        }
+        for extension in wanted.iter() {
+            if current.contains(extension) {
+                continue;
+            }
+            let aor = qsoftphone_sip::call::aor_for(extension, &account);
+            if let Err(e) = self.blf.watch(account_id, extension, &aor) {
+                self.status = format!("Could not watch extension {extension}: {e}");
+            }
+        }
+    }
+
+    /// Stop watching every extension of an account.
+    fn unwatch_blf(&mut self, account_id: &str) {
+        for lamp in self.blf.lamps(account_id) {
+            self.blf.unwatch(account_id, &lamp.extension);
         }
     }
 
@@ -1241,6 +1325,11 @@ impl QSoftphoneApp {
                 self.status = format!("Saved account {}.", saved.label);
                 self.reload();
                 self.load_selected();
+                // The lamps follow the account: an extension that was
+                // added is watched, and one that was taken out is not.
+                if self.registration_state(&stored.id).is_registered() {
+                    self.sync_blf(&stored.id);
+                }
             }
             Err(e) => self.status = format!("Could not save the account: {e}"),
         }
@@ -1263,7 +1352,12 @@ impl QSoftphoneApp {
             return;
         };
         self.registrations.stop(&account.id);
-        self.states.insert(account.id, RegistrationState::Idle);
+        let account_id = account.id.clone();
+        self.states
+            .insert(account_id.clone(), RegistrationState::Idle);
+        // The lamps go with the registration: there is no session to
+        // send a subscription on any more.
+        self.unwatch_blf(&account_id);
         self.status = format!("Unregistered {}.", account.label);
     }
 
@@ -2031,6 +2125,7 @@ impl QSoftphoneApp {
                 self.status = format!("Removed account {}.", account.label);
                 self.registrations.stop(&account.id);
                 self.states.remove(&account.id);
+                self.unwatch_blf(&account.id);
                 self.reload();
                 self.load_selected();
             }
@@ -2209,6 +2304,14 @@ impl QSoftphoneApp {
                         self.delete_selected();
                     }
                 });
+
+                // The Busy Lamp Field, **below the accounts**: the lamps
+                // of the extensions this account watches.
+                //
+                // They are here and not on the call page because they
+                // are not about a call — they are about the people, and
+                // they are worth looking at while nothing is happening.
+                self.draw_blf_panel(ui);
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -3410,6 +3513,19 @@ impl QSoftphoneApp {
             draft.custom_headers.push((String::new(), String::new()));
         }
 
+        // The extensions whose lamps this account watches.
+        ui.separator();
+        ui.label(
+            egui::RichText::new("WATCHED EXTENSIONS")
+                .strong()
+                .size(11.0),
+        );
+        ui.weak(
+            "The lamps in the left panel say whether these extensions are free, busy or \
+             ringing. They are on the same server as this account.",
+        );
+        ui.text_edit_singleline(&mut self.edit_account.blf_extensions);
+
         ui.horizontal(|ui| {
             if ui.button("Save").clicked() {
                 self.save_selected();
@@ -3466,6 +3582,47 @@ impl QSoftphoneApp {
             ui.monospace(format!("data    {}", self.paths.data_dir().display()));
             ui.monospace(format!("logs    {}", self.paths.log_dir().display()));
         });
+    }
+
+    /// The Busy Lamp Field: the lamps of the extensions the selected
+    /// account watches.
+    ///
+    /// They are in the left panel, **below the accounts**: the lights
+    /// say whether the people are free, and they are worth looking at
+    /// while nothing is happening. A lamp that has never been told
+    /// anything is grey — a lamp that says "free" when the truth is
+    /// "we do not know" is a lamp that lies.
+    fn draw_blf_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(account) = self.selected_account().cloned() else {
+            return;
+        };
+
+        let lamps = self.blf.lamps(&account.id);
+        let watched = account.blf_extensions.len();
+
+        ui.separator();
+        ui.label(egui::RichText::new("EXTENSIONS").strong().size(11.0));
+
+        if lamps.is_empty() {
+            if watched == 0 {
+                ui.weak("No extensions are being watched.");
+            } else {
+                ui.weak("Starting…");
+            }
+            return;
+        }
+
+        for lamp in lamps {
+            ui.horizontal(|ui| {
+                let (r, g, b) = lamp.state.colour();
+                let colour = egui::Color32::from_rgb(r, g, b);
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 5.0, colour);
+                ui.label(&lamp.extension);
+                ui.weak(lamp.state.label());
+            });
+        }
     }
 
     /// The settings page: the codecs, the sound card and the test
@@ -4548,6 +4705,19 @@ mod tests {
 
     /// An app with one account, over a given database.
     fn build_app_with(db: Db, handle: tokio::runtime::Handle) -> (QSoftphoneApp, CallBus) {
+        let (app, bus, _) = build_app_with_sessions(db, handle);
+        (app, bus)
+    }
+
+    /// An app with one account, and the sessions it watches.
+    ///
+    /// The Busy Lamp Field lives on a session — a subscription needs an
+    /// endpoint to go out on — so a test that wants a lamp has to put a
+    /// session in the registry.
+    fn build_app_with_sessions(
+        db: Db,
+        handle: tokio::runtime::Handle,
+    ) -> (QSoftphoneApp, CallBus, SessionRegistry) {
         let paths = AppPaths::under(std::env::temp_dir().join("qsoftphone-app-ui-test"));
         let sessions = SessionRegistry::new();
         let (bus, receiver) = CallBus::new();
@@ -4557,7 +4727,7 @@ mod tests {
             db,
             AppConfig::default(),
             handle,
-            sessions,
+            sessions.clone(),
             bus.clone(),
             receiver,
         );
@@ -4575,7 +4745,7 @@ mod tests {
         app.selected = Some(0);
         app.load_selected();
 
-        (app, bus)
+        (app, bus, sessions)
     }
 
     /// An incoming call, as the SIP layer would report it.
@@ -4718,6 +4888,102 @@ mod tests {
         app.view = View::Account;
         let output = frame(&mut app, &ctx);
         assert!(!output.shapes.is_empty(), "the frame drew nothing");
+    }
+
+    #[tokio::test]
+    async fn the_lamps_are_in_the_left_panel_below_the_accounts() {
+        // The Busy Lamp Field: the lights that say whether the people
+        // are free. They are in the left panel, under the accounts.
+        let (mut app, _bus, sessions) = build_app_with_sessions(
+            Db::open_in_memory().expect("db"),
+            tokio::runtime::Handle::current(),
+        );
+        let ctx = egui::Context::default();
+
+        // A session, so the lamp has somewhere to live.
+        let token = qsoftphone_sip::CancellationToken::new();
+        let endpoint =
+            qsoftphone_sip::build_endpoint(qsoftphone_sip::Transport::Udp, 0, token, None)
+                .await
+                .expect("endpoint");
+        let mut account = Account::new("Office", "sip.example.com:5060", "104", "pw", "udp");
+        account.id = "acct-ui-1".to_string();
+        let session = qsoftphone_sip::AccountSession::new(
+            account,
+            endpoint,
+            qsoftphone_sip::PublicAddress::default(),
+            sessions.media_config_handle(),
+        );
+        sessions.insert("acct-ui-1", session);
+
+        app.blf
+            .watch("acct-ui-1", "105", "sip:105@sip.example.com")
+            .expect("the extension was not watched");
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("EXTENSIONS"),
+            "the panel has no lamp section:\n{text}"
+        );
+        assert!(
+            text.contains("105"),
+            "the lamp is not in the panel:\n{text}"
+        );
+        assert!(
+            text.contains("unknown"),
+            "the lamp does not say what it knows:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_account_page_says_when_no_extension_is_watched() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("No extensions are being watched"),
+            "the panel does not say that there is nothing to watch:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_account_editor_takes_the_watched_extensions() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.accounts[0].blf_extensions = vec!["105".to_string(), "106".to_string()];
+        app.load_selected();
+        app.view = View::Account;
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("WATCHED EXTENSIONS"),
+            "the account page has no field for the watched extensions:\n{text}"
+        );
+        assert!(
+            text.contains("105, 106"),
+            "the watched extensions are not shown as they were set:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_watched_extensions_are_read_out_of_a_list() {
+        // A list a user typed may have spaces, empty entries and a
+        // trailing comma. None of them is an extension.
+        assert_eq!(
+            Draft::split_extensions("105, 106, 107"),
+            vec!["105", "106", "107"]
+        );
+        assert_eq!(Draft::split_extensions(" 105 , 106 ,"), vec!["105", "106"]);
+        assert!(Draft::split_extensions("").is_empty());
+        assert!(Draft::split_extensions(" , , ").is_empty());
+
+        // A duplicate is one extension watched once.
+        assert_eq!(Draft::split_extensions("105, 105"), vec!["105"]);
     }
 
     #[tokio::test]

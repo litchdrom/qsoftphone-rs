@@ -20,8 +20,10 @@ use rsipstack::transaction::endpoint::Endpoint;
 use rsipstack::transaction::transaction::TransactionEventSender;
 
 use qsoftphone_core::model::account::Account;
+use qsoftphone_core::sip::blf::{BlfState, DialogInfo};
 use qsoftphone_media::{MediaConfig, MediaSession};
 
+use crate::blf::{BlfLamp, BlfSubscription};
 use crate::inspector::PublicAddress;
 
 /// One account's SIP session.
@@ -82,6 +84,12 @@ pub struct AccountSession {
     /// section of the config file held the codec priorities for the
     /// whole application, not for one account.
     media_config: Arc<RwLock<MediaConfig>>,
+    /// The Busy Lamp Field subscriptions of this account, by extension.
+    ///
+    /// They live here because the `NOTIFY` that updates them arrives on
+    /// this session's endpoint, and it has to be matched to the
+    /// subscription it belongs to — by its Call-ID.
+    blf: Mutex<HashMap<String, BlfSubscription>>,
 }
 
 impl AccountSession {
@@ -105,6 +113,7 @@ impl AccountSession {
             targets: Mutex::new(HashMap::new()),
             ringing_calls: Mutex::new(HashMap::new()),
             media_config,
+            blf: Mutex::new(HashMap::new()),
         })
     }
 
@@ -260,6 +269,107 @@ impl AccountSession {
             .lock()
             .expect("consultations lock")
             .remove(call_id)
+    }
+
+    /// Remember a Busy Lamp Field subscription.
+    pub fn remember_blf(&self, subscription: BlfSubscription) {
+        self.blf
+            .lock()
+            .expect("blf lock")
+            .insert(subscription.extension.clone(), subscription);
+    }
+
+    /// Forget a subscription: the extension is not watched any more.
+    pub fn forget_blf(&self, extension: &str) {
+        self.blf.lock().expect("blf lock").remove(extension);
+    }
+
+    /// The lamps of this account.
+    ///
+    /// Sorted by extension, so the panel does not shuffle itself every
+    /// time it is drawn.
+    pub fn blf_lamps(&self) -> Vec<BlfLamp> {
+        let mut lamps: Vec<BlfLamp> = self
+            .blf
+            .lock()
+            .expect("blf lock")
+            .values()
+            .map(|subscription| subscription.lamp())
+            .collect();
+        lamps.sort_by(|a, b| a.extension.cmp(&b.extension));
+        lamps
+    }
+
+    /// The subscriptions of this account.
+    pub fn blf_subscriptions(&self) -> HashMap<String, BlfSubscription> {
+        self.blf.lock().expect("blf lock").clone()
+    }
+
+    /// The subscription a `NOTIFY` belongs to.
+    ///
+    /// The Call-ID is what the two have in common: the server sends
+    /// the `NOTIFY` on the dialog the SUBSCRIBE created.
+    pub fn blf_by_call_id(&self, call_id: &str) -> Option<BlfSubscription> {
+        self.blf
+            .lock()
+            .expect("blf lock")
+            .values()
+            .find(|subscription| subscription.call_id == call_id)
+            .cloned()
+    }
+
+    /// Apply a state that arrived for one of the subscriptions.
+    ///
+    /// What comes back is the **lamp's** state: the document is read,
+    /// the dialogs are kept, and what they add up to is the answer.
+    pub fn apply_blf(&self, call_id: &str, info: &DialogInfo) -> Option<BlfState> {
+        let mut subscriptions = self.blf.lock().expect("blf lock");
+        let subscription = subscriptions
+            .values_mut()
+            .find(|subscription| subscription.call_id == call_id)?;
+        Some(subscription.tracker.apply(info))
+    }
+
+    /// Remember the tag the server put on its `To`.
+    ///
+    /// The refresh is an in-dialog SUBSCRIBE, and an in-dialog request
+    /// carries the tags of the dialog it belongs to.
+    pub fn set_blf_to_tag(&self, call_id: &str, tag: &str) {
+        let mut subscriptions = self.blf.lock().expect("blf lock");
+        if let Some(subscription) = subscriptions
+            .values_mut()
+            .find(|subscription| subscription.call_id == call_id)
+        {
+            subscription.to_tag = tag.to_string();
+        }
+    }
+
+    /// Remember the CSeq of the last SUBSCRIBE that was sent.
+    pub fn set_blf_cseq(&self, call_id: &str, cseq: u32) {
+        let mut subscriptions = self.blf.lock().expect("blf lock");
+        if let Some(subscription) = subscriptions
+            .values_mut()
+            .find(|subscription| subscription.call_id == call_id)
+        {
+            subscription.cseq = cseq;
+        }
+    }
+
+    /// The Call-ID, the CSeq and the two tags of a subscription, for
+    /// the refresh.
+    pub fn blf_refresh_of(&self, extension: &str) -> Option<(String, u32, String, String)> {
+        self.blf
+            .lock()
+            .expect("blf lock")
+            .get(extension)
+            .map(|subscription| {
+                (
+                    subscription.call_id.clone(),
+                    subscription.cseq,
+                    subscription.from_tag.clone(),
+                    subscription.to_tag.clone(),
+                )
+            })
     }
 }
 

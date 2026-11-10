@@ -134,6 +134,7 @@ qsoftphone-rs/
     │   ├── lib.rs                 the session: socket, negotiation, threads
     │   └── rtp.rs                 the UDP socket and the packets on it
     ├── qsoftphone-sip/            the SIP layer: transport, registration, calls
+    │   ├── blf.rs                 the Busy Lamp Field: the subscriptions and the lamps
     │   ├── call.rs                placing, answering and ending calls
     │   ├── digest.rs              RFC 7616 interop with rsipstack
     │   ├── endpoint.rs            one endpoint per account, per transport
@@ -4167,6 +4168,165 @@ own `headers` field, which rsipstack has always had.
 
 ---
 
+## M6.7 — The Busy Lamp Field
+
+*"Blf implementation (asterisk pjsip mostly) left panel below accounts."*
+
+### What a BLF is
+
+A **Busy Lamp Field** is the little light on a desk that says whether a
+colleague is free, busy or on a call. It is not a softphone feature
+that was invented for this: PJPROJECT has had one for ever
+(`pjsua_blf`), and Asterisk serves it.
+
+On Asterisk it is built on **RFC 3903**. The watcher **subscribes** to
+`dialog-info+simulimit` for an address of record, and the server
+answers with a `dialog-info+xml` document that lists that address's
+dialogs:
+
+```xml
+<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" version="0"
+             state="full" entity="sip:105@193.178.169.164">
+  <dialog id="h6hhv876a3dsdjf" state="confirmed">
+    …
+  </dialog>
+</dialog-info>
+```
+
+Every time the state changes, the server sends another `NOTIFY` with
+the same document. `dialog-info+simulimit` is the package PJSUA's own
+BLF uses and the one Asterisk's `res_pjsip_pubsub` serves: it says what
+the **address of record** is doing.
+
+### The panel
+
+The lamps are in the **left panel, below the accounts** — where the
+request put them:
+
+```
+ACCOUNTS
+  Office      registered
+  Home        registered
+─────────────
+EXTENSIONS
+  ● 105   busy
+  ● 106   free
+  ● 107   ringing
+```
+
+The lamp is a coloured dot and a word. Green is free, amber is
+ringing, red is busy, and **grey is unknown**.
+
+That last one matters: a lamp that has never been told anything is
+**unknown**, not free. A lamp that says "free" when the truth is "we
+stopped listening" is a lamp that lies, and a softphone that shows a
+colleague as available when it cannot see them is worse than one that
+shows nothing.
+
+### Which extensions are watched
+
+Each account has its own list, on its own page:
+
+> **WATCHED EXTENSIONS** — 105, 106, 107
+
+They are on the server **that account is registered with** — the same
+domain, or the same registrar's host — because the same number on
+another server is a different person.
+
+An account watches nothing until it is told to, and it sends no
+subscription at all until it is **registered**: a subscription needs an
+endpoint to go out on, and there is no endpoint until the account is
+registered. The lamps follow the account — an extension that is added
+is watched, and one that is taken out is not — and they go when the
+account is unregistered.
+
+### rsipstack has no out-of-dialog SUBSCRIBE
+
+This is the part that had to be built. rsipstack 0.7.9 has
+`ClientSubscriptionDialog` and a `get_or_create_client_subscription`,
+but nothing creates one: there is no API that sends an out-of-dialog
+SUBSCRIBE.
+
+So the request is built here, out of the pieces the stack does have:
+
+* `EndpointInner::make_request` builds it — it knows the Via, the
+  branch and the User-Agent;
+* `Transaction::new_client` carries it, and the `202 Accepted` is
+  read from the transaction;
+* `Event`, `Accept`, `Expires` and the `Contact` are added on top.
+
+Two details that are easy to get wrong and that the tests pin down:
+
+* **The request is built _once_.** The Call-ID it carries is the one
+  the subscription is registered under, and the `NOTIFY` comes back on
+  it. A request built twice carries two Call-IDs, and the lamp never
+  hears from the server.
+* **The subscription is registered _before_ the SUBSCRIBE goes out.**
+  The server is allowed to send the first `NOTIFY` before the `202
+  Accepted` has been read, and a lamp that missed it would show the
+  wrong thing.
+
+A `NOTIFY` is an **in-dialog** request — it carries a To tag — so it
+is matched to its subscription by the **Call-ID**, and the check
+happens before the in-dialog branch of the incoming router. A
+subscription whose `NOTIFY`s are answered with `481` is a subscription
+the server gives up on.
+
+### The refresh
+
+A subscription has a lifetime, and it is refreshed before it runs out:
+the refresh is an in-dialog SUBSCRIBE with the **same Call-ID and the
+same two tags** and a new CSeq (RFC 6665 §4). A subscription that is
+not refreshed ends, and a lamp that has gone dark says "free" when the
+truth is "we stopped listening".
+
+### The document is read by hand
+
+The XML is parsed in the core, by a small scanner that reads the
+`state` of every `<dialog>` element and the `id` that names it.
+
+**No XML crate was added**, and that was a decision rather than an
+accident. The document is machine-generated and its shape is fixed: a
+`state` attribute on each `<dialog>`, and nothing else that a lamp
+cares about. The scanner handles the three things that could make it
+misread — a **comment** that contains the text `<dialog
+state="confirmed">`, a **CDATA** section, and an attribute whose name
+merely **starts** the same (`stateful` is not `state`) — and the
+entities are undone.
+
+The `full` and `partial` documents are told apart, because they mean
+different things: a **full** document replaces everything that is known,
+and a **partial** one changes only the dialogs it mentions. A partial
+document that ends one dialog leaves the others alone.
+
+### The dependency cost: nothing
+
+No new package: the RFC 3903 document is read by a function in the
+core, the SUBSCRIBE is built from the stack's own pieces, and the
+lamps are a list in the session.
+
+### What is *not* in M6.7
+
+* **The lamps have not been seen against a real Asterisk.** The whole
+  mechanism is proved against the peer in this repository: the
+  `SUBSCRIBE` goes out with the right event package, the `202
+  Accepted` is read, the `NOTIFY` is answered with a `200 OK`, and the
+  document turns into a lamp that says *busy*. What has **not** been
+  run is the user's own Asterisk serving `dialog-info+simulimit` —
+  that needs `res_pjsip_pubsub` and an ACL that lets the account watch
+  the extension.
+* **The lamps are not the accounts' own devices.** `simulimit` says
+  what the **address of record** is doing, not what each of its
+  devices is doing separately. Watching one's own desk phone as a
+  separate device is a different subscription.
+* **There is no lamp for an extension that is not on the list.** The
+  panel shows what the account watches, and nothing else.
+* **The lamp is not a presence.** It says whether there is a call; it
+  does not say whether the person is at their desk, and it does not go
+  away when they are free but away from the phone.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -4219,6 +4379,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.4** | The file the user picks: a native **Browse…** dialog for the ringtone, on the settings page and on the account editor, with the WAV filter, the **Reset** button, and a file that is checked before it is accepted | **done** |
 | **M6.5** | The transfer completed while the target is ringing: **Complete transfer** is live as soon as the target rings, the server finishes the transfer, and a consultation that dies after the REFER is the server's business rather than the user calling it off | **done** |
 | **M6.6** | The headers an account puts on its own calls: a per-account list of `X-var1=…` that goes on the INVITE, with `$callerid` / `$called` / `$user` / `$account` as the values | **done** |
+| **M6.7** | The Busy Lamp Field: RFC 3903 `dialog-info+simulimit` subscriptions, the `NOTIFY` documents read by hand, and the lamps in the left panel below the accounts | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -4282,7 +4443,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 452 tests, all passing.
+* `cargo test --workspace` — 477 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -4413,6 +4574,24 @@ player lands.
 * **The headers survive a database round trip**, and an account in a
   database from before the feature still opens — with no headers, and
   with its ringtone and everything else intact.
+* **The Busy Lamp Field works on the wire.** The client subscribes to
+  `dialog-info+simulimit` — the test reads the `Event`, the `Accept`
+  and the `Expires` off the `SUBSCRIBE` — the server answers `202
+  Accepted` and sends a `NOTIFY`, the client answers it with a `200
+  OK`, and the document in it turns into a lamp that says **busy**.
+* **A server that does not serve the event package leaves the lamp
+  dark.** It answers `489 Bad Event`, and the lamp says **unknown** —
+  not *free*. A lamp that says "free" when the truth is "we stopped
+  listening" is a lamp that lies.
+* **A comment that looks like a dialog is not one.** The XML scanner
+  reads the `state` of every `<dialog>` and nothing else: a comment
+  containing `<dialog state="confirmed"/>` is not a dialog, and
+  `stateful="yes"` is not `state`.
+* **A partial document only changes the dialog it names.** A `full`
+  document replaces everything that is known; a `partial` one changes
+  one dialog and leaves the others — which is what RFC 3903 says.
+* **The lamps are in the left panel, below the accounts**, and the
+  account page takes the list of extensions to watch.
 * **An incoming call rings.** The event starts the ringtone, and the test
   checks that the player is playing.
 * **A call we made rings back — but only when there is nothing to hear.**
@@ -4810,6 +4989,13 @@ player lands.
   a broken name is dropped. What has not been tried is the user's own
   Asterisk reading a header it was configured to read, which is the
   only thing that proves the *names* are the ones the PBX expects.
+* **The Busy Lamp Field has not been seen against a real Asterisk.**
+  The whole mechanism is proved against the peer in this repository —
+  the `SUBSCRIBE`, the `202 Accepted`, the `NOTIFY`, the `200 OK` and
+  the document. What has **not** been run is the user's own Asterisk
+  serving `dialog-info+simulimit`: that needs `res_pjsip_pubsub`
+  enabled and an ACL that lets the account watch the extension, and
+  neither is known to be there.
 * **No third-party softphone has been called.** The calls in the test
   suite were made against the hand-written peer in this repository; the
   Asterisk run above ended in a `404`. The SIP messages on the wire are

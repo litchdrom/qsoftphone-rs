@@ -57,6 +57,16 @@ pub struct Account {
     /// dropped on the way out — a message with a broken header in it is
     /// a message the peer may refuse.
     pub custom_headers: Vec<(String, String)>,
+    /// The extensions whose Busy Lamp Field this account watches.
+    ///
+    /// The lamps are the little lights that say whether a colleague is
+    /// free, busy or ringing (RFC 3903). They are per-account: the
+    /// extension is on the server **this** account is registered with,
+    /// and the same number on another server is a different person.
+    ///
+    /// Empty = no lamps. An account that watches nothing sends no
+    /// subscriptions at all.
+    pub blf_extensions: Vec<String>,
     /// Which CRM plugin handles this account. Empty = local contacts.
     pub crm_preset_id: String,
     /// The WAV file this account rings with.

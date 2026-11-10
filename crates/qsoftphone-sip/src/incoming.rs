@@ -78,6 +78,18 @@ fn has_to_tag(request: &Request) -> bool {
         .is_some()
 }
 
+/// Whether a `NOTIFY` belongs to one of our Busy Lamp Field
+/// subscriptions.
+///
+/// The Call-ID is what the two have in common: the server sends the
+/// `NOTIFY` on the dialog the SUBSCRIBE created.
+fn is_blf_notify(session: &AccountSession, request: &Request) -> bool {
+    let Ok(call_id) = request.call_id_header() else {
+        return false;
+    };
+    session.blf_by_call_id(call_id.value()).is_some()
+}
+
 /// Answer the requests that arrive on the endpoint, until the token is
 /// cancelled.
 pub async fn serve(
@@ -97,6 +109,20 @@ pub async fn serve(
 
         let mut transaction = transaction;
         let request = transaction.original.clone();
+
+        // A `NOTIFY` on one of our Busy Lamp Field subscriptions.
+        //
+        // It is checked **before** the in-dialog branch: a NOTIFY in a
+        // subscription dialog carries a To tag, so it would be routed
+        // to the call layer — which has no dialog for it and would
+        // answer `481`, and a subscription whose NOTIFYs are refused is
+        // a subscription the server gives up on.
+        if request.method == Method::Notify && is_blf_notify(&session, &request) {
+            if let Err(e) = crate::blf::handle_notify(session.clone(), transaction).await {
+                warn!(error = %e, "the Busy Lamp Field state could not be read");
+            }
+            continue;
+        }
 
         // An in-dialog request: the BYE, the DTMF INFO, a re-INVITE.
         // It goes to the dialog it belongs to.
