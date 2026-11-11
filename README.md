@@ -4300,6 +4300,40 @@ its old shape — `sip:104@193.178.169.164`, with no port. An address of
 record is a name, not a destination; the port lives in the registrar,
 where the requests actually go.
 
+### The subscription has to authenticate
+
+Asterisk does not serve the event package to an anonymous client. It
+answers the first `SUBSCRIBE` with **`401 Unauthorized`** and a digest
+challenge, and the client has to answer it with the account's
+credentials and send the subscription again:
+
+```text
+SUBSCRIBE sip:105@193.178.169.164:5161 SIP/2.0
+…
+SIP/2.0 401 Unauthorized
+WWW-Authenticate: Digest realm="asterisk", nonce="…", algorithm=MD5, qop="auth"
+
+SUBSCRIBE sip:105@193.178.169.164:5161 SIP/2.0
+Authorization: Digest username="104", realm="asterisk", nonce="…", uri="sip:105@193.178.169.164:5161", response="…", algorithm=MD5, cnonce="…", opaque="…", qop=auth, nc=00000001
+…
+SIP/2.0 202 Accepted
+```
+
+The retry is the **same dialog** — the same Call-ID and the same `From`
+tag — with a new CSeq and a new branch, because a request that is sent
+again is a new request (RFC 3261 §8.1.3.2).
+
+The digest is computed over the Request-URI **as it went out**: a
+server that recomputes it over anything else answers `403`, and the
+lamp stays dark. The realm is the one the **server** named, the
+algorithm is the one **it** asked for, and the algorithm is echoed back
+with the server's own spelling, because RFC 7616 §3.4.1 says so.
+
+The refresh is an in-dialog SUBSCRIBE, and it is challenged in exactly
+the same way — so the answer to the challenge is not a one-off for the
+first request: every SUBSCRIBE this client sends can be challenged, and
+every one of them is answered.
+
 ### rsipstack has no out-of-dialog SUBSCRIBE
 
 This is the part that had to be built. rsipstack 0.7.9 has
@@ -4369,13 +4403,15 @@ lamps are a list in the session.
 
 * **The lamps have not been seen against a real Asterisk.** The whole
   mechanism is proved against the peer in this repository: the
-  `SUBSCRIBE` goes out with the right event package, the `202
-  Accepted` is read, the `NOTIFY` is answered with a `200 OK`, and the
-  document turns into a lamp that says *busy*. What has **not** been
-  run is the user's own Asterisk serving `dialog-info+simulimit` —
-  that needs `res_pjsip_pubsub` and an ACL that lets the account watch
-  the extension. The one thing the real server *did* say is that the
-  subscription was going to the wrong port, and that is fixed.
+  `SUBSCRIBE` goes out with the right event package, the `401` is
+  answered with the account's digest, the `202 Accepted` is read, the
+  `NOTIFY` is answered with a `200 OK`, and the document turns into a
+  lamp that says *busy*. What has **not** been run is the user's own
+  Asterisk serving `dialog-info+simulimit` — that needs
+  `res_pjsip_pubsub` and an ACL that lets the account watch the
+  extension. The two things the real server *did* say are that the
+  subscription went to the wrong port and that it was asked for
+  credentials, and both are fixed.
 * **The lamps are not the accounts' own devices.** `simulimit` says
   what the **address of record** is doing, not what each of its
   devices is doing separately. Watching one's own desk phone as a
@@ -4504,7 +4540,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 480 tests, all passing.
+* `cargo test --workspace` — 485 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -4665,6 +4701,12 @@ player lands.
   the subscription names the server the account is registered with,
   port and all — `sip:105@193.178.169.164:5161` — which is the port
   bug the user found against their own Asterisk.
+* **A challenged subscription is sent again with the credentials.** The
+  peer answers the first `SUBSCRIBE` with `401 Unauthorized` and a
+  digest challenge; the client answers it, sends the subscription again
+  with the same Call-ID and a new CSeq, and the peer — which computes
+  the digest itself, the way a server does — accepts it. The lamp then
+  lights up.
 * **An incoming call rings.** The event starts the ringtone, and the test
   checks that the player is playing.
 * **A call we made rings back — but only when there is nothing to hear.**
@@ -5064,15 +5106,14 @@ player lands.
   only thing that proves the *names* are the ones the PBX expects.
 * **The Busy Lamp Field has not been seen against a real Asterisk.**
   The whole mechanism is proved against the peer in this repository —
-  the `SUBSCRIBE`, the `202 Accepted`, the `NOTIFY`, the `200 OK` and
-  the document. What has **not** been run is the user's own Asterisk
-  serving `dialog-info+simulimit`: that needs `res_pjsip_pubsub`
-  enabled and an ACL that lets the account watch the extension, and
-  neither is known to be there. The one thing that *was* found against
-  the real Asterisk is the **port**: the subscription went to `:5060`
-  because the Request-URI had dropped the registrar's own port. That is
-  fixed, and the fix is proved on the wire — but the rest of the
-  mechanism still has not seen a real `NOTIFY`.
+  the `SUBSCRIBE`, the `401` and the answer to it, the `202 Accepted`,
+  the `NOTIFY`, the `200 OK` and the document. What has **not** been
+  run is the user's own Asterisk serving `dialog-info+simulimit`:
+  that needs `res_pjsip_pubsub` enabled and an ACL that lets the
+  account watch the extension, and neither is known to be there. The
+  two things the real server *did* say are the **port** and the
+  **`401`** — the subscription went to `:5060`, and it was asked for
+  credentials — and both are fixed and proved on the wire.
 * **No third-party softphone has been called.** The calls in the test
   suite were made against the hand-written peer in this repository; the
   Asterisk run above ended in a `404`. The SIP messages on the wire are

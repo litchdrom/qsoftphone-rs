@@ -323,6 +323,11 @@ const PEER_CHALLENGE: &str = concat!(
     r#"algorithm=MD5, qop="auth""#,
 );
 
+/// The password of the account the tests register.
+///
+/// The peer checks the digest with it, the way a server does.
+const PEER_PASSWORD: &str = "secret";
+
 /// The tag the peer puts on the `To` header of its answers.
 const PEER_TAG: &str = "peer-tag";
 
@@ -452,6 +457,12 @@ struct PeerOptions {
     dtmf: Option<char>,
     /// Answer the first INVITE with a 401 challenge.
     challenge_invite: bool,
+    /// Answer the first SUBSCRIBE with a 401 challenge.
+    ///
+    /// Asterisk asks for the credentials before it serves the event
+    /// package: the client has to answer the challenge with the
+    /// account's digest and send the subscription again.
+    challenge_subscribe: bool,
     /// What to report when the client sends a REFER.
     transfer: Option<TransferScript>,
     /// The address the registrar says it sees the client at.
@@ -609,6 +620,40 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
                         .expect("SUBSCRIBE reply");
                     continue;
                 };
+
+                // The challenge comes first: the server wants the
+                // account's credentials before it will serve the
+                // package, and the client has to answer it with the
+                // digest and send the subscription again.
+                if options.challenge_subscribe && header_value(&text, "Authorization").is_none() {
+                    let message = response(
+                        &text,
+                        "401 Unauthorized",
+                        &[("WWW-Authenticate", PEER_CHALLENGE)],
+                        "",
+                    );
+                    socket
+                        .send_to(message.as_bytes(), from)
+                        .await
+                        .expect("401 reply");
+                    continue;
+                }
+
+                // The credentials have to be **right**. The peer
+                // computes the digest itself, the way a server does:
+                // a client that hashes a different string — the
+                // Request-URI with another case, say — is told no.
+                if options.challenge_subscribe {
+                    let authorization = header_value(&text, "Authorization").unwrap_or_default();
+                    if !digest_is_right(&authorization, &text, PEER_PASSWORD) {
+                        let message = response(&text, "403 Forbidden", &[], "");
+                        socket
+                            .send_to(message.as_bytes(), from)
+                            .await
+                            .expect("403 reply");
+                        continue;
+                    }
+                }
 
                 let accepted = subscribe_accepted(&text);
                 socket
@@ -895,6 +940,77 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
     }
 }
 
+/// Whether the digest in an `Authorization` header is the right one.
+///
+/// The peer computes the answer itself, the way a server does. The
+/// digest is over the **Request-URI as it was sent**, so a client that
+/// hashes a different string — the same URI in another case, say —
+/// fails here, and so does a client that leaves out the `qop` the
+/// challenge asked for.
+fn digest_is_right(authorization: &str, request: &str, password: &str) -> bool {
+    let username = digest_param(authorization, "username").unwrap_or_default();
+    let realm = digest_param(authorization, "realm").unwrap_or_default();
+    let nonce = digest_param(authorization, "nonce").unwrap_or_default();
+    let uri = digest_param(authorization, "uri").unwrap_or_default();
+    let response = digest_param(authorization, "response").unwrap_or_default();
+    let qop = digest_param(authorization, "qop").unwrap_or_default();
+    let cnonce = digest_param(authorization, "cnonce").unwrap_or_default();
+    let nc = digest_param(authorization, "nc").unwrap_or_default();
+
+    let mut parts = request.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let request_uri = parts.next().unwrap_or_default();
+    if uri != request_uri {
+        // The digest is computed over the Request-URI as it went out.
+        return false;
+    }
+
+    let ha1 = md5_hex(&format!("{username}:{realm}:{password}"));
+    let ha2 = md5_hex(&format!("{method}:{uri}"));
+    let value = if qop == "auth" {
+        format!("{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}")
+    } else {
+        format!("{ha1}:{nonce}:{ha2}")
+    };
+    md5_hex(&value) == response
+}
+
+/// A parameter of a digest header.
+///
+/// The first parameter is preceded by the scheme — `Digest username=…`
+/// — so the name is the **last** word of the key.
+fn digest_param(header: &str, name: &str) -> Option<String> {
+    for part in header.split(',') {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        let key = key.split_whitespace().last().unwrap_or(key);
+        if !key.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .unwrap_or(value);
+        return Some(value.to_string());
+    }
+    None
+}
+
+/// The MD5 of a string, in lower-case hex.
+fn md5_hex(input: &str) -> String {
+    use md5::Md5;
+    use sha2::Digest as _;
+    let mut hasher = Md5::new();
+    hasher.update(input.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// The `202 Accepted` that says a subscription is there.
 ///
 /// RFC 6665 §4.1: the answer forms the dialog, so it carries a To tag
@@ -990,6 +1106,7 @@ async fn the_busy_lamp_field_says_whether_the_extension_is_on_a_call() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: None,
@@ -1072,6 +1189,159 @@ async fn the_busy_lamp_field_says_whether_the_extension_is_on_a_call() {
     );
 }
 
+/// A subscription that is challenged is sent again with the credentials.
+///
+/// Asterisk answers a SUBSCRIBE with `401 Unauthorized` and a digest
+/// challenge: the client has to answer it with the account's
+/// credentials and send the subscription **again** — the same dialog,
+/// with a new CSeq and a new branch (RFC 3261 §8.1.3.2).
+///
+/// The peer checks the digest the way a server does — it computes the
+/// answer itself — so a lamp that lights up is a lamp whose
+/// credentials were right.
+#[tokio::test]
+async fn a_subscribe_that_is_challenged_is_sent_again_with_the_credentials() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+            challenge_subscribe: true,
+            transfer: None,
+            public_address: None,
+            bye_status: None,
+            early_media: false,
+            cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
+            // The extension is on a call.
+            blf_state: Some("confirmed"),
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-blf-auth".to_string();
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    stack
+        .blf
+        .watch(
+            &account.id,
+            &qsoftphone_core::model::account::BlfEntry {
+                watch: "105".to_string(),
+                dial: String::new(),
+            },
+        )
+        .expect("the extension was not watched");
+
+    // The lamp says what the NOTIFY said — and the peer only sends the
+    // NOTIFY when the credentials were right.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut lamp = None;
+    while std::time::Instant::now() < deadline {
+        lamp = stack.blf.lamps(&account.id).into_iter().next();
+        if let Some(lamp) = &lamp {
+            if lamp.state != qsoftphone_core::sip::blf::BlfState::Unavailable {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let lamp = lamp.expect("the lamp never appeared");
+    assert_eq!(
+        lamp.state,
+        qsoftphone_core::sip::blf::BlfState::Busy,
+        "the extension is on a call, so the lamp says busy"
+    );
+
+    // The subscription went out **twice**: the first without
+    // credentials, the second with them.
+    let requests = observations
+        .lock()
+        .expect("observations lock")
+        .requests("SUBSCRIBE");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the subscription was not sent again after the challenge:\n{}",
+        requests.join("\n---\n")
+    );
+
+    let first = &requests[0];
+    assert!(
+        header_value(first, "Authorization").is_none(),
+        "the first subscription carries credentials it cannot have:\n{first}"
+    );
+
+    let second = &requests[1];
+    let authorization = header_value(second, "Authorization")
+        .expect("the second subscription carries no credentials");
+    assert_eq!(
+        digest_param(&authorization, "username").as_deref(),
+        Some("104"),
+        "the digest is for the wrong user:\n{authorization}"
+    );
+    assert_eq!(
+        digest_param(&authorization, "realm").as_deref(),
+        Some("asterisk"),
+        "the digest is for the wrong realm:\n{authorization}"
+    );
+    assert_eq!(
+        digest_param(&authorization, "nonce").as_deref(),
+        Some("4b2c1f0e9a8d7c6b5a4938271605f4e3"),
+        "the digest is for the wrong nonce:\n{authorization}"
+    );
+    assert_eq!(
+        digest_param(&authorization, "uri").as_deref(),
+        Some(format!("sip:105@{peer_addr}").as_str()),
+        "the digest is over the wrong URI:\n{authorization}"
+    );
+    assert_eq!(
+        digest_param(&authorization, "qop").as_deref(),
+        Some("auth"),
+        "the digest does not use the quality of protection the server asked for:\n{authorization}"
+    );
+    assert!(
+        authorization.contains("algorithm=MD5"),
+        "the algorithm is not the one the server asked for:\n{authorization}"
+    );
+
+    // The same dialog: the same Call-ID, the same From tag, and a CSeq
+    // that went up — a request that is sent again is a new request.
+    assert_eq!(
+        header_value(first, "Call-ID"),
+        header_value(second, "Call-ID"),
+        "the retry is not in the same dialog:\n{first}\n---\n{second}"
+    );
+    assert_eq!(
+        header_value(first, "From"),
+        header_value(second, "From"),
+        "the retry is not in the same dialog:\n{first}\n---\n{second}"
+    );
+    let cseq_of = |request: &str| -> u32 {
+        header_value(request, "CSeq")
+            .and_then(|value| value.split_whitespace().next().map(str::to_string))
+            .and_then(|number| number.parse().ok())
+            .unwrap_or_default()
+    };
+    assert!(
+        cseq_of(second) > cseq_of(first),
+        "the retry did not get a new CSeq:\n{first}\n---\n{second}"
+    );
+}
+
 /// A lamp that the server will not light stays dark.
 ///
 /// A server that does not serve the event package answers `489 Bad
@@ -1091,6 +1361,7 @@ async fn a_server_that_does_not_serve_the_package_leaves_the_lamp_dark() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: None,
@@ -1206,6 +1477,7 @@ async fn an_outgoing_call_connects_and_hangs_up() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: None,
@@ -1327,6 +1599,7 @@ async fn the_call_goes_out_with_the_accounts_own_headers() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: None,
@@ -1414,6 +1687,7 @@ async fn a_header_with_a_broken_name_does_not_go_out() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: None,
@@ -1490,6 +1764,7 @@ async fn an_account_with_no_headers_sends_none() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: None,
@@ -1558,6 +1833,7 @@ async fn an_incoming_call_rings_before_the_user_answers() {
             call_back: true,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: None,
@@ -1684,6 +1960,7 @@ async fn a_ringing_incoming_call_is_declined_when_it_is_hung_up() {
             call_back: true,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: None,
@@ -1753,6 +2030,7 @@ async fn a_dtmf_digit_arrives_as_an_event() {
             call_back: true,
             dtmf: Some('5'),
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: None,
@@ -1811,6 +2089,7 @@ async fn a_dtmf_digit_is_sent_as_an_info_request() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: None,
@@ -1907,6 +2186,7 @@ fn a_call_placed_off_the_runtime_does_not_take_the_app_down() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: None,
@@ -1980,6 +2260,7 @@ async fn a_challenged_invite_is_answered_with_the_account_digest() {
             call_back: false,
             dtmf: None,
             challenge_invite: true,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: None,
@@ -2162,6 +2443,7 @@ async fn an_in_dialog_request_carries_the_public_contact() {
             call_back: true,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: Some(PUBLIC_ADDRESS),
             bye_status: None,
@@ -2255,6 +2537,7 @@ async fn a_bye_the_peer_does_not_know_still_ends_the_call() {
             call_back: true,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: Some("481 Call/Transaction Does Not Exist"),
@@ -2337,6 +2620,7 @@ async fn a_blind_transfer_reaches_the_peer_and_releases_the_original_call() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: Some(TransferScript::Answered),
             public_address: None,
             bye_status: None,
@@ -2434,6 +2718,7 @@ async fn the_attended_transfer_names_the_consultation() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: Some(TransferScript::Answered),
             public_address: None,
             bye_status: None,
@@ -2573,6 +2858,7 @@ async fn the_refer_goes_out_while_the_consultation_is_still_ringing() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: Some(TransferScript::Answered),
             public_address: None,
             bye_status: None,
@@ -2686,6 +2972,7 @@ async fn a_refer_to_a_call_that_has_not_rung_is_refused() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: Some(TransferScript::Answered),
             public_address: None,
             bye_status: None,
@@ -2797,6 +3084,7 @@ async fn a_feature_code_transfer_is_typed_as_dtmf() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: None,
@@ -2868,6 +3156,7 @@ async fn a_transfer_that_cannot_route_leaves_the_original_call_up() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: Some(TransferScript::NoRoute),
             public_address: None,
             bye_status: None,
@@ -2955,6 +3244,7 @@ async fn a_call_can_be_held() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: None,
@@ -3089,6 +3379,7 @@ async fn a_ringing_call_can_be_redirected() {
             call_back: true,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: None,
@@ -3177,6 +3468,7 @@ async fn a_ringing_without_media_says_that_there_is_none() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: None,
@@ -3236,6 +3528,7 @@ async fn a_ringing_with_media_says_that_there_is_some() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: None,
@@ -3296,6 +3589,7 @@ async fn a_call_the_peer_cancels_ends() {
             call_back: false,
             dtmf: None,
             challenge_invite: false,
+            challenge_subscribe: false,
             transfer: None,
             public_address: None,
             bye_status: None,

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rsipstack::sip::headers::{Accept, Contact, Event, Expires, SubscriptionState};
-use rsipstack::sip::{Header, HeadersExt, Method, Request, Uri};
+use rsipstack::sip::{Header, HeadersExt, Method, Request, Response, Uri};
 use rsipstack::transaction::key::{TransactionKey, TransactionRole};
 use rsipstack::transaction::transaction::Transaction;
 use tracing::{info, warn};
@@ -28,7 +28,8 @@ use tracing::{info, warn};
 use qsoftphone_core::model::account::BlfEntry;
 use qsoftphone_core::sip::blf::{self, BlfState, Tracker};
 
-use crate::call::{aor_for, aor_of};
+use crate::call::{aor_for, aor_of, credential_of};
+use crate::digest;
 use crate::session::{AccountSession, SessionRegistry};
 
 /// The event package a Busy Lamp Field subscription asks for.
@@ -192,7 +193,7 @@ impl BlfManager {
             aor: aor.clone(),
             dial: entry.dial_target().to_string(),
             call_id: call_id.clone(),
-            from_tag,
+            from_tag: from_tag.clone(),
             to_tag: String::new(),
             cseq: 1,
             tracker: Tracker::new(),
@@ -208,14 +209,23 @@ impl BlfManager {
         let session_for_task = session.clone();
         let aor = aor.to_string();
         let extension = extension.to_string();
+        let spec = SubscribeSpec {
+            aor: aor.clone(),
+            cseq: 1,
+            expires: EXPIRES_SECONDS,
+            call_id: Some(call_id.clone()),
+            from_tag: Some(from_tag),
+            to_tag: None,
+        };
         self.handle.spawn(async move {
-            // The **same** request goes out: the Call-ID it carries is
-            // the one the subscription was registered under, and the
-            // `NOTIFY` comes back on it. A request built twice would
-            // carry two Call-IDs, and the lamp would never hear from
-            // the server.
-            if let Err(e) = send_subscribe(&session_for_task, request).await {
-                warn!(error = %e, "the Busy Lamp Field subscription could not be sent");
+            // The request goes out with the Call-ID the subscription was
+            // registered under: the `NOTIFY` comes back on it. A request
+            // built with another Call-ID would leave the lamp deaf.
+            match send_subscribe(&session_for_task, &spec).await {
+                Ok(cseq) => session_for_task.set_blf_cseq(&call_id, cseq),
+                Err(e) => {
+                    warn!(error = %e, "the Busy Lamp Field subscription could not be sent");
+                }
             }
             refresh_loop(session_for_task, extension, aor).await;
         });
@@ -252,44 +262,151 @@ impl BlfManager {
     }
 }
 
+/// The pieces of a SUBSCRIBE.
+///
+/// They are kept apart from the request so that the request can be
+/// built **again** — with a new CSeq and a new branch — when the server
+/// answers with a challenge. The dialog does not change: the Call-ID
+/// and the two tags are the same.
+#[derive(Clone, Debug)]
+struct SubscribeSpec {
+    /// The address of record that is watched.
+    aor: String,
+    /// The CSeq of the request.
+    cseq: u32,
+    /// How long the subscription is asked for.
+    expires: u32,
+    /// The Call-ID of the subscription.
+    call_id: Option<String>,
+    /// The tag on our `From`.
+    from_tag: Option<String>,
+    /// The tag on the server's `To`.
+    to_tag: Option<String>,
+}
+
 /// Send the SUBSCRIBE and wait for the answer.
 ///
 /// The `202 Accepted` is what says the subscription is established. The
 /// server's `To` tag comes out of it: the refresh is an **in-dialog**
 /// SUBSCRIBE (RFC 6665 §4), and an in-dialog request has to carry the
 /// tags of the dialog it belongs to.
-async fn send_subscribe(session: &Arc<AccountSession>, request: Request) -> Result<(), BlfError> {
-    let key = TransactionKey::from_request(&request, TransactionRole::Client)
+///
+/// A server that wants credentials answers `401 Unauthorized` first
+/// (RFC 3261 §8.1.3.2): the challenge is answered with the account's
+/// credentials, and the request goes out again — the **same** dialog,
+/// with a new CSeq and a new branch. Asterisk does exactly this, and a
+/// SUBSCRIBE that is not answered twice is a subscription that is never
+/// made.
+///
+/// The CSeq that was actually used comes back, because a request that
+/// was sent twice used two of them.
+async fn send_subscribe(
+    session: &Arc<AccountSession>,
+    spec: &SubscribeSpec,
+) -> Result<u32, BlfError> {
+    let request = subscribe_request(
+        session,
+        &spec.aor,
+        spec.cseq,
+        spec.expires,
+        spec.call_id.clone(),
+        spec.from_tag.clone(),
+        spec.to_tag.clone(),
+    )?;
+
+    let first = send_once(session, &request).await?;
+    let (response, cseq) = match digest::challenge_of(&first) {
+        None => (first, spec.cseq),
+        Some((challenge, proxy)) => {
+            let credential = credential_of(&session.account).ok_or_else(|| {
+                BlfError::Sip("the account has no credentials to answer with".to_string())
+            })?;
+            let authorization = digest::authorization_header(
+                challenge,
+                &request.method,
+                &request.uri.to_string(),
+                &credential.username,
+                &credential.password,
+                proxy,
+            )
+            .ok_or_else(|| {
+                BlfError::Sip("the digest challenge could not be answered".to_string())
+            })?;
+
+            // The retry: the same dialog, the credentials, a new CSeq
+            // and a new branch. The CSeq goes up because a request that
+            // is sent again is a new request (RFC 3261 §8.1.3.2).
+            let retry = SubscribeSpec {
+                cseq: spec.cseq + 1,
+                call_id: Some(
+                    request
+                        .call_id_header()
+                        .map_err(|e| BlfError::Sip(e.to_string()))?
+                        .value()
+                        .to_string(),
+                ),
+                from_tag: Some(
+                    request
+                        .from_header()
+                        .map_err(|e| BlfError::Sip(e.to_string()))?
+                        .tag()
+                        .map_err(|e| BlfError::Sip(e.to_string()))?
+                        .map(|tag| tag.value().to_string())
+                        .unwrap_or_default(),
+                ),
+                ..spec.clone()
+            };
+            let mut retry_request = subscribe_request(
+                session,
+                &retry.aor,
+                retry.cseq,
+                retry.expires,
+                retry.call_id.clone(),
+                retry.from_tag.clone(),
+                retry.to_tag.clone(),
+            )?;
+            retry_request.headers.push(authorization);
+
+            info!("the server asked for credentials: the subscription is sent again");
+            (send_once(session, &retry_request).await?, retry.cseq)
+        }
+    };
+
+    // The answer. A `202 Accepted` means the subscription is there; a
+    // `4xx` or `5xx` means the server will not say anything, and the
+    // lamp stays dark.
+    let code = response.status_code.code();
+    if code < 300 {
+        // The server's tag, for the refresh.
+        if let Ok(to) = response.to_header() {
+            if let Ok(Some(tag)) = to.tag() {
+                if let Ok(call_id) = response.call_id_header() {
+                    session.set_blf_to_tag(call_id.value(), tag.value());
+                }
+            }
+        }
+        info!(code, "the Busy Lamp Field subscription was accepted");
+        return Ok(cseq);
+    }
+    warn!(code, "the server refused the Busy Lamp Field subscription");
+    Err(BlfError::Sip(format!("the server answered {code}")))
+}
+
+/// Send one request and wait for its answer.
+async fn send_once(session: &Arc<AccountSession>, request: &Request) -> Result<Response, BlfError> {
+    let key = TransactionKey::from_request(request, TransactionRole::Client)
         .map_err(|e| BlfError::Sip(e.to_string()))?;
     let mut transaction =
-        Transaction::new_client(key, request, session.endpoint.inner.clone(), None);
+        Transaction::new_client(key, request.clone(), session.endpoint.inner.clone(), None);
     transaction
         .send()
         .await
         .map_err(|e| BlfError::Sip(e.to_string()))?;
 
-    // The answer. A `202 Accepted` means the subscription is there; a
-    // `4xx` or `5xx` means the server will not say anything, and the
-    // lamp stays dark.
     while let Some(message) = transaction.receive().await {
-        let rsipstack::sip::SipMessage::Response(response) = message else {
-            continue;
-        };
-        let code = response.status_code.code();
-        if code < 300 {
-            // The server's tag, for the refresh.
-            if let Ok(to) = response.to_header() {
-                if let Ok(Some(tag)) = to.tag() {
-                    if let Ok(call_id) = response.call_id_header() {
-                        session.set_blf_to_tag(call_id.value(), tag.value());
-                    }
-                }
-            }
-            info!(code, "the Busy Lamp Field subscription was accepted");
-            return Ok(());
+        if let rsipstack::sip::SipMessage::Response(response) = message {
+            return Ok(response);
         }
-        warn!(code, "the server refused the Busy Lamp Field subscription");
-        return Err(BlfError::Sip(format!("the server answered {code}")));
     }
 
     Err(BlfError::Sip(
@@ -312,24 +429,18 @@ async fn refresh_loop(session: Arc<AccountSession>, extension: String, aor: Stri
             // The extension is not watched any more.
             return;
         };
-        let cseq = cseq + 1;
-        let request = match subscribe_request(
-            &session,
-            &aor,
-            cseq,
-            EXPIRES_SECONDS,
-            Some(call_id.clone()),
-            Some(from_tag),
-            Some(to_tag),
-        ) {
-            Ok(request) => request,
-            Err(e) => {
-                warn!(error = %e, "the Busy Lamp Field subscription could not be refreshed");
-                return;
-            }
+        let spec = SubscribeSpec {
+            aor: aor.clone(),
+            cseq: cseq + 1,
+            expires: EXPIRES_SECONDS,
+            call_id: Some(call_id.clone()),
+            from_tag: Some(from_tag),
+            to_tag: Some(to_tag),
         };
-        match send_subscribe(&session, request).await {
-            Ok(()) => {
+        match send_subscribe(&session, &spec).await {
+            Ok(cseq) => {
+                // The CSeq that was really used: a refresh that was
+                // challenged used two of them.
                 session.set_blf_cseq(&call_id, cseq);
                 info!("the Busy Lamp Field subscription was refreshed");
             }

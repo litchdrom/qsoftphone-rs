@@ -29,9 +29,15 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Mutex;
 
-use rsipstack::sip::{Header, Request, Response, SipMessage, StatusCode};
+use rsipstack::dialog::authenticate::compute_digest;
+use rsipstack::sip::headers::auth::{Algorithm, AuthQop};
+use rsipstack::sip::{Header, Method, Request, Response, SipMessage, StatusCode};
 use rsipstack::transaction::endpoint::MessageInspector;
+use rsipstack::transaction::random_text;
 use rsipstack::transport::SipAddr;
+
+/// How long the client nonce is.
+const CNONCE_LEN: usize = 16;
 
 /// The canonical spelling of each digest algorithm that rsipstack's
 /// parser accepts.
@@ -160,6 +166,118 @@ pub fn restore_algorithm(raw: &str, token: &str) -> String {
     out.push_str(token);
     out.push_str(&raw[range.end..]);
     out
+}
+
+/// The digest challenge in a `401` or `407` response.
+///
+/// The raw header value and whether it is a **proxy** challenge — a
+/// `407` is answered with `Proxy-Authorization`, a `401` with
+/// `Authorization`.
+///
+/// `None` when the response is not a challenge, or when it carries no
+/// challenge at all: a server that answers `401` without a
+/// `WWW-Authenticate` is not asking for credentials, it is saying no.
+pub fn challenge_of(response: &Response) -> Option<(&str, bool)> {
+    let proxy = match response.status_code {
+        StatusCode::Unauthorized => false,
+        StatusCode::ProxyAuthenticationRequired => true,
+        _ => return None,
+    };
+    response.headers.iter().find_map(|header| match header {
+        Header::WwwAuthenticate(h) if !proxy => Some((h.value(), false)),
+        Header::ProxyAuthenticate(h) if proxy => Some((h.value(), true)),
+        _ => None,
+    })
+}
+
+/// The header that answers a digest challenge.
+///
+/// RFC 7616 §3.4.1: the `Authorization` header names the user, the
+/// realm the **server** named, the nonce it sent, the Request-URI the
+/// request was sent to, and the response the digest computes to.
+///
+/// `request_uri` is the Request-URI **as it goes on the wire** — the
+/// digest is computed over that exact string, and a server that
+/// recomputes it over anything else answers `403`.
+///
+/// The algorithm is echoed with the **server's** own spelling, because
+/// RFC 7616 §3.4.1 says the client does so; a server that asked for
+/// `SHA-256` wants to read `SHA-256` back.
+///
+/// `None` when the challenge has no realm or no nonce — there is
+/// nothing to answer with.
+pub fn authorization_header(
+    challenge: &str,
+    method: &Method,
+    request_uri: &str,
+    username: &str,
+    password: &str,
+    proxy: bool,
+) -> Option<Header> {
+    let realm = find_param(challenge, "realm")?.0;
+    let nonce = find_param(challenge, "nonce")?.0;
+    let opaque = find_param(challenge, "opaque").map(|(value, _)| value);
+    let algorithm_token = find_param(challenge, "algorithm").map(|(value, _)| value);
+
+    // The algorithm the **digest** is computed with. MD5 is what RFC
+    // 7616 assumes when the challenge does not say.
+    let algorithm = algorithm_token
+        .as_deref()
+        .and_then(canonical_algorithm)
+        .and_then(|token| Algorithm::try_from(token).ok())
+        .unwrap_or(Algorithm::Md5);
+
+    // The quality of protection the challenge asked for. `auth` is the
+    // only one a SUBSCRIBE can offer: `auth-int` would need the body,
+    // and a SUBSCRIBE has none.
+    let cnonce = random_text(CNONCE_LEN);
+    let qop = match find_param(challenge, "qop").map(|(value, _)| value) {
+        Some(value) if value.eq_ignore_ascii_case("auth") => Some(AuthQop::Auth { cnonce, nc: 1 }),
+        Some(value) if value.eq_ignore_ascii_case("auth-int") => {
+            Some(AuthQop::AuthInt { cnonce, nc: 1 })
+        }
+        _ => None,
+    };
+
+    let response = compute_digest(
+        username,
+        password,
+        &realm,
+        &nonce,
+        method,
+        request_uri,
+        algorithm,
+        qop.as_ref(),
+    );
+
+    // The header is written by hand rather than through rsipstack's
+    // `Authorization`: the wire format that works against Asterisk has
+    // an unquoted `qop=auth` and a quoted `cnonce`, and a server that
+    // parses the strictest way round does not care about the order of
+    // the parameters.
+    let mut value = format!(
+        "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", \
+         uri=\"{request_uri}\", response=\"{response}\""
+    );
+    if let Some(token) = &algorithm_token {
+        value.push_str(&format!(", algorithm={token}"));
+    }
+    if let Some(opaque) = &opaque {
+        value.push_str(&format!(", opaque=\"{opaque}\""));
+    }
+    if let Some(qop) = &qop {
+        let (name, cnonce, nc) = match qop {
+            AuthQop::Auth { cnonce, nc } => ("auth", cnonce, nc),
+            AuthQop::AuthInt { cnonce, nc } => ("auth-int", cnonce, nc),
+        };
+        value.push_str(&format!(", qop={name}, nc={nc:08}, cnonce=\"{cnonce}\""));
+    }
+
+    Some(if proxy {
+        Header::ProxyAuthorization(rsipstack::sip::headers::ProxyAuthorization::new(value))
+    } else {
+        Header::Authorization(rsipstack::sip::headers::Authorization::new(value))
+    })
 }
 
 /// Endpoint-level digest-authentication interop.
@@ -439,6 +557,124 @@ mod tests {
         let expected = md5_hex(&format!("{ha1}:{nonce}:{ha2}"));
 
         assert_eq!(from_rsipstack, expected);
+    }
+
+    #[test]
+    fn a_challenge_is_answered_with_the_digest_of_the_right_things() {
+        // The challenge Asterisk sends, and the answer it wants back.
+        let challenge = r#"Digest realm="asterisk", nonce="4b2c1f0e9a8d7c6b5a4938271605f4e3", algorithm=MD5, qop="auth""#;
+        let header = authorization_header(
+            challenge,
+            &Method::Subscribe,
+            "sip:105@193.178.169.164:5161",
+            "104",
+            "secret",
+            false,
+        )
+        .expect("the challenge was not answered");
+
+        let raw = match &header {
+            Header::Authorization(h) => h.value().to_string(),
+            other => panic!("expected an Authorization header, got {other:?}"),
+        };
+
+        assert!(raw.starts_with("Digest "), "{raw}");
+        assert!(raw.contains("username=\"104\""), "{raw}");
+        assert!(raw.contains("realm=\"asterisk\""), "{raw}");
+        assert!(
+            raw.contains("nonce=\"4b2c1f0e9a8d7c6b5a4938271605f4e3\""),
+            "{raw}"
+        );
+        assert!(
+            raw.contains("uri=\"sip:105@193.178.169.164:5161\""),
+            "the digest is over the wrong URI: {raw}"
+        );
+        assert!(raw.contains("algorithm=MD5"), "{raw}");
+        assert!(raw.contains("qop=auth"), "{raw}");
+        assert!(raw.contains("nc=00000001"), "{raw}");
+
+        // The response is the digest of exactly those things: the
+        // method, the Request-URI as it was sent, the nonce, the
+        // client nonce and the count.
+        let cnonce = raw
+            .split("cnonce=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("the answer carries no client nonce");
+        let ha1 = md5_hex("104:asterisk:secret");
+        let ha2 = md5_hex("SUBSCRIBE:sip:105@193.178.169.164:5161");
+        let expected = md5_hex(&format!(
+            "{ha1}:4b2c1f0e9a8d7c6b5a4938271605f4e3:00000001:{cnonce}:auth:{ha2}"
+        ));
+        assert!(
+            raw.contains(&format!("response=\"{expected}\"")),
+            "the response is not the digest of the request: {raw}"
+        );
+    }
+
+    #[test]
+    fn a_proxy_challenge_is_answered_with_a_proxy_authorization() {
+        let challenge = r#"Digest realm="asterisk", nonce="abc", algorithm=MD5, qop="auth""#;
+        let header = authorization_header(
+            challenge,
+            &Method::Subscribe,
+            "sip:105@host",
+            "104",
+            "secret",
+            true,
+        )
+        .expect("the challenge was not answered");
+        assert!(
+            matches!(header, Header::ProxyAuthorization(_)),
+            "a 407 is answered with a Proxy-Authorization"
+        );
+    }
+
+    #[test]
+    fn a_challenge_without_a_quality_of_protection_is_answered_without_one() {
+        // RFC 2069: no `qop`, no client nonce, no count.
+        let challenge = r#"Digest realm="asterisk", nonce="abc", algorithm=MD5"#;
+        let raw = match authorization_header(
+            challenge,
+            &Method::Subscribe,
+            "sip:105@host",
+            "104",
+            "secret",
+            false,
+        )
+        .expect("the challenge was not answered")
+        {
+            Header::Authorization(h) => h.value().to_string(),
+            other => panic!("expected an Authorization header, got {other:?}"),
+        };
+
+        assert!(!raw.contains("qop="), "{raw}");
+        assert!(!raw.contains("cnonce"), "{raw}");
+
+        let ha1 = md5_hex("104:asterisk:secret");
+        let ha2 = md5_hex("SUBSCRIBE:sip:105@host");
+        let expected = md5_hex(&format!("{ha1}:abc:{ha2}"));
+        assert!(
+            raw.contains(&format!("response=\"{expected}\"")),
+            "the response is not the digest of the request: {raw}"
+        );
+    }
+
+    #[test]
+    fn a_challenge_with_no_nonce_cannot_be_answered() {
+        let challenge = r#"Digest realm="asterisk", algorithm=MD5"#;
+        assert!(
+            authorization_header(
+                challenge,
+                &Method::Subscribe,
+                "sip:105@host",
+                "104",
+                "secret",
+                false
+            )
+            .is_none(),
+            "a challenge without a nonce was answered"
+        );
     }
 
     #[test]
