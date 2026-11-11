@@ -4199,6 +4199,18 @@ On Asterisk it is built on **RFC 3903**. The watcher **subscribes** to the
 </dialog-info>
 ```
 
+Asterisk's own generator puts the state somewhere else — in the text
+of a `<state>` child — and both are read:
+
+```xml
+<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" version="3"
+             state="full" entity="sip:105@193.178.169.164:5161">
+ <dialog id="105">
+  <state>terminated</state>
+ </dialog>
+</dialog-info>
+```
+
 Every time the state changes, the server sends another `NOTIFY` with
 the same document. The `dialog` event says what the **address of
 record** is doing.
@@ -4416,16 +4428,52 @@ truth is "we stopped listening".
 ### The document is read by hand
 
 The XML is parsed in the core, by a small scanner that reads the
-`state` of every `<dialog>` element and the `id` that names it.
+state of every `<dialog>` element and the `id` that names it.
 
 **No XML crate was added**, and that was a decision rather than an
 accident. The document is machine-generated and its shape is fixed: a
-`state` attribute on each `<dialog>`, and nothing else that a lamp
+state of some kind on each `<dialog>`, and nothing else that a lamp
 cares about. The scanner handles the three things that could make it
 misread — a **comment** that contains the text `<dialog
 state="confirmed">`, a **CDATA** section, and an attribute whose name
 merely **starts** the same (`stateful` is not `state`) — and the
 entities are undone.
+
+### The state comes in two shapes, and both are read
+
+This is the bug the user's own Asterisk found, and it is worth
+writing down: **the state is not in one place.**
+
+RFC 3903 puts it in an **attribute** of the `<dialog>`:
+
+```xml
+<dialog id="105" state="confirmed">
+```
+
+Asterisk's `res_pjsip_dialog_info_body_generator` puts it in the
+**text** of a `<state>` **child**:
+
+```xml
+<dialog id="105">
+ <state>terminated</state>
+</dialog>
+```
+
+The user's Asterisk sends the second one — `version="3"`, the
+extension itself as the `id`, and the state as the element's text. A
+reader that only knows the first shape reads *nothing* out of the
+second: the lamp stays green through every state change, and the log
+says `state=Available` on every single `NOTIFY`, because that is what
+an unread state looks like.
+
+Both shapes are read now. The attribute wins when both are there —
+the RFC shape is the more specific one — and a `<state>` element under
+a dialog that has no attribute of its own is that dialog's state.
+
+**A dialog the server named but said nothing about is not free.** It
+is **unknown**, and the lamp says so: "we were told there is a dialog
+and we were not told what it is" is not the same claim as "there is no
+call".
 
 The `full` and `partial` documents are told apart, because they mean
 different things: a **full** document replaces everything that is known,
@@ -4440,18 +4488,20 @@ lamps are a list in the session.
 
 ### What is *not* in M6.7
 
-* **The lamps have not been seen against a real Asterisk.** The whole
-  mechanism is proved against the peer in this repository: the
-  `SUBSCRIBE` goes out with the right event, the `401` is answered with
-  the account's digest, the `202 Accepted` is read, the `NOTIFY` is
-  answered with a `200 OK`, and the document turns into a lamp that says
-  *busy*. What has **not** been run is the user's own Asterisk serving
-  the `dialog` event — that needs `res_pjsip_pubsub`,
-  `res_pjsip_exten_state` and `res_pjsip_dialog_info_body_generator`,
-  and an ACL that lets the account watch the extension. The three things
-  the real server *did* say are that the subscription went to the wrong
-  port, that it was asked for credentials, and that it was asking for a
-  package it does not know — and all three are fixed.
+* **The subscription has been seen against a real Asterisk; a lamp that
+  changes has not.** The user's own Asterisk 22.8.0 answered the
+  `SUBSCRIBE` with `401`, was answered with the account's digest, took
+  the retry with the same Call-ID, answered `202 Accepted`, and has been
+  sending `NOTIFY` documents since — the mechanism is no longer
+  hypothetical. What has **not** been watched is a lamp that actually
+  *changes*: the server puts the state in the text of a `<state>`
+  child, which the first reader did not read at all, so the lamp sat
+  green through every document. That reader is fixed (see above), but
+  the proof that a real `confirmed` turns the lamp red is still owed.
+  Two things on the server are still worth checking: that
+  `res_pjsip_exten_state` and `res_pjsip_dialog_info_body_generator`
+  are loaded, and that the watched extension has a **hint** in
+  `extensions.conf` — without a hint the state is always *unavailable*.
 * **The lamps are not the accounts' own devices.** The `dialog` event
   says what the **address of record** is doing, not what each of its
   devices is doing separately. Watching one's own desk phone as a
@@ -4580,7 +4630,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 486 tests, all passing.
+* `cargo test --workspace` — 489 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -4728,6 +4778,11 @@ player lands.
   reads the `state` of every `<dialog>` and nothing else: a comment
   containing `<dialog state="confirmed"/>` is not a dialog, and
   `stateful="yes"` is not `state`.
+* **The state is read out of either shape.** The RFC's attribute and
+  Asterisk's `<state>` child are both read, and the parser is proved
+  against the **exact** document the user's Asterisk sent —
+  `version="3"`, `<dialog id="105"><state>terminated</state></dialog>`
+  — as well as against `early` and `confirmed` in that same shape.
 * **A partial document only changes the dialog it names.** A `full`
   document replaces everything that is known; a `partial` one changes
   one dialog and leaves the others — which is what RFC 3903 says.
@@ -5152,19 +5207,24 @@ player lands.
   a broken name is dropped. What has not been tried is the user's own
   Asterisk reading a header it was configured to read, which is the
   only thing that proves the *names* are the ones the PBX expects.
-* **The Busy Lamp Field has not been seen against a real Asterisk.**
-  The whole mechanism is proved against the peer in this repository —
-  the `SUBSCRIBE`, the `401` and the answer to it, the `202 Accepted`,
-  the `NOTIFY`, the `200 OK` and the document. What has **not** been
-  run is the user's own Asterisk serving the `dialog` event: that
-  needs `res_pjsip_pubsub`, `res_pjsip_exten_state` and
-  `res_pjsip_dialog_info_body_generator` enabled, an ACL that lets the
-  account watch the extension, and a **hint** for the extension in
-  `extensions.conf` — and none of that is known to be there. The three
-  things the real server *did* say are the **port** (the subscription
-  went to `:5060`), the **`401`** (it wanted credentials) and the
-  **`489`** (it did not know the package we asked for) — and all three
-  are fixed and proved on the wire.
+* **The Busy Lamp Field now reaches the real Asterisk — but a lamp that
+  changes colour has not been watched.** The user's own Asterisk 22.8.0
+  was reached end to end: the `SUBSCRIBE` went to the registrar's
+  **port**, the `401` was answered with the account's digest, the retry
+  took the **same Call-ID** and was answered `202 Accepted`, and the
+  server has been sending `NOTIFY` documents ever since. The first lamp
+  did not move, and the reason was in the document rather than in the
+  wire: Asterisk puts the state in the **text** of a `<state>` child
+  and the reader only knew the RFC's attribute, so every `NOTIFY` was
+  logged as `state=Available` and the lamp stayed green. Both shapes
+  are read now, and the parser is proved against the exact document the
+  server sent — but the thing still owed is a **watched** state change:
+  extension 105 going to `confirmed` and the lamp going red on the
+  user's screen. On the server side that wants
+  `res_pjsip_exten_state` and `res_pjsip_dialog_info_body_generator`
+  loaded, and a **hint** for the watched extension in `extensions.conf`
+  — without a hint the state is *unavailable* whatever the server
+  sends.
 * **No third-party softphone has been called.** The calls in the test
   suite were made against the hand-written peer in this repository; the
   Asterisk run above ended in a `404`. The SIP messages on the wire are

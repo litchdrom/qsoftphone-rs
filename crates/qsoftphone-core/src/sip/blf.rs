@@ -96,6 +96,15 @@ impl DialogState {
                 | DialogState::Confirmed
         )
     }
+
+    /// A state that says nothing at all.
+    ///
+    /// A dialog the server named but did not say anything about is not
+    /// a dialog that is over: it is a dialog whose state is unknown,
+    /// and the lamp says so.
+    fn is_unknown(&self) -> bool {
+        matches!(self, DialogState::Other(state) if state.is_empty())
+    }
 }
 
 /// One dialog in the document.
@@ -124,10 +133,29 @@ pub struct DialogInfo {
 
 /// Parse a `dialog-info+xml` document.
 ///
-/// The document is read for two things: the `state` attribute of every
-/// `<dialog>`, and the `id` that names it. Nothing else matters, and
-/// nothing else is read — the `<local>` and `<remote>` blocks are what
-/// the *peer* cares about, not what a lamp does.
+/// The document is read for two things: the state of every `<dialog>`,
+/// and the `id` that names it. Nothing else matters, and nothing else
+/// is read — the `<local>` and `<remote>` blocks are what the *peer*
+/// cares about, not what a lamp does.
+///
+/// **The state comes in two shapes, and both are read.** RFC 3903 puts
+/// it in an attribute of the `<dialog>`:
+///
+/// ```xml
+/// <dialog id="105" state="confirmed"> … </dialog>
+/// ```
+///
+/// and Asterisk's `res_pjsip_dialog_info_body_generator` puts it in the
+/// **text** of a `<state>` child:
+///
+/// ```xml
+/// <dialog id="105">
+///  <state>terminated</state>
+/// </dialog>
+/// ```
+///
+/// A reader that only knows the first one sees a lamp that never
+/// changes, and that is exactly what happened.
 ///
 /// `None` when the text is not a `dialog-info` document at all. A
 /// document that **is** one but has no dialogs in it is a document that
@@ -139,20 +167,53 @@ pub fn parse(xml: &str) -> Option<DialogInfo> {
     let entity = attribute(root.attrs, "entity").unwrap_or_default();
     let state = attribute(root.attrs, "state").unwrap_or_default();
 
-    let dialogs = tags
-        .iter()
-        .filter(|tag| tag.name == "dialog")
-        .map(|tag| Dialog {
-            id: attribute(tag.attrs, "id").unwrap_or_default(),
-            state: DialogState::parse(&attribute(tag.attrs, "state").unwrap_or_default()),
-        })
-        .collect();
+    // The dialogs, in order. A `<state>` element belongs to the dialog
+    // that is open around it, which is the one before it.
+    let mut dialogs: Vec<Dialog> = Vec::new();
+    let mut open: Option<(String, Option<String>)> = None;
+    for tag in &tags {
+        match tag.name {
+            "dialog" => {
+                if let Some((id, state)) = open.take() {
+                    dialogs.push(dialog(id, state));
+                }
+                open = Some((
+                    attribute(tag.attrs, "id").unwrap_or_default(),
+                    attribute(tag.attrs, "state"),
+                ));
+            }
+            "state" => {
+                // The child element's text, when the dialog has no
+                // attribute of its own.
+                if let Some((_, state)) = open.as_mut()
+                    && state.is_none()
+                {
+                    let text = tag.text.trim();
+                    if !text.is_empty() {
+                        *state = Some(text.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((id, state)) = open.take() {
+        dialogs.push(dialog(id, state));
+    }
 
     Some(DialogInfo {
         entity,
         state,
         dialogs,
     })
+}
+
+/// One dialog, with the state it named.
+fn dialog(id: String, state: Option<String>) -> Dialog {
+    Dialog {
+        id,
+        state: DialogState::parse(&state.unwrap_or_default()),
+    }
 }
 
 /// What the lamps of one watched extension say.
@@ -217,6 +278,11 @@ impl Tracker {
         if self.dialogs.values().any(|state| state.is_live()) {
             return BlfState::Ringing;
         }
+        // A dialog the server named but said nothing about: the state
+        // is unknown, and "unknown" is not "free".
+        if self.dialogs.values().any(|state| state.is_unknown()) {
+            return BlfState::Unavailable;
+        }
         // Every dialog in it is over, or there is none: the extension
         // is free.
         BlfState::Available
@@ -227,6 +293,8 @@ impl Tracker {
 struct Tag<'a> {
     name: &'a str,
     attrs: &'a str,
+    /// The character data that follows the open tag, up to the next tag.
+    text: &'a str,
 }
 
 /// Every element in the text, in order.
@@ -285,8 +353,24 @@ fn tags(text: &str) -> Vec<Tag<'_>> {
             .unwrap_or(inner.len());
         let name = &inner[..name_end];
         let attrs = inner[name_end..].trim();
-        out.push(Tag { name, attrs });
-        i = start + 1 + end + 1;
+
+        // The character data of the element: everything up to the next
+        // tag. This is where the **text** of an element lives, and
+        // Asterisk puts the state of a dialog in the text of its
+        // `<state>` child rather than in an attribute.
+        let text_start = start + 1 + end + 1;
+        let text_end = text[text_start..]
+            .find('<')
+            .map(|at| text_start + at)
+            .unwrap_or(text.len());
+        let content = &text[text_start..text_end];
+
+        out.push(Tag {
+            name,
+            attrs,
+            text: content,
+        });
+        i = text_end;
     }
 
     out
@@ -399,7 +483,8 @@ fn unescape(value: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The document Asterisk sends for an extension that is free.
+    /// The document RFC 3903 describes: the state is an **attribute**
+    /// of the `<dialog>`.
     const FREE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" version="0" state="full" entity="sip:105@193.178.169.164">
   <dialog id="h6hhv876a3dsdjf" state="terminated">
@@ -412,7 +497,8 @@ mod tests {
   </dialog>
 </dialog-info>"#;
 
-    /// The document Asterisk sends for an extension that is on a call.
+    /// The document RFC 3903 describes: the state is an **attribute**
+    /// of the `<dialog>`.
     const BUSY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" version="0" state="full" entity="sip:105@193.178.169.164">
   <dialog id="h6hhv876a3dsdjf" state="confirmed">
@@ -424,6 +510,89 @@ mod tests {
     </remote>
   </dialog>
 </dialog-info>"#;
+
+    /// The document **Asterisk** sends for an extension that is free.
+    ///
+    /// Asterisk puts the state in the **text** of a `<state>` child, not
+    /// in an attribute of the `<dialog>` — this is the document that
+    /// comes out of `res_pjsip_dialog_info_body_generator`, and the one
+    /// the user's own Asterisk sent.
+    const ASTERISK_FREE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" version="3" state="full" entity="sip:105@193.178.169.164:5161">
+ <dialog id="105">
+  <state>terminated</state>
+ </dialog>
+</dialog-info>"#;
+
+    /// The document Asterisk sends for an extension that is on a call.
+    const ASTERISK_BUSY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" version="3" state="full" entity="sip:105@193.178.169.164:5161">
+ <dialog id="105">
+  <state>confirmed</state>
+ </dialog>
+</dialog-info>"#;
+
+    /// The document Asterisk sends for an extension that is ringing.
+    const ASTERISK_RINGING: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" version="3" state="full" entity="sip:105@193.178.169.164:5161">
+ <dialog id="105">
+  <state>early</state>
+ </dialog>
+</dialog-info>"#;
+
+    #[test]
+    fn the_state_is_read_out_of_the_element_asterisk_sends() {
+        // The state is in the **text** of a `<state>` child, not in an
+        // attribute of the `<dialog>`.
+        let info = parse(ASTERISK_FREE).expect("the document was not read");
+        assert_eq!(info.dialogs.len(), 1);
+        assert_eq!(info.dialogs[0].id, "105");
+        assert_eq!(
+            info.dialogs[0].state,
+            DialogState::Terminated,
+            "the state in the element was not read"
+        );
+    }
+
+    #[test]
+    fn the_lamp_follows_the_state_asterisk_sends() {
+        let mut tracker = Tracker::new();
+        assert_eq!(
+            tracker.apply(&parse(ASTERISK_BUSY).expect("not read")),
+            BlfState::Busy,
+            "an extension that is on a call is busy"
+        );
+
+        let mut tracker = Tracker::new();
+        assert_eq!(
+            tracker.apply(&parse(ASTERISK_RINGING).expect("not read")),
+            BlfState::Ringing,
+            "an extension that is ringing is ringing"
+        );
+
+        let mut tracker = Tracker::new();
+        assert_eq!(
+            tracker.apply(&parse(ASTERISK_FREE).expect("not read")),
+            BlfState::Available,
+            "an extension with no call is free"
+        );
+    }
+
+    #[test]
+    fn a_dialog_with_no_state_at_all_says_unknown() {
+        // The server named a dialog and said nothing about it: that is
+        // not a dialog that is over. It is a dialog whose state is
+        // unknown, and the lamp says so.
+        let xml = r#"<dialog-info state="full" entity="sip:105@example.com">
+            <dialog id="x"/>
+          </dialog-info>"#;
+        let mut tracker = Tracker::new();
+        assert_eq!(
+            tracker.apply(&parse(xml).expect("the document was not read")),
+            BlfState::Unavailable,
+            "a dialog with no state is not a dialog that is over"
+        );
+    }
 
     #[test]
     fn a_document_is_read_for_the_entity_and_the_dialogs() {

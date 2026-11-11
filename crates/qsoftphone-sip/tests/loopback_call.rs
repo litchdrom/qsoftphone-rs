@@ -1059,20 +1059,22 @@ fn blf_notify(request: &str, peer_addr: std::net::SocketAddr, state: &str) -> St
     let client_uri = uri_of(&client_from);
     let peer_uri = uri_of(&header_value(request, "To").unwrap_or_default());
 
+    // The document is the one **Asterisk** sends: the state is in the
+    // text of a `<state>` child, not in an attribute of the `<dialog>`.
+    // A reader that only knows the attribute sees a lamp that never
+    // changes.
     let body = format!(
         concat!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n",
-            "<dialog-info xmlns=\"urn:ietf:params:xml:ns:dialog-info\" version=\"0\" ",
+            "<dialog-info xmlns=\"urn:ietf:params:xml:ns:dialog-info\" version=\"3\" ",
             "state=\"full\" entity=\"{peer_uri}\">\r\n",
-            "  <dialog id=\"peer-dialog-1\" state=\"{state}\">\r\n",
-            "    <local><identity display=\"Peer\"><uri>{peer_uri}</uri></identity></local>\r\n",
-            "    <remote><identity display=\"Client\"><uri>{client_uri}</uri></identity></remote>\r\n",
-            "  </dialog>\r\n",
+            " <dialog id=\"peer-dialog-1\">\r\n",
+            "  <state>{state}</state>\r\n",
+            " </dialog>\r\n",
             "</dialog-info>\r\n"
         ),
         peer_uri = peer_uri,
         state = state,
-        client_uri = client_uri,
     );
 
     // The server echoes the event the client asked for.
