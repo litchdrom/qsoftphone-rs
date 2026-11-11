@@ -4186,10 +4186,9 @@ colleague is free, busy or on a call. It is not a softphone feature
 that was invented for this: PJPROJECT has had one for ever
 (`pjsua_blf`), and Asterisk serves it.
 
-On Asterisk it is built on **RFC 3903**. The watcher **subscribes** to
-`dialog-info+simulimit` for an address of record, and the server
-answers with a `dialog-info+xml` document that lists that address's
-dialogs:
+On Asterisk it is built on **RFC 3903**. The watcher **subscribes** to the
+`dialog` event for an address of record, and the server answers with a
+`dialog-info+xml` document that lists that address's dialogs:
 
 ```xml
 <dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" version="0"
@@ -4201,9 +4200,42 @@ dialogs:
 ```
 
 Every time the state changes, the server sends another `NOTIFY` with
-the same document. `dialog-info+simulimit` is the package PJSUA's own
-BLF uses and the one Asterisk's `res_pjsip_pubsub` serves: it says what
-the **address of record** is doing.
+the same document. The `dialog` event says what the **address of
+record** is doing.
+
+### The event's name is the server's
+
+This is the one thing about RFC 3903 that is worth writing down,
+because the first version got it wrong and Asterisk said so:
+
+| | the event |
+|---|---|
+| RFC 3903 | `dialog-info` |
+| PJSUA's own BLF | `dialog-info+simulimit` |
+| **Asterisk** | **`dialog`** |
+
+The `Event` header carries the **server's** name for the package. A
+server answers **`489 Bad Event`** for a package it does not know — and
+`res_pjsip_exten_state` is the module that serves Asterisk's two
+events, `presence` and `dialog`.
+
+The body does not follow the event's name: the document that comes back
+is still `application/dialog-info+xml`.
+
+Asterisk's side needs three modules, and the watcher's own extension
+needs a **hint** in `extensions.conf` — without one, the lamp says
+"unavailable" no matter what the server sends:
+
+```
+module load res_pjsip_pubsub.so
+module load res_pjsip_exten_state.so
+module load res_pjsip_dialog_info_body_generator.so
+```
+
+```text
+; extensions.conf — the hint is what makes the lamp say anything
+exten => 105,1,Hint(PJSIP/105)
+```
 
 ### The panel
 
@@ -4270,6 +4302,13 @@ The list is typed. There is no **Use my contacts** button: the
 contacts are not in the application yet, and a button that fills a list
 from a feature that is not there is a button that cannot do what it
 says.
+
+The list is stored with the account, as those two values. A database
+from before the second value existed — the list was a plain
+`["105", "106"]` — is **read**, not thrown away: each old entry is an
+extension to watch with no number of its own. A list that cannot be
+read is a list whose lamps go dark and whose speed dials disappear,
+and that is not a thing to do to somebody's account.
 
 An account watches nothing until it is told to, and it sends no
 subscription at all until it is **registered**: a subscription needs an
@@ -4403,17 +4442,18 @@ lamps are a list in the session.
 
 * **The lamps have not been seen against a real Asterisk.** The whole
   mechanism is proved against the peer in this repository: the
-  `SUBSCRIBE` goes out with the right event package, the `401` is
-  answered with the account's digest, the `202 Accepted` is read, the
-  `NOTIFY` is answered with a `200 OK`, and the document turns into a
-  lamp that says *busy*. What has **not** been run is the user's own
-  Asterisk serving `dialog-info+simulimit` — that needs
-  `res_pjsip_pubsub` and an ACL that lets the account watch the
-  extension. The two things the real server *did* say are that the
-  subscription went to the wrong port and that it was asked for
-  credentials, and both are fixed.
-* **The lamps are not the accounts' own devices.** `simulimit` says
-  what the **address of record** is doing, not what each of its
+  `SUBSCRIBE` goes out with the right event, the `401` is answered with
+  the account's digest, the `202 Accepted` is read, the `NOTIFY` is
+  answered with a `200 OK`, and the document turns into a lamp that says
+  *busy*. What has **not** been run is the user's own Asterisk serving
+  the `dialog` event — that needs `res_pjsip_pubsub`,
+  `res_pjsip_exten_state` and `res_pjsip_dialog_info_body_generator`,
+  and an ACL that lets the account watch the extension. The three things
+  the real server *did* say are that the subscription went to the wrong
+  port, that it was asked for credentials, and that it was asking for a
+  package it does not know — and all three are fixed.
+* **The lamps are not the accounts' own devices.** The `dialog` event
+  says what the **address of record** is doing, not what each of its
   devices is doing separately. Watching one's own desk phone as a
   separate device is a different subscription.
 * **There is no lamp for an extension that is not on the list.** The
@@ -4476,7 +4516,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.4** | The file the user picks: a native **Browse…** dialog for the ringtone, on the settings page and on the account editor, with the WAV filter, the **Reset** button, and a file that is checked before it is accepted | **done** |
 | **M6.5** | The transfer completed while the target is ringing: **Complete transfer** is live as soon as the target rings, the server finishes the transfer, and a consultation that dies after the REFER is the server's business rather than the user calling it off | **done** |
 | **M6.6** | The headers an account puts on its own calls: a per-account list of `X-var1=…` that goes on the INVITE, with `$callerid` / `$called` / `$user` / `$account` as the values | **done** |
-| **M6.7** | The Busy Lamp Field: RFC 3903 `dialog-info+simulimit` subscriptions, the `NOTIFY` documents read by hand, and the lamps in the left panel below the accounts — each lamp a button that dials the number the account has for that extension | **done** |
+| **M6.7** | The Busy Lamp Field: RFC 3903 `dialog` subscriptions, the `NOTIFY` documents read by hand, and the lamps in the left panel below the accounts — each lamp a button that dials the number the account has for that extension | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -4540,7 +4580,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 485 tests, all passing.
+* `cargo test --workspace` — 486 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -4672,10 +4712,14 @@ player lands.
   database from before the feature still opens — with no headers, and
   with its ringtone and everything else intact.
 * **The Busy Lamp Field works on the wire.** The client subscribes to
-  `dialog-info+simulimit` — the test reads the `Event`, the `Accept`
-  and the `Expires` off the `SUBSCRIBE` — the server answers `202
-  Accepted` and sends a `NOTIFY`, the client answers it with a `200
-  OK`, and the document in it turns into a lamp that says **busy**.
+  the `dialog` event — the test reads the `Event`, the `Accept` and the
+  `Expires` off the `SUBSCRIBE` — the server answers `202 Accepted` and
+  sends a `NOTIFY`, the client answers it with a `200 OK`, and the
+  document in it turns into a lamp that says **busy**.
+* **The peer serves the events Asterisk serves, and no others.** It
+  answers `489 Bad Event` for anything but `presence` and `dialog` —
+  so the test proves the client asks for a package a server can serve,
+  not merely for the right string.
 * **A server that does not serve the event package leaves the lamp
   dark.** It answers `489 Bad Event`, and the lamp says **unknown** —
   not *free*. A lamp that says "free" when the truth is "we stopped
@@ -4707,6 +4751,10 @@ player lands.
   with the same Call-ID and a new CSeq, and the peer — which computes
   the digest itself, the way a server does — accepts it. The lamp then
   lights up.
+* **A watched extension list is read, not emptied.** An account whose
+  list was written in the old format — `["105", "106"]`, before the
+  dialled number became a value of its own — comes back with its
+  extensions and no number of its own, rather than with nothing.
 * **An incoming call rings.** The event starts the ringtone, and the test
   checks that the player is playing.
 * **A call we made rings back — but only when there is nothing to hear.**
@@ -5108,12 +5156,15 @@ player lands.
   The whole mechanism is proved against the peer in this repository —
   the `SUBSCRIBE`, the `401` and the answer to it, the `202 Accepted`,
   the `NOTIFY`, the `200 OK` and the document. What has **not** been
-  run is the user's own Asterisk serving `dialog-info+simulimit`:
-  that needs `res_pjsip_pubsub` enabled and an ACL that lets the
-  account watch the extension, and neither is known to be there. The
-  two things the real server *did* say are the **port** and the
-  **`401`** — the subscription went to `:5060`, and it was asked for
-  credentials — and both are fixed and proved on the wire.
+  run is the user's own Asterisk serving the `dialog` event: that
+  needs `res_pjsip_pubsub`, `res_pjsip_exten_state` and
+  `res_pjsip_dialog_info_body_generator` enabled, an ACL that lets the
+  account watch the extension, and a **hint** for the extension in
+  `extensions.conf` — and none of that is known to be there. The three
+  things the real server *did* say are the **port** (the subscription
+  went to `:5060`), the **`401`** (it wanted credentials) and the
+  **`489`** (it did not know the package we asked for) — and all three
+  are fixed and proved on the wire.
 * **No third-party softphone has been called.** The calls in the test
   suite were made against the hand-written peer in this repository; the
   Asterisk run above ended in a `404`. The SIP messages on the wire are

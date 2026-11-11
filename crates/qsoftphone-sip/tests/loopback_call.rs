@@ -621,6 +621,20 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
                     continue;
                 };
 
+                // Asterisk serves the `presence` and `dialog` events,
+                // and answers `489 Bad Event` for anything else — the
+                // name of the package is the **server's**, and RFC 3903
+                // and PJSUA spell it differently from Asterisk.
+                let event = header_value(&text, "Event").unwrap_or_default();
+                if !matches!(event.as_str(), "presence" | "dialog") {
+                    let message = response(&text, "489 Bad Event", &[], "");
+                    socket
+                        .send_to(message.as_bytes(), from)
+                        .await
+                        .expect("SUBSCRIBE reply");
+                    continue;
+                }
+
                 // The challenge comes first: the server wants the
                 // account's credentials before it will serve the
                 // package, and the client has to answer it with the
@@ -1061,6 +1075,9 @@ fn blf_notify(request: &str, peer_addr: std::net::SocketAddr, state: &str) -> St
         client_uri = client_uri,
     );
 
+    // The server echoes the event the client asked for.
+    let event = header_value(request, "Event").unwrap_or_else(|| "dialog".to_string());
+
     format!(
         concat!(
             "NOTIFY {client_uri} SIP/2.0\r\n",
@@ -1070,7 +1087,7 @@ fn blf_notify(request: &str, peer_addr: std::net::SocketAddr, state: &str) -> St
             "To: {client_uri};tag={client_tag}\r\n",
             "Call-ID: {call_id}\r\n",
             "CSeq: 1 NOTIFY\r\n",
-            "Event: dialog-info+simulimit\r\n",
+            "Event: {event}\r\n",
             "Subscription-State: active;expires=3600\r\n",
             "Content-Type: application/dialog-info+xml\r\n",
             "Content-Length: {length}\r\n",
@@ -1083,6 +1100,7 @@ fn blf_notify(request: &str, peer_addr: std::net::SocketAddr, state: &str) -> St
         PEER_TAG = PEER_TAG,
         client_tag = client_tag,
         call_id = call_id,
+        event = event,
         length = body.len(),
         body = body,
     )
@@ -1090,8 +1108,8 @@ fn blf_notify(request: &str, peer_addr: std::net::SocketAddr, state: &str) -> St
 
 /// The Busy Lamp Field says whether an extension is on a call.
 ///
-/// The client subscribes to `dialog-info+simulimit`, the server answers
-/// with `202 Accepted` and then sends a `NOTIFY` carrying the RFC 3903
+/// The client subscribes to the `dialog` event, the server answers with
+/// `202 Accepted` and then sends a `NOTIFY` carrying the RFC 3903
 /// document. The lamp says what the document says.
 #[tokio::test]
 async fn the_busy_lamp_field_says_whether_the_extension_is_on_a_call() {
@@ -1176,8 +1194,8 @@ async fn the_busy_lamp_field_says_whether_the_extension_is_on_a_call() {
     );
 
     assert!(
-        header_value(&subscribe, "Event").as_deref() == Some("dialog-info+simulimit"),
-        "the subscription asks for the wrong event package:\n{subscribe}"
+        header_value(&subscribe, "Event").as_deref() == Some("dialog"),
+        "the subscription asks for the wrong event:\n{subscribe}"
     );
     assert!(
         header_value(&subscribe, "Accept").as_deref() == Some("application/dialog-info+xml"),

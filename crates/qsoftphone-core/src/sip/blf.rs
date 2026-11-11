@@ -2,7 +2,7 @@
 //!
 //! A BLF is a lamp on a desk that says whether a colleague is free,
 //! busy or on a call. On Asterisk it is built on RFC 3903: the watcher
-//! **subscribes** to `dialog-info+simulimit` for an address of record,
+//! **subscribes** to the `dialog` event for an address of record,
 //! and the server answers with a `dialog-info+xml` document that lists
 //! that address's dialogs.
 //!

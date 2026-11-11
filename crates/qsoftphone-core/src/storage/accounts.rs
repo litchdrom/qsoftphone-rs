@@ -175,17 +175,39 @@ fn row_to_account(row: &Row<'_>) -> rusqlite::Result<Account> {
         }
     };
     // The extensions whose lamps this account watches.
+    //
+    // The column was a list of strings before the watched extension and
+    // the number to dial became two values: `["105", "106"]`. That old
+    // shape is **read**, not thrown away — an account whose list is
+    // dropped is an account whose lamps go dark and whose speed dials
+    // disappear, and the user is told nothing except a line in the log.
+    // Each old entry is an extension to watch, with no number of its
+    // own, which is exactly what an empty one means.
     let blf: String = row.get(12)?;
     let blf_extensions = match serde_json::from_str::<Vec<BlfEntry>>(&blf) {
         Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                account_id = %id,
-                error = %e,
-                "account has malformed blf_extensions; treating as empty"
-            );
-            Vec::new()
-        }
+        Err(e) => match serde_json::from_str::<Vec<String>>(&blf) {
+            Ok(old) => {
+                tracing::info!(
+                    account_id = %id,
+                    "the watched extensions were read in the old format"
+                );
+                old.into_iter()
+                    .map(|watch| BlfEntry {
+                        watch,
+                        dial: String::new(),
+                    })
+                    .collect()
+            }
+            Err(_) => {
+                tracing::warn!(
+                    account_id = %id,
+                    error = %e,
+                    "account has malformed blf_extensions; treating as empty"
+                );
+                Vec::new()
+            }
+        },
     };
     Ok(Account {
         id,
@@ -351,6 +373,38 @@ mod tests {
         assert_eq!(fetched.blf_extensions[0].watch, "101");
         assert_eq!(fetched.blf_extensions[0].dial, "00101");
         assert_eq!(fetched.blf_extensions[1].watch, "102");
+        assert_eq!(fetched.blf_extensions[1].dial, "");
+    }
+
+    #[test]
+    fn the_watched_extensions_are_read_out_of_the_old_format() {
+        // The column used to be a list of strings: `["105", "106"]`.
+        // A list that cannot be read is a list that is **lost** — the
+        // lamps go dark and the speed dials disappear — so the old
+        // shape is read, not thrown away.
+        let db = Db::open_in_memory().unwrap();
+        let store = AccountStore::new(&db);
+
+        let account = Account::new("Office", "example.com", "104", "", "udp");
+        store.upsert(&account).unwrap();
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE accounts SET blf_extensions = ?1 WHERE id = ?2",
+                params!["[\"105\",\"106\"]", account.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let fetched = store.get(&account.id).unwrap().unwrap();
+        assert_eq!(fetched.blf_extensions.len(), 2);
+        assert_eq!(fetched.blf_extensions[0].watch, "105");
+        assert_eq!(
+            fetched.blf_extensions[0].dial, "",
+            "the old list had no number of its own"
+        );
+        assert_eq!(fetched.blf_extensions[1].watch, "106");
         assert_eq!(fetched.blf_extensions[1].dial, "");
     }
 

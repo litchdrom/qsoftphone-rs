@@ -2,10 +2,15 @@
 //! free, busy or ringing.
 //!
 //! On Asterisk the lamp is built on RFC 3903. The watcher **subscribes**
-//! to `dialog-info+simulimit` for an address of record, and the server
+//! to the `dialog` event for an address of record, and the server
 //! answers with a `dialog-info+xml` document that lists that address's
 //! dialogs. Every time the state changes the server sends another
 //! `NOTIFY`.
+//!
+//! The event's name is the **server's**: Asterisk calls the package
+//! `dialog`, while RFC 3903 and PJSUA call it `dialog-info` and
+//! `dialog-info+simulimit`. A server answers `489 Bad Event` for a
+//! package it does not know.
 //!
 //! rsipstack 0.7.9 has no out-of-dialog SUBSCRIBE of its own, so the
 //! request is built here: [`rsipstack::transaction::endpoint::EndpointInner`]
@@ -34,11 +39,19 @@ use crate::session::{AccountSession, SessionRegistry};
 
 /// The event package a Busy Lamp Field subscription asks for.
 ///
-/// `dialog-info+simulimit` is the package PJSUA's own BLF uses, and the
-/// one Asterisk's `res_pjsip_pubsub` serves: it says what the
-/// **address of record** is doing, not what each of its devices is
-/// doing separately.
-pub const EVENT_PACKAGE: &str = "dialog-info+simulimit";
+/// **The name is the server's.** RFC 3903 calls the package
+/// `dialog-info`, PJSUA asks for `dialog-info+simulimit`, and Asterisk
+/// calls it **`dialog`** — and a server answers `489 Bad Event` for a
+/// package it does not know.
+///
+/// Asterisk's own list is the one to go by: `res_pjsip_exten_state`
+/// handles the `presence` and `dialog` events, and the `dialog` event
+/// is the busy lamp — it says what the **address of record** is doing,
+/// not what each of its devices is doing separately.
+///
+/// The body that comes back is still `application/dialog-info+xml`: the
+/// content type does not follow the event's name.
+pub const EVENT_PACKAGE: &str = "dialog";
 
 /// The content type the document comes in.
 pub const EVENT_CONTENT_TYPE: &str = "application/dialog-info+xml";
