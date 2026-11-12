@@ -4249,6 +4249,72 @@ module load res_pjsip_dialog_info_body_generator.so
 exten => 105,1,Hint(PJSIP/105)
 ```
 
+### Two events, two documents, two lamps' worth of truth
+
+This is the second thing about RFC 3903 that is worth writing down,
+because the first version got it wrong and the user's own Asterisk
+found it: **a lamp needs two events, not one.**
+
+Asterisk serves two, and they answer different questions:
+
+| event | body | says |
+|---|---|---|
+| `dialog` | `application/dialog-info+xml` | what the extension is **doing** — on a call, ringing, over |
+| `presence` | `application/pidf+xml` | whether the extension is **there at all** — registered, or gone |
+
+The two documents look nothing alike, and the difference is the whole
+point:
+
+```xml
+<!-- the dialog event: a call state -->
+<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" version="3"
+             state="full" entity="sip:105@193.178.169.164:5161">
+ <dialog id="105">
+  <state>terminated</state>
+ </dialog>
+</dialog-info>
+```
+
+```xml
+<!-- the presence event: reachability -->
+<presence entity="sip:105@193.178.169.164" xmlns="urn:ietf:params:xml:ns:pidf">
+ <note>Ready</note>
+ <tuple id="105">
+  <status>
+   <basic>open</basic>
+  </status>
+ </tuple>
+</presence>
+```
+
+**A lamp that only listens to `dialog` can never say "offline".** An
+extension whose device is gone has no dialogs, and no dialogs is
+*exactly* what "free" looks like — so the busy lamp says "free" about
+somebody who is not at their desk, and stays green forever. That is
+what the user's own Asterisk was doing: it sends `terminated` for an
+extension that is simply not registered, and the lamp read that as
+"free".
+
+So the client subscribes to **both**: two SUBSCRIBEs, two Call-IDs, two
+dialogs, and the server answers each of them on its own. The `dialog`
+event says what the extension is doing; the `presence` event says
+whether it is there; the lamp puts the two together:
+
+| | |
+|---|---|
+| a call is up | **busy** or **ringing** — a call is the stronger fact |
+| the device is gone (`closed`) | **offline** |
+| there, and no call | **free** |
+| nothing has been said | **unknown** |
+
+A server that does not serve one of the two answers `489 Bad Event`,
+and the lamp goes on the other one: the `dialog` event alone still
+gives *busy*, *ringing* and *free*.
+
+**Both are the server's names.** `Event: dialog` and `Event: presence`
+— the RFC's names (`dialog-info`) and PJSUA's (`dialog-info+simulimit`)
+are both `489` on Asterisk.
+
 ### The panel
 
 The lamps are in the **left panel, below the accounts** — where the
@@ -4263,16 +4329,18 @@ EXTENSIONS
   ● 105  00105   busy
   ● 106           free
   ● 107           ringing
+  ● 108           offline
 ```
 
 The lamp is a coloured dot and a word. Green is free, amber is
-ringing, red is busy, and **grey is unknown**.
+ringing, red is busy, **dark grey is offline** and **light grey is
+unknown**.
 
-That last one matters: a lamp that has never been told anything is
-**unknown**, not free. A lamp that says "free" when the truth is "we
-stopped listening" is a lamp that lies, and a softphone that shows a
-colleague as available when it cannot see them is worse than one that
-shows nothing.
+The last two matter: a lamp that has never been told anything is
+**unknown**, not free, and a lamp that says "free" when the truth is
+"we stopped listening" is a lamp that lies. And **offline** is not free
+either — it says the colleague's device is gone, which is what the
+`presence` event is for and what the `dialog` event alone cannot say.
 
 **The row is a button.** Pressing the extension dials it.
 
@@ -4439,6 +4507,11 @@ state="confirmed">`, a **CDATA** section, and an attribute whose name
 merely **starts** the same (`stateful` is not `state`) — and the
 entities are undone.
 
+The `full` and `partial` documents are told apart, because they mean
+different things: a **full** document replaces everything that is known,
+and a **partial** one changes only the dialogs it mentions. A partial
+document that ends one dialog leaves the others alone.
+
 ### The state comes in two shapes, and both are read
 
 This is the bug the user's own Asterisk found, and it is worth
@@ -4475,6 +4548,20 @@ is **unknown**, and the lamp says so: "we were told there is a dialog
 and we were not told what it is" is not the same claim as "there is no
 call".
 
+### The presence document is read by hand too
+
+The `presence` event's document is PIDF (RFC 3863), and the scanner
+that reads the `dialog-info` one reads this as well: a `<tuple>` for
+each device, and a `<basic>` under the tuple's `<status>` that says
+whether that device is reachable — `open` or `closed`.
+
+The rules are the same ones. **One device that is there is enough** —
+an address of record with two devices, one registered and one not, is
+an extension that is at its desk, so `open` wins over `closed`. And a
+document that says nothing about the basic status is **unknown**, not
+"there": a lamp that says "free" about somebody it has not heard from
+is a lamp that lies.
+
 The `full` and `partial` documents are told apart, because they mean
 different things: a **full** document replaces everything that is known,
 and a **partial** one changes only the dialogs it mentions. A partial
@@ -4508,9 +4595,12 @@ lamps are a list in the session.
   separate device is a different subscription.
 * **There is no lamp for an extension that is not on the list.** The
   panel shows what the account watches, and nothing else.
-* **The lamp is not a presence.** It says whether there is a call; it
-  does not say whether the person is at their desk, and it does not go
-  away when they are free but away from the phone.
+* **The lamp is not a presence.** It says whether there is a call, and
+  whether the device is registered; it does not say whether the person
+  is at their desk, and it does not go away when they are free but away
+  from the phone. A colleague who is on a call from their mobile is
+  **busy**, not offline, and a colleague whose desk phone is
+  unregistered is **offline** even if they are in the building.
 
 ---
 
@@ -4566,7 +4656,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.4** | The file the user picks: a native **Browse…** dialog for the ringtone, on the settings page and on the account editor, with the WAV filter, the **Reset** button, and a file that is checked before it is accepted | **done** |
 | **M6.5** | The transfer completed while the target is ringing: **Complete transfer** is live as soon as the target rings, the server finishes the transfer, and a consultation that dies after the REFER is the server's business rather than the user calling it off | **done** |
 | **M6.6** | The headers an account puts on its own calls: a per-account list of `X-var1=…` that goes on the INVITE, with `$callerid` / `$called` / `$user` / `$account` as the values | **done** |
-| **M6.7** | The Busy Lamp Field: RFC 3903 `dialog` subscriptions, the `NOTIFY` documents read by hand, and the lamps in the left panel below the accounts — each lamp a button that dials the number the account has for that extension | **done** |
+| **M6.7** | The Busy Lamp Field: RFC 3903 `dialog` **and** `presence` subscriptions, the two kinds of `NOTIFY` document read by hand, and the lamps in the left panel below the accounts — each lamp a button that dials the number the account has for that extension, and each lamp able to say *busy*, *ringing*, *free*, *offline* or *unknown* | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -4630,7 +4720,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 489 tests, all passing.
+* `cargo test --workspace` — 499 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -4783,6 +4873,22 @@ player lands.
   against the **exact** document the user's Asterisk sent —
   `version="3"`, `<dialog id="105"><state>terminated</state></dialog>`
   — as well as against `early` and `confirmed` in that same shape.
+* **The lamp says when the extension is not there.** The client
+  subscribes to the `presence` event as well as the `dialog` one — two
+  SUBSCRIBEs, two Call-IDs, two dialogs — and the peer answers the
+  second with a PIDF document. A device that is gone (`closed`) makes
+  the lamp say **offline**, and a device that is there (`open`) with no
+  call makes it say **free**.
+* **A call that is up beats the presence.** A lamp that says "offline"
+  about somebody who is on a call is lying about the call, which is the
+  one thing it must not do.
+* **One device that is there is enough.** An address of record with two
+  devices, one registered and one not, is an extension that is at its
+  desk: `open` wins over `closed`.
+* **A server that serves only one of the two events still lights the
+  lamp.** It answers `489 Bad Event` for the package it does not know,
+  and the lamp goes on the other one — *busy*, *ringing* and *free* all
+  still work, and only *offline* is lost.
 * **A partial document only changes the dialog it names.** A `full`
   document replaces everything that is known; a `partial` one changes
   one dialog and leaves the others — which is what RFC 3903 says.
@@ -5225,6 +5331,16 @@ player lands.
   loaded, and a **hint** for the watched extension in `extensions.conf`
   — without a hint the state is *unavailable* whatever the server
   sends.
+* **The `presence` subscription has not been seen against the real
+  Asterisk.** It is the one that answers *offline*, and it is proved
+  against the peer in this repository — two SUBSCRIBEs, two Call-IDs,
+  a PIDF document, and a lamp that says **offline**. What has not been
+  run is the user's own server serving it: MicroSIP's capture proves
+  the server *can* serve `presence` (`<basic>open</basic>` for the
+  watched extension), so what is wanted from the next run is a
+  `NOTIFY` with `Event: presence` on the wire, and — for the lamp to
+  say anything at all — `res_pjsip_exten_state` loaded and a **hint**
+  for the watched extension in `extensions.conf`.
 * **No third-party softphone has been called.** The calls in the test
   suite were made against the hand-written peer in this repository; the
   Asterisk run above ended in a `404`. The SIP messages on the wire are

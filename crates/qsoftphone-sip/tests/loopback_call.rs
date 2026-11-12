@@ -213,6 +213,23 @@ impl Observations {
             .map(|(_, raw)| raw.clone())
             .collect()
     }
+
+    /// The full text of every request for one **event**.
+    ///
+    /// The client subscribes to the `dialog` and the `presence` events
+    /// separately, and each of them is a subscription of its own — so a
+    /// test that wants one of them has to say which.
+    fn requests_for_event(&self, method: &str, event: &str) -> Vec<String> {
+        self.requests(method)
+            .into_iter()
+            .filter(|raw| header_value(raw, "Event").as_deref() == Some(event))
+            .collect()
+    }
+
+    /// The full text of the first request for one **event**.
+    fn request_for_event(&self, method: &str, event: &str) -> Option<String> {
+        self.requests_for_event(method, event).into_iter().next()
+    }
 }
 
 /// The ACK for a `200 OK` to an INVITE.
@@ -522,6 +539,17 @@ struct PeerOptions {
     /// `None` — the ordinary case — is a server that does not serve the
     /// event package at all, and answers `489 Bad Event`.
     blf_state: Option<&'static str>,
+    /// What the peer says about whether the watched extension is **there**.
+    ///
+    /// The `presence` event is a subscription of its own, and the peer
+    /// answers it with a PIDF document: `open` when the device is
+    /// registered, `closed` when it is gone.
+    ///
+    /// `None` — the ordinary case — is a server that serves the
+    /// `dialog` event but not the `presence` one: it answers `489 Bad
+    /// Event` for the presence package, and the lamp goes on the call
+    /// state alone.
+    presence_basic: Option<&'static str>,
 }
 
 /// A registrar and call agent on one socket.
@@ -625,8 +653,23 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
                 // and answers `489 Bad Event` for anything else — the
                 // name of the package is the **server's**, and RFC 3903
                 // and PJSUA spell it differently from Asterisk.
+                //
+                // The two events are **separate subscriptions**: the
+                // client sends two SUBSCRIBEs, with two Call-IDs, and
+                // the server answers each of them on its own.
                 let event = header_value(&text, "Event").unwrap_or_default();
                 if !matches!(event.as_str(), "presence" | "dialog") {
+                    let message = response(&text, "489 Bad Event", &[], "");
+                    socket
+                        .send_to(message.as_bytes(), from)
+                        .await
+                        .expect("SUBSCRIBE reply");
+                    continue;
+                }
+
+                // The `presence` event is its own package: a server may
+                // serve the `dialog` event and not the `presence` one.
+                if event == "presence" && options.presence_basic.is_none() {
                     let message = response(&text, "489 Bad Event", &[], "");
                     socket
                         .send_to(message.as_bytes(), from)
@@ -676,8 +719,14 @@ async fn run_peer(socket: UdpSocket, observations: Arc<Mutex<Observations>>, opt
                     .expect("SUBSCRIBE reply");
 
                 // The state comes on its own NOTIFY, right after the
-                // answer — which is what a server does.
-                let notify = blf_notify(&text, peer_addr, state);
+                // answer — which is what a server does. The two events
+                // have two documents: the `dialog` one is a
+                // `dialog-info+xml`, the `presence` one a PIDF.
+                let notify = if event == "presence" {
+                    presence_notify(&text, peer_addr, options.presence_basic.unwrap_or("open"))
+                } else {
+                    blf_notify(&text, peer_addr, state)
+                };
                 socket
                     .send_to(notify.as_bytes(), from)
                     .await
@@ -1108,6 +1157,82 @@ fn blf_notify(request: &str, peer_addr: std::net::SocketAddr, state: &str) -> St
     )
 }
 
+/// The `NOTIFY` that carries whether the watched extension is there.
+///
+/// The `presence` event is a subscription of its own, and its document
+/// is PIDF (RFC 3863) rather than the `dialog-info+xml` of the
+/// `dialog` event: a `<tuple>` for each device, and a `<basic>` under
+/// the tuple's `<status>` that says whether that device is reachable —
+/// `open` or `closed`.
+///
+/// This is the document **Asterisk** sends, and the one the user's own
+/// server sent for the watched extension.
+fn presence_notify(request: &str, peer_addr: std::net::SocketAddr, basic: &str) -> String {
+    let call_id = header_value(request, "Call-ID").unwrap_or_default();
+    let client_from = header_value(request, "From").unwrap_or_default();
+    let client_tag = tag_of(&client_from).unwrap_or_default();
+    let client_uri = uri_of(&client_from);
+    let peer_uri = uri_of(&header_value(request, "To").unwrap_or_default());
+
+    // The tuple is named after the extension that is watched.
+    let tuple = peer_uri
+        .split_once('@')
+        .map(|(user, _)| user.trim_start_matches("sip:").to_string())
+        .unwrap_or_else(|| "peer".to_string());
+    let note = if basic == "open" {
+        "Ready"
+    } else {
+        "Unavailable"
+    };
+
+    let body = format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n",
+            "<presence entity=\"{peer_uri}\" xmlns=\"urn:ietf:params:xml:ns:pidf\" ",
+            "xmlns:dm=\"urn:ietf:params:xml:ns:pidf:data-model\" ",
+            "xmlns:rpid=\"urn:ietf:params:xml:ns:pidf:rpid\">\r\n",
+            " <note>{note}</note>\r\n",
+            " <tuple id=\"{tuple}\">\r\n",
+            "  <status>\r\n",
+            "   <basic>{basic}</basic>\r\n",
+            "  </status>\r\n",
+            " </tuple>\r\n",
+            " <dm:person />\r\n",
+            "</presence>\r\n"
+        ),
+        peer_uri = peer_uri,
+        note = note,
+        tuple = tuple,
+        basic = basic,
+    );
+
+    format!(
+        concat!(
+            "NOTIFY {client_uri} SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP {addr};branch=z9hG4bK-peer-presence\r\n",
+            "Max-Forwards: 70\r\n",
+            "From: {peer_uri};tag={PEER_TAG}\r\n",
+            "To: {client_uri};tag={client_tag}\r\n",
+            "Call-ID: {call_id}\r\n",
+            "CSeq: 1 NOTIFY\r\n",
+            "Event: presence\r\n",
+            "Subscription-State: active;expires=3600\r\n",
+            "Content-Type: application/pidf+xml\r\n",
+            "Content-Length: {length}\r\n",
+            "\r\n",
+            "{body}"
+        ),
+        client_uri = client_uri,
+        addr = peer_addr,
+        peer_uri = peer_uri,
+        PEER_TAG = PEER_TAG,
+        client_tag = client_tag,
+        call_id = call_id,
+        length = body.len(),
+        body = body,
+    )
+}
+
 /// The Busy Lamp Field says whether an extension is on a call.
 ///
 /// The client subscribes to the `dialog` event, the server answers with
@@ -1136,6 +1261,7 @@ async fn the_busy_lamp_field_says_whether_the_extension_is_on_a_call() {
             ring_delay: None,
             // The extension is on a call.
             blf_state: Some("confirmed"),
+            presence_basic: None,
         },
     ));
 
@@ -1181,10 +1307,9 @@ async fn the_busy_lamp_field_says_whether_the_extension_is_on_a_call() {
     );
 
     // And the subscription went out the way it should.
+    let observations = observations.lock().expect("observations lock");
     let subscribe = observations
-        .lock()
-        .expect("observations lock")
-        .request("SUBSCRIBE")
+        .request_for_event("SUBSCRIBE", "dialog")
         .expect("the server never saw the SUBSCRIBE");
 
     // The Request-URI names the **port** of the server. A registrar on
@@ -1206,6 +1331,173 @@ async fn the_busy_lamp_field_says_whether_the_extension_is_on_a_call() {
     assert!(
         header_value(&subscribe, "Expires").is_some(),
         "the subscription has no lifetime:\n{subscribe}"
+    );
+
+    // And the **presence** subscription went out beside it: the lamp
+    // needs both events to tell "free" from "not at their desk".
+    let presence = observations
+        .request_for_event("SUBSCRIBE", "presence")
+        .expect("the server never saw the presence SUBSCRIBE");
+    assert!(
+        header_value(&presence, "Accept").as_deref() == Some("application/pidf+xml"),
+        "the presence subscription does not say what it will take:\n{presence}"
+    );
+    assert!(
+        presence.starts_with(&format!("SUBSCRIBE sip:105@{peer_addr} ")),
+        "the presence subscription does not name the server's port:\n{presence}"
+    );
+}
+
+/// The lamp says when the extension is **not there**.
+///
+/// The `dialog` event cannot say this: an extension whose device is
+/// gone has no dialogs, and no dialogs is exactly what "free" looks
+/// like. The `presence` event says it — `closed` is not reachable —
+/// and the lamp says **offline**.
+///
+/// This is the difference between the two documents: the `dialog` one
+/// says what the extension is **doing**, the `presence` one says
+/// whether it is **there**.
+#[tokio::test]
+async fn an_extension_that_is_not_there_is_offline() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+            challenge_subscribe: false,
+            transfer: None,
+            public_address: None,
+            bye_status: None,
+            early_media: false,
+            cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
+            // The extension has no call...
+            blf_state: Some("terminated"),
+            // ...and its device is gone.
+            presence_basic: Some("closed"),
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-blf-offline".to_string();
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    stack
+        .blf
+        .watch(
+            &account.id,
+            &qsoftphone_core::model::account::BlfEntry {
+                watch: "105".to_string(),
+                dial: String::new(),
+            },
+        )
+        .expect("the extension was not watched");
+
+    // The lamp says offline.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut lamp = None;
+    while std::time::Instant::now() < deadline {
+        lamp = stack.blf.lamps(&account.id).into_iter().next();
+        if let Some(lamp) = &lamp {
+            if lamp.state == qsoftphone_core::sip::blf::BlfState::Offline {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let lamp = lamp.expect("the lamp never appeared");
+    assert_eq!(lamp.extension, "105");
+    assert_eq!(
+        lamp.state,
+        qsoftphone_core::sip::blf::BlfState::Offline,
+        "the extension's device is gone, so the lamp says offline"
+    );
+}
+
+/// An extension that **is** there and has no call is free.
+///
+/// The presence says `open` and the `dialog` event says no calls: the
+/// lamp says **free**, and not "offline" — the two events do not
+/// contradict each other.
+#[tokio::test]
+async fn an_extension_that_is_there_and_has_no_call_is_free() {
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: false,
+            dtmf: None,
+            challenge_invite: false,
+            challenge_subscribe: false,
+            transfer: None,
+            public_address: None,
+            bye_status: None,
+            early_media: false,
+            cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
+            // The extension has no call...
+            blf_state: Some("terminated"),
+            // ...and its device is there.
+            presence_basic: Some("open"),
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-blf-online".to_string();
+    stack.registrations.start(&account, 0);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    stack
+        .blf
+        .watch(
+            &account.id,
+            &qsoftphone_core::model::account::BlfEntry {
+                watch: "105".to_string(),
+                dial: String::new(),
+            },
+        )
+        .expect("the extension was not watched");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut lamp = None;
+    while std::time::Instant::now() < deadline {
+        lamp = stack.blf.lamps(&account.id).into_iter().next();
+        if let Some(lamp) = &lamp {
+            if lamp.state == qsoftphone_core::sip::blf::BlfState::Available {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let lamp = lamp.expect("the lamp never appeared");
+    assert_eq!(
+        lamp.state,
+        qsoftphone_core::sip::blf::BlfState::Available,
+        "the extension is there and has no call, so the lamp says free"
     );
 }
 
@@ -1242,6 +1534,7 @@ async fn a_subscribe_that_is_challenged_is_sent_again_with_the_credentials() {
             ring_delay: None,
             // The extension is on a call.
             blf_state: Some("confirmed"),
+            presence_basic: None,
         },
     ));
 
@@ -1288,10 +1581,14 @@ async fn a_subscribe_that_is_challenged_is_sent_again_with_the_credentials() {
 
     // The subscription went out **twice**: the first without
     // credentials, the second with them.
+    //
+    // The `dialog` event is the one this test is about: the client
+    // subscribes to the `presence` event as well, and that one is
+    // challenged on its own dialog.
     let requests = observations
         .lock()
         .expect("observations lock")
-        .requests("SUBSCRIBE");
+        .requests_for_event("SUBSCRIBE", "dialog");
     assert_eq!(
         requests.len(),
         2,
@@ -1391,6 +1688,7 @@ async fn a_server_that_does_not_serve_the_package_leaves_the_lamp_dark() {
             ring_delay: None,
             // The server does not serve the package.
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -1506,6 +1804,7 @@ async fn an_outgoing_call_connects_and_hangs_up() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -1628,6 +1927,7 @@ async fn the_call_goes_out_with_the_accounts_own_headers() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -1716,6 +2016,7 @@ async fn a_header_with_a_broken_name_does_not_go_out() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -1793,6 +2094,7 @@ async fn an_account_with_no_headers_sends_none() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -1862,6 +2164,7 @@ async fn an_incoming_call_rings_before_the_user_answers() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -1989,6 +2292,7 @@ async fn a_ringing_incoming_call_is_declined_when_it_is_hung_up() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -2059,6 +2363,7 @@ async fn a_dtmf_digit_arrives_as_an_event() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -2118,6 +2423,7 @@ async fn a_dtmf_digit_is_sent_as_an_info_request() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -2215,6 +2521,7 @@ fn a_call_placed_off_the_runtime_does_not_take_the_app_down() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -2289,6 +2596,7 @@ async fn a_challenged_invite_is_answered_with_the_account_digest() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -2472,6 +2780,7 @@ async fn an_in_dialog_request_carries_the_public_contact() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -2566,6 +2875,7 @@ async fn a_bye_the_peer_does_not_know_still_ends_the_call() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -2649,6 +2959,7 @@ async fn a_blind_transfer_reaches_the_peer_and_releases_the_original_call() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -2747,6 +3058,7 @@ async fn the_attended_transfer_names_the_consultation() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -2889,6 +3201,7 @@ async fn the_refer_goes_out_while_the_consultation_is_still_ringing() {
             ring_for: Some(1000),
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -3003,6 +3316,7 @@ async fn a_refer_to_a_call_that_has_not_rung_is_refused() {
             // been named when the transfer is attempted.
             ring_delay: Some(800),
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -3113,6 +3427,7 @@ async fn a_feature_code_transfer_is_typed_as_dtmf() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -3185,6 +3500,7 @@ async fn a_transfer_that_cannot_route_leaves_the_original_call_up() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -3273,6 +3589,7 @@ async fn a_call_can_be_held() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -3408,6 +3725,7 @@ async fn a_ringing_call_can_be_redirected() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -3497,6 +3815,7 @@ async fn a_ringing_without_media_says_that_there_is_none() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -3557,6 +3876,7 @@ async fn a_ringing_with_media_says_that_there_is_some() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 
@@ -3618,6 +3938,7 @@ async fn a_call_the_peer_cancels_ends() {
             ring_for: None,
             ring_delay: None,
             blf_state: None,
+            presence_basic: None,
         },
     ));
 

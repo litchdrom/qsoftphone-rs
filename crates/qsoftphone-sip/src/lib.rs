@@ -36,7 +36,7 @@ pub mod session;
 pub mod state;
 pub mod transfer;
 
-pub use blf::{BlfError, BlfLamp, BlfManager};
+pub use blf::{BlfError, BlfEvent, BlfLamp, BlfManager};
 pub use call::{CallBus, CallError, CallManager, CallUpdate};
 pub use digest::DigestInterop;
 pub use endpoint::{USER_AGENT, build_endpoint, split_host_port};

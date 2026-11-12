@@ -6,8 +6,15 @@
 //! and the server answers with a `dialog-info+xml` document that lists
 //! that address's dialogs.
 //!
-//! Everything here is a pure function over strings — the document is
-//! parsed, and the lamp is worked out from the dialogs in it. §6.
+//! **A lamp needs two events, not one.** The `dialog` event says what
+//! an extension is **doing**; the `presence` event says whether it is
+//! **there** at all. An extension that is offline has no dialogs, and
+//! no dialogs is exactly what "free" looks like — so a lamp that only
+//! listens to `dialog` can never say "offline", and says "free" about
+//! somebody who is not at their desk.
+//!
+//! Everything here is a pure function over strings — the documents are
+//! parsed, and the lamp is worked out from them. §6.
 
 use std::collections::BTreeMap;
 
@@ -18,6 +25,12 @@ pub enum BlfState {
     /// the server has not said anything yet.
     #[default]
     Unavailable,
+    /// The extension is **not there**: the device is gone.
+    ///
+    /// The `dialog` event cannot say this — an offline extension has no
+    /// dialogs, which is what "free" looks like. The `presence` event
+    /// says it: `closed` is not reachable.
+    Offline,
     /// The extension is free.
     Available,
     /// The extension is ringing — a call is coming in, or going out.
@@ -31,6 +44,7 @@ impl BlfState {
     pub fn label(self) -> &'static str {
         match self {
             BlfState::Unavailable => "unknown",
+            BlfState::Offline => "offline",
             BlfState::Available => "free",
             BlfState::Ringing => "ringing",
             BlfState::Busy => "busy",
@@ -46,6 +60,7 @@ impl BlfState {
     pub fn colour(self) -> (u8, u8, u8) {
         match self {
             BlfState::Unavailable => (140, 140, 140),
+            BlfState::Offline => (96, 96, 104),
             BlfState::Available => (120, 200, 120),
             BlfState::Ringing => (231, 176, 60),
             BlfState::Busy => (231, 76, 60),
@@ -216,6 +231,95 @@ fn dialog(id: String, state: Option<String>) -> Dialog {
     }
 }
 
+/// Whether an extension is reachable at all.
+///
+/// This is the `presence` event's answer, and it is the one the `dialog`
+/// event cannot give: an extension that is not registered has no
+/// dialogs, and "no dialogs" is what **free** looks like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PresenceBasic {
+    /// The extension is there.
+    Open,
+    /// The extension is not there — the device is gone.
+    Closed,
+    /// The document did not say.
+    #[default]
+    Unknown,
+}
+
+impl PresenceBasic {
+    /// The value the document named.
+    fn parse(text: &str) -> PresenceBasic {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "open" => PresenceBasic::Open,
+            "closed" => PresenceBasic::Closed,
+            _ => PresenceBasic::Unknown,
+        }
+    }
+
+    /// Is the extension offline?
+    pub fn is_offline(self) -> bool {
+        matches!(self, PresenceBasic::Closed)
+    }
+}
+
+/// What a presence document says about an extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Presence {
+    /// Whether the extension is reachable.
+    pub basic: PresenceBasic,
+    /// The server's own words, when it left any.
+    pub note: String,
+}
+
+/// Read a presence document.
+///
+/// The document is PIDF (RFC 3863): a `<presence>` element with a
+/// `<tuple>` for each device, and a `<basic>` under each tuple's
+/// `<status>` that says whether that device is there — `open` or
+/// `closed`.
+///
+/// `None` when the text is not a presence document at all. A presence
+/// document that says nothing about the basic status is read as
+/// **unknown**, not as "there": a lamp that says "free" about somebody
+/// it has not heard from is a lamp that lies.
+pub fn parse_presence(xml: &str) -> Option<Presence> {
+    let tags = tags(xml);
+    if !tags.iter().any(|tag| local_name(tag.name) == "presence") {
+        return None;
+    }
+
+    // A tuple per device: one device that is there is enough for the
+    // person to be at their desk, so `open` wins over `closed`.
+    let mut basic = PresenceBasic::Unknown;
+    let mut note = String::new();
+    for tag in &tags {
+        match local_name(tag.name) {
+            "basic" => {
+                let parsed = PresenceBasic::parse(tag.text);
+                if parsed == PresenceBasic::Open || basic == PresenceBasic::Unknown {
+                    basic = parsed;
+                }
+            }
+            "note" => note = tag.text.trim().to_string(),
+            _ => {}
+        }
+    }
+
+    Some(Presence { basic, note })
+}
+
+/// The name of an element, without its namespace prefix.
+///
+/// PIDF puts the data-model elements in a namespace of their own
+/// (`<dm:person />`), and the prefix is not part of the name.
+fn local_name(name: &str) -> &str {
+    match name.rsplit_once(':') {
+        Some((_, local)) => local,
+        None => name,
+    }
+}
+
 /// What the lamps of one watched extension say.
 ///
 /// The server sends the state of the **whole** extension with a `full`
@@ -232,6 +336,11 @@ pub struct Tracker {
     /// free: a lamp that says "free" when the truth is "we do not
     /// know" is a lamp that lies.
     heard: bool,
+    /// Whether the extension is reachable.
+    ///
+    /// This is the `presence` event's answer, and it is the one the
+    /// `dialog` event cannot give.
+    presence: PresenceBasic,
 }
 
 impl Tracker {
@@ -263,8 +372,37 @@ impl Tracker {
         self.state()
     }
 
+    /// Take a presence document and work out what the lamp says.
+    pub fn apply_presence(&mut self, presence: &Presence) -> BlfState {
+        self.presence = presence.basic;
+        self.state()
+    }
+
     /// What the lamp says now.
+    ///
+    /// Two facts go into it: whether the extension is **on a call** (the
+    /// `dialog` event) and whether it is **there at all** (the
+    /// `presence` event).
+    ///
+    /// A call that is up is the stronger of the two — an extension that
+    /// is on a call is busy, whatever its presence says — and an
+    /// extension that is not reachable is **offline**, not free.
     pub fn state(&self) -> BlfState {
+        let dialog = self.dialog_state();
+        if matches!(dialog, BlfState::Busy | BlfState::Ringing) {
+            return dialog;
+        }
+        if self.presence.is_offline() {
+            return BlfState::Offline;
+        }
+        dialog
+    }
+
+    /// What the **call state** alone says.
+    ///
+    /// The presence is not part of it: this is the lamp the `dialog`
+    /// event alone can light.
+    fn dialog_state(&self) -> BlfState {
         if !self.heard {
             return BlfState::Unavailable;
         }
@@ -763,10 +901,118 @@ mod tests {
         assert_eq!(BlfState::Available.label(), "free");
         assert_eq!(BlfState::Ringing.label(), "ringing");
         assert_eq!(BlfState::Unavailable.label(), "unknown");
+        assert_eq!(BlfState::Offline.label(), "offline");
 
         // Every lamp has a colour, and "free" is not the same colour
         // as "we do not know".
         assert_ne!(BlfState::Available.colour(), BlfState::Unavailable.colour());
         assert_ne!(BlfState::Busy.colour(), BlfState::Ringing.colour());
+        assert_ne!(BlfState::Offline.colour(), BlfState::Available.colour());
+    }
+
+    /// The presence document **MicroSIP** gets from Asterisk: the one
+    /// the user's own server sent for the watched extension.
+    const PRESENCE_OPEN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<presence entity="sip:104@193.178.169.164;transport=tcp" xmlns="urn:ietf:params:xml:ns:pidf" xmlns:dm="urn:ietf:params:xml:ns:pidf:data-model" xmlns:rpid="urn:ietf:params:xml:ns:pidf:rpid">
+ <note>Ready</note>
+ <tuple id="104">
+  <status>
+   <basic>open</basic>
+  </status>
+  <contact priority="1">sip:105@193.178.169.164</contact>
+ </tuple>
+ <dm:person />
+</presence>"#;
+
+    /// The same document for an extension whose device is gone.
+    const PRESENCE_CLOSED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<presence entity="sip:106@193.178.169.164;transport=tcp" xmlns="urn:ietf:params:xml:ns:pidf">
+ <note>Unavailable</note>
+ <tuple id="106">
+  <status>
+   <basic>closed</basic>
+  </status>
+ </tuple>
+</presence>"#;
+
+    #[test]
+    fn the_presence_document_is_read() {
+        let presence = parse_presence(PRESENCE_OPEN).expect("the document was not read");
+        assert_eq!(presence.basic, PresenceBasic::Open);
+        assert_eq!(presence.note, "Ready");
+
+        let presence = parse_presence(PRESENCE_CLOSED).expect("the document was not read");
+        assert_eq!(presence.basic, PresenceBasic::Closed);
+    }
+
+    #[test]
+    fn a_document_that_is_not_presence_is_not_presence() {
+        assert!(parse_presence(ASTERISK_FREE).is_none());
+        assert!(parse_presence("<nothing/>").is_none());
+    }
+
+    #[test]
+    fn a_presence_document_that_says_nothing_is_unknown() {
+        let xml = r#"<presence entity="sip:106@example.com" xmlns="urn:ietf:params:xml:ns:pidf">
+ <tuple id="106"><status/></tuple>
+</presence>"#;
+        let presence = parse_presence(xml).expect("the document was not read");
+        assert_eq!(presence.basic, PresenceBasic::Unknown);
+    }
+
+    #[test]
+    fn one_device_that_is_there_is_enough() {
+        // Two tuples: one device is registered and the other is not.
+        // The person is at their desk, so the extension is there.
+        let xml = r#"<presence entity="sip:105@example.com" xmlns="urn:ietf:params:xml:ns:pidf">
+ <tuple id="105a"><status><basic>closed</basic></status></tuple>
+ <tuple id="105b"><status><basic>open</basic></status></tuple>
+</presence>"#;
+        let presence = parse_presence(xml).expect("the document was not read");
+        assert_eq!(presence.basic, PresenceBasic::Open);
+    }
+
+    #[test]
+    fn an_extension_that_is_not_there_is_offline() {
+        // The `dialog` event says the extension has no calls, which is
+        // what "free" looks like. The `presence` event is what says
+        // the person is not there.
+        let mut tracker = Tracker::new();
+        tracker.apply(&parse(ASTERISK_FREE).expect("the document was not read"));
+        assert_eq!(tracker.state(), BlfState::Available);
+
+        let presence = parse_presence(PRESENCE_CLOSED).expect("the document was not read");
+        assert_eq!(
+            tracker.apply_presence(&presence),
+            BlfState::Offline,
+            "an extension whose device is gone is offline, not free"
+        );
+    }
+
+    #[test]
+    fn an_extension_that_is_there_and_free_is_free() {
+        let mut tracker = Tracker::new();
+        tracker.apply(&parse(ASTERISK_FREE).expect("the document was not read"));
+        let presence = parse_presence(PRESENCE_OPEN).expect("the document was not read");
+        assert_eq!(tracker.apply_presence(&presence), BlfState::Available);
+    }
+
+    #[test]
+    fn a_call_that_is_up_beats_the_presence() {
+        // A lamp that says "offline" about somebody who is on a call is
+        // lying about the call, which is the one thing it must not do.
+        let mut tracker = Tracker::new();
+        tracker.apply(&parse(ASTERISK_BUSY).expect("the document was not read"));
+        let presence = parse_presence(PRESENCE_CLOSED).expect("the document was not read");
+        assert_eq!(tracker.apply_presence(&presence), BlfState::Busy);
+    }
+
+    #[test]
+    fn the_presence_alone_does_not_make_a_lamp_free() {
+        // The extension is there, but nothing is known about its calls:
+        // that is "unknown", not "free".
+        let mut tracker = Tracker::new();
+        let presence = parse_presence(PRESENCE_OPEN).expect("the document was not read");
+        assert_eq!(tracker.apply_presence(&presence), BlfState::Unavailable);
     }
 }

@@ -20,10 +20,10 @@ use rsipstack::transaction::endpoint::Endpoint;
 use rsipstack::transaction::transaction::TransactionEventSender;
 
 use qsoftphone_core::model::account::Account;
-use qsoftphone_core::sip::blf::{BlfState, DialogInfo};
+use qsoftphone_core::sip::blf::{BlfState, DialogInfo, Presence};
 use qsoftphone_media::{MediaConfig, MediaSession};
 
-use crate::blf::{BlfLamp, BlfSubscription};
+use crate::blf::{BlfEvent, BlfLamp, BlfSubscription};
 use crate::inspector::PublicAddress;
 
 /// One account's SIP session.
@@ -314,8 +314,28 @@ impl AccountSession {
             .lock()
             .expect("blf lock")
             .values()
-            .find(|subscription| subscription.call_id == call_id)
+            .find(|subscription| {
+                subscription.dialog.call_id == call_id || subscription.presence.call_id == call_id
+            })
             .cloned()
+    }
+
+    /// Which event a `NOTIFY` belongs to.
+    ///
+    /// The two events are served on two dialogs with two Call-IDs, and
+    /// the body is different in each: the `dialog` event comes back as
+    /// a `dialog-info+xml` document and the `presence` event as a PIDF
+    /// one. The Call-ID says which of the two this is.
+    pub fn blf_event_of(&self, call_id: &str) -> Option<BlfEvent> {
+        let subscriptions = self.blf.lock().expect("blf lock");
+        let subscription = subscriptions.values().find(|subscription| {
+            subscription.dialog.call_id == call_id || subscription.presence.call_id == call_id
+        })?;
+        if subscription.dialog.call_id == call_id {
+            Some(BlfEvent::Dialog)
+        } else {
+            Some(BlfEvent::Presence)
+        }
     }
 
     /// Apply a state that arrived for one of the subscriptions.
@@ -326,8 +346,21 @@ impl AccountSession {
         let mut subscriptions = self.blf.lock().expect("blf lock");
         let subscription = subscriptions
             .values_mut()
-            .find(|subscription| subscription.call_id == call_id)?;
+            .find(|subscription| subscription.dialog.call_id == call_id)?;
         Some(subscription.tracker.apply(info))
+    }
+
+    /// Apply a presence that arrived for one of the subscriptions.
+    ///
+    /// It is the other half of the lamp: the `dialog` event says what
+    /// the extension is doing, and the `presence` event says whether it
+    /// is there at all.
+    pub fn apply_presence(&self, call_id: &str, presence: &Presence) -> Option<BlfState> {
+        let mut subscriptions = self.blf.lock().expect("blf lock");
+        let subscription = subscriptions
+            .values_mut()
+            .find(|subscription| subscription.presence.call_id == call_id)?;
+        Some(subscription.tracker.apply_presence(presence))
     }
 
     /// Remember the tag the server put on its `To`.
@@ -336,40 +369,49 @@ impl AccountSession {
     /// carries the tags of the dialog it belongs to.
     pub fn set_blf_to_tag(&self, call_id: &str, tag: &str) {
         let mut subscriptions = self.blf.lock().expect("blf lock");
-        if let Some(subscription) = subscriptions
-            .values_mut()
-            .find(|subscription| subscription.call_id == call_id)
-        {
-            subscription.to_tag = tag.to_string();
+        for subscription in subscriptions.values_mut() {
+            if subscription.dialog.call_id == call_id {
+                subscription.dialog.to_tag = tag.to_string();
+            } else if subscription.presence.call_id == call_id {
+                subscription.presence.to_tag = tag.to_string();
+            }
         }
     }
 
     /// Remember the CSeq of the last SUBSCRIBE that was sent.
     pub fn set_blf_cseq(&self, call_id: &str, cseq: u32) {
         let mut subscriptions = self.blf.lock().expect("blf lock");
-        if let Some(subscription) = subscriptions
-            .values_mut()
-            .find(|subscription| subscription.call_id == call_id)
-        {
-            subscription.cseq = cseq;
+        for subscription in subscriptions.values_mut() {
+            if subscription.dialog.call_id == call_id {
+                subscription.dialog.cseq = cseq;
+            } else if subscription.presence.call_id == call_id {
+                subscription.presence.cseq = cseq;
+            }
         }
     }
 
     /// The Call-ID, the CSeq and the two tags of a subscription, for
     /// the refresh.
-    pub fn blf_refresh_of(&self, extension: &str) -> Option<(String, u32, String, String)> {
-        self.blf
-            .lock()
-            .expect("blf lock")
-            .get(extension)
-            .map(|subscription| {
-                (
-                    subscription.call_id.clone(),
-                    subscription.cseq,
-                    subscription.from_tag.clone(),
-                    subscription.to_tag.clone(),
-                )
-            })
+    ///
+    /// The two events are refreshed on their own: each of them has its
+    /// own dialog, its own Call-ID and its own lifetime.
+    pub fn blf_refresh_of(
+        &self,
+        extension: &str,
+        event: BlfEvent,
+    ) -> Option<(String, u32, String, String)> {
+        let subscriptions = self.blf.lock().expect("blf lock");
+        let subscription = subscriptions.get(extension)?;
+        let handle = match event {
+            BlfEvent::Dialog => &subscription.dialog,
+            BlfEvent::Presence => &subscription.presence,
+        };
+        Some((
+            handle.call_id.clone(),
+            handle.cseq,
+            handle.from_tag.clone(),
+            handle.to_tag.clone(),
+        ))
     }
 }
 

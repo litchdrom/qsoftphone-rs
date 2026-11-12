@@ -37,24 +37,55 @@ use crate::call::{aor_for, aor_of, credential_of};
 use crate::digest;
 use crate::session::{AccountSession, SessionRegistry};
 
-/// The event package a Busy Lamp Field subscription asks for.
+/// The events a Busy Lamp Field subscription can be for.
 ///
-/// **The name is the server's.** RFC 3903 calls the package
-/// `dialog-info`, PJSUA asks for `dialog-info+simulimit`, and Asterisk
-/// calls it **`dialog`** — and a server answers `489 Bad Event` for a
-/// package it does not know.
+/// Asterisk serves **two** of them, and they say different things:
 ///
-/// Asterisk's own list is the one to go by: `res_pjsip_exten_state`
-/// handles the `presence` and `dialog` events, and the `dialog` event
-/// is the busy lamp — it says what the **address of record** is doing,
-/// not what each of its devices is doing separately.
+/// | event | body | says |
+/// |---|---|---|
+/// | `dialog` | `application/dialog-info+xml` | whether the extension is **on a call** |
+/// | `presence` | `application/pidf+xml` | whether the extension is **there at all** |
 ///
-/// The body that comes back is still `application/dialog-info+xml`: the
-/// content type does not follow the event's name.
-pub const EVENT_PACKAGE: &str = "dialog";
+/// A lamp that only listens to `dialog` can never say *offline*: an
+/// extension whose device is gone has no dialogs, and no dialogs is
+/// exactly what "free" looks like. So a lamp that wants to tell
+/// "free" from "not at their desk" has to listen to both — and the
+/// `dialog` event is the one that says what they are **doing**, while
+/// the `presence` event says whether they are **there**.
+///
+/// The body's content type does not follow the event's name: the
+/// `dialog` event comes back as `application/dialog-info+xml` and the
+/// `presence` event as `application/pidf+xml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlfEvent {
+    /// The call state: the busy lamp proper.
+    Dialog,
+    /// The reachability: whether the device is registered at all.
+    Presence,
+}
 
-/// The content type the document comes in.
-pub const EVENT_CONTENT_TYPE: &str = "application/dialog-info+xml";
+impl BlfEvent {
+    /// The name the **server** calls the package.
+    ///
+    /// RFC 3903 calls the busy-lamp package `dialog-info`, PJSUA asks
+    /// for `dialog-info+simulimit`, and Asterisk calls it **`dialog`**
+    /// — and a server answers `489 Bad Event` for a package it does
+    /// not know.
+    pub fn package(self) -> &'static str {
+        match self {
+            BlfEvent::Dialog => "dialog",
+            BlfEvent::Presence => "presence",
+        }
+    }
+
+    /// The content type the document comes in.
+    pub fn content_type(self) -> &'static str {
+        match self {
+            BlfEvent::Dialog => "application/dialog-info+xml",
+            BlfEvent::Presence => "application/pidf+xml",
+        }
+    }
+}
 
 /// How long a subscription lasts, and how long before it is refreshed.
 ///
@@ -74,8 +105,20 @@ pub enum BlfError {
     NotRegistered,
     /// The address of record is not a SIP URI.
     BadTarget(String),
+    /// The server does not serve this package: `489 Bad Event`.
+    ///
+    /// It is not a failure — it is the server saying "I have no such
+    /// thing" — and the lamp goes on what the **other** event says.
+    NotServed,
     /// The stack refused.
     Sip(String),
+}
+
+impl BlfError {
+    /// Did the server simply not serve this package?
+    pub fn is_not_served(&self) -> bool {
+        matches!(self, BlfError::NotServed)
+    }
 }
 
 impl fmt::Display for BlfError {
@@ -83,6 +126,7 @@ impl fmt::Display for BlfError {
         match self {
             BlfError::NotRegistered => write!(f, "the account is not registered"),
             BlfError::BadTarget(target) => write!(f, "{target} is not a SIP URI"),
+            BlfError::NotServed => write!(f, "the server does not serve this event"),
             BlfError::Sip(e) => write!(f, "{e}"),
         }
     }
@@ -110,6 +154,23 @@ pub struct BlfLamp {
     pub state: BlfState,
 }
 
+/// One event subscription: the dialog it runs on.
+///
+/// A subscription is identified by its **Call-ID**: the `NOTIFY`s come
+/// back on it, and it is how a `NOTIFY` is told apart from somebody
+/// else's.
+#[derive(Debug, Clone)]
+pub struct BlfHandle {
+    /// The Call-ID of the SUBSCRIBE.
+    pub call_id: String,
+    /// The tag we put on our `From`.
+    pub from_tag: String,
+    /// The tag the server put on its `To`, once it has answered.
+    pub to_tag: String,
+    /// The CSeq of the last SUBSCRIBE we sent.
+    pub cseq: u32,
+}
+
 /// The subscription of one watched extension.
 ///
 /// It lives in the session, because the `NOTIFY` that updates it arrives
@@ -122,17 +183,14 @@ pub struct BlfSubscription {
     pub aor: String,
     /// The number that is dialled when the lamp is pressed.
     pub dial: String,
-    /// The Call-ID of the SUBSCRIBE.
+    /// The `dialog` subscription — what the extension is doing.
+    pub dialog: BlfHandle,
+    /// The `presence` subscription — whether the extension is there.
     ///
-    /// The `NOTIFY`s carry it, and it is how the two are matched.
-    pub call_id: String,
-    /// The tag we put on our `From`.
-    pub from_tag: String,
-    /// The tag the server put on its `To`, once it has answered.
-    pub to_tag: String,
-    /// The CSeq of the last SUBSCRIBE we sent.
-    pub cseq: u32,
-    /// What is known about the dialogs of that address.
+    /// It is a second dialog with a second Call-ID: the server serves
+    /// the two events separately, and answers each of them on its own.
+    pub presence: BlfHandle,
+    /// What is known about the extension.
     pub tracker: Tracker,
 }
 
@@ -171,7 +229,12 @@ impl BlfManager {
     /// second is what pressing the lamp does, and it never goes on the
     /// wire.
     ///
-    /// The subscription is registered **before** the SUBSCRIBE goes
+    /// **Two** subscriptions go out: the `dialog` event, which says
+    /// what the extension is doing, and the `presence` event, which
+    /// says whether it is there at all. They are two dialogs with two
+    /// Call-IDs, and the server answers each of them on its own.
+    ///
+    /// The subscriptions are registered **before** the SUBSCRIBEs go
     /// out: the server is allowed to send the first `NOTIFY` before the
     /// `202 Accepted` has been read, and a lamp that missed it would
     /// show the wrong thing.
@@ -187,61 +250,93 @@ impl BlfManager {
         // a SUBSCRIBE that goes to the wrong port never comes back.
         let aor = aor_for(&extension, &session.account);
 
-        let request = subscribe_request(&session, &aor, 1, EXPIRES_SECONDS, None, None, None)?;
-        let call_id = request
-            .call_id_header()
-            .map_err(|e| BlfError::Sip(e.to_string()))?
-            .value()
-            .to_string();
-        let from_tag = request
-            .from_header()
-            .map_err(|e| BlfError::Sip(e.to_string()))?
-            .tag()
-            .map_err(|e| BlfError::Sip(e.to_string()))?
-            .map(|tag| tag.value().to_string())
-            .unwrap_or_default();
+        // The two requests are built **once** each: the Call-ID is what
+        // the server's `NOTIFY` comes back on, and a request built
+        // twice carries two Call-IDs and the subscription never hears
+        // from the server.
+        let dialog = subscribe_request(
+            &session,
+            &SubscribeSpec {
+                aor: aor.clone(),
+                cseq: 1,
+                expires: EXPIRES_SECONDS,
+                call_id: None,
+                from_tag: None,
+                to_tag: None,
+                event: BlfEvent::Dialog,
+            },
+        )?;
+        let presence = subscribe_request(
+            &session,
+            &SubscribeSpec {
+                aor: aor.clone(),
+                cseq: 1,
+                expires: EXPIRES_SECONDS,
+                call_id: None,
+                from_tag: None,
+                to_tag: None,
+                event: BlfEvent::Presence,
+            },
+        )?;
+
+        let dialog_handle = handle_of(&dialog)?;
+        let presence_handle = handle_of(&presence)?;
 
         session.remember_blf(BlfSubscription {
             extension: extension.clone(),
             aor: aor.clone(),
             dial: entry.dial_target().to_string(),
-            call_id: call_id.clone(),
-            from_tag: from_tag.clone(),
-            to_tag: String::new(),
-            cseq: 1,
+            dialog: dialog_handle.clone(),
+            presence: presence_handle.clone(),
             tracker: Tracker::new(),
         });
 
-        // The SUBSCRIBE goes out on the runtime: the endpoint lives
+        // The SUBSCRIBEs go out on the runtime: the endpoint lives
         // there, and the interface thread is not on it (§3).
         //
         // The task is spawned **onto** that runtime, so it runs in its
         // context — which is what the stack's own `tokio::spawn` calls
         // need. There is no `enter()` guard here: it is not `Send`, and
         // a guard held across an await would take the task with it.
-        let session_for_task = session.clone();
-        let aor = aor.to_string();
-        let extension = extension.to_string();
-        let spec = SubscribeSpec {
-            aor: aor.clone(),
-            cseq: 1,
-            expires: EXPIRES_SECONDS,
-            call_id: Some(call_id.clone()),
-            from_tag: Some(from_tag),
-            to_tag: None,
-        };
-        self.handle.spawn(async move {
-            // The request goes out with the Call-ID the subscription was
-            // registered under: the `NOTIFY` comes back on it. A request
-            // built with another Call-ID would leave the lamp deaf.
-            match send_subscribe(&session_for_task, &spec).await {
-                Ok(cseq) => session_for_task.set_blf_cseq(&call_id, cseq),
-                Err(e) => {
-                    warn!(error = %e, "the Busy Lamp Field subscription could not be sent");
+        for (event, handle) in [
+            (BlfEvent::Dialog, dialog_handle),
+            (BlfEvent::Presence, presence_handle),
+        ] {
+            let session_for_task = session.clone();
+            let aor = aor.to_string();
+            let extension = extension.to_string();
+            let spec = SubscribeSpec {
+                aor: aor.clone(),
+                cseq: 1,
+                expires: EXPIRES_SECONDS,
+                call_id: Some(handle.call_id.clone()),
+                from_tag: Some(handle.from_tag.clone()),
+                to_tag: None,
+                event,
+            };
+            self.handle.spawn(async move {
+                // The request goes out with the Call-ID the subscription was
+                // registered under: the `NOTIFY` comes back on it. A request
+                // built with another Call-ID would leave the lamp deaf.
+                match send_subscribe(&session_for_task, &spec).await {
+                    Ok(cseq) => session_for_task.set_blf_cseq(&handle.call_id, cseq),
+                    Err(e) => {
+                        // A server that does not serve the package says
+                        // `489 Bad Event`. That is not a failure: the lamp
+                        // simply goes on what the other event says.
+                        if e.is_not_served() {
+                            info!(
+                                event = event.package(),
+                                "the server does not serve this event: the lamp goes on the other one"
+                            );
+                        } else {
+                            warn!(error = %e, event = event.package(), "the Busy Lamp Field subscription could not be sent");
+                        }
+                    }
                 }
-            }
-            refresh_loop(session_for_task, extension, aor).await;
-        });
+                refresh_loop(session_for_task, extension, aor, event).await;
+            });
+        }
 
         Ok(())
     }
@@ -295,6 +390,34 @@ struct SubscribeSpec {
     from_tag: Option<String>,
     /// The tag on the server's `To`.
     to_tag: Option<String>,
+    /// The event the subscription is for.
+    event: BlfEvent,
+}
+
+/// The handle of a request that has not gone out yet.
+///
+/// The Call-ID and the tag are the dialog's, and they are what the
+/// `NOTIFY` comes back on.
+fn handle_of(request: &Request) -> Result<BlfHandle, BlfError> {
+    let call_id = request
+        .call_id_header()
+        .map_err(|e| BlfError::Sip(e.to_string()))?
+        .value()
+        .to_string();
+    let from_tag = request
+        .from_header()
+        .map_err(|e| BlfError::Sip(e.to_string()))?
+        .tag()
+        .map_err(|e| BlfError::Sip(e.to_string()))?
+        .map(|tag| tag.value().to_string())
+        .unwrap_or_default();
+
+    Ok(BlfHandle {
+        call_id,
+        from_tag,
+        to_tag: String::new(),
+        cseq: 1,
+    })
 }
 
 /// Send the SUBSCRIBE and wait for the answer.
@@ -317,15 +440,7 @@ async fn send_subscribe(
     session: &Arc<AccountSession>,
     spec: &SubscribeSpec,
 ) -> Result<u32, BlfError> {
-    let request = subscribe_request(
-        session,
-        &spec.aor,
-        spec.cseq,
-        spec.expires,
-        spec.call_id.clone(),
-        spec.from_tag.clone(),
-        spec.to_tag.clone(),
-    )?;
+    let request = subscribe_request(session, spec)?;
 
     let first = send_once(session, &request).await?;
     let (response, cseq) = match digest::challenge_of(&first) {
@@ -369,15 +484,7 @@ async fn send_subscribe(
                 ),
                 ..spec.clone()
             };
-            let mut retry_request = subscribe_request(
-                session,
-                &retry.aor,
-                retry.cseq,
-                retry.expires,
-                retry.call_id.clone(),
-                retry.from_tag.clone(),
-                retry.to_tag.clone(),
-            )?;
+            let mut retry_request = subscribe_request(session, &retry)?;
             retry_request.headers.push(authorization);
 
             info!("the server asked for credentials: the subscription is sent again");
@@ -398,10 +505,24 @@ async fn send_subscribe(
                 }
             }
         }
-        info!(code, "the Busy Lamp Field subscription was accepted");
+        info!(
+            code,
+            event = spec.event.package(),
+            "the Busy Lamp Field subscription was accepted"
+        );
         return Ok(cseq);
     }
-    warn!(code, "the server refused the Busy Lamp Field subscription");
+    // `489 Bad Event` means the server does not serve this package at
+    // all — it has no such event, and it will never send a `NOTIFY`
+    // for it. The lamp goes on the other event.
+    if code == 489 {
+        return Err(BlfError::NotServed);
+    }
+    warn!(
+        code,
+        event = spec.event.package(),
+        "the server refused the Busy Lamp Field subscription"
+    );
     Err(BlfError::Sip(format!("the server answered {code}")))
 }
 
@@ -432,13 +553,19 @@ async fn send_once(session: &Arc<AccountSession>, request: &Request) -> Result<R
 /// A subscription that is not refreshed ends, and a lamp that has gone
 /// dark says "free" when the truth is "we stopped listening" — which is
 /// the one thing a lamp must never say.
-async fn refresh_loop(session: Arc<AccountSession>, extension: String, aor: String) {
+async fn refresh_loop(
+    session: Arc<AccountSession>,
+    extension: String,
+    aor: String,
+    event: BlfEvent,
+) {
     loop {
         tokio::time::sleep(REFRESH_AFTER).await;
 
         // The refresh is an in-dialog SUBSCRIBE: the same Call-ID, the
         // same tags, a new CSeq (RFC 6665 §4).
-        let Some((call_id, cseq, from_tag, to_tag)) = session.blf_refresh_of(&extension) else {
+        let Some((call_id, cseq, from_tag, to_tag)) = session.blf_refresh_of(&extension, event)
+        else {
             // The extension is not watched any more.
             return;
         };
@@ -449,16 +576,25 @@ async fn refresh_loop(session: Arc<AccountSession>, extension: String, aor: Stri
             call_id: Some(call_id.clone()),
             from_tag: Some(from_tag),
             to_tag: Some(to_tag),
+            event,
         };
         match send_subscribe(&session, &spec).await {
             Ok(cseq) => {
                 // The CSeq that was really used: a refresh that was
                 // challenged used two of them.
                 session.set_blf_cseq(&call_id, cseq);
-                info!("the Busy Lamp Field subscription was refreshed");
+                info!(
+                    event = event.package(),
+                    "the Busy Lamp Field subscription was refreshed"
+                );
             }
             Err(e) => {
-                warn!(error = %e, "the Busy Lamp Field subscription could not be refreshed");
+                if e.is_not_served() {
+                    // The server does not serve this package: there is
+                    // nothing to refresh.
+                    return;
+                }
+                warn!(error = %e, event = event.package(), "the Busy Lamp Field subscription could not be refreshed");
                 return;
             }
         }
@@ -477,17 +613,13 @@ async fn refresh_loop(session: Arc<AccountSession>, extension: String, aor: Stri
 /// put on its `To` — RFC 6665 §4.
 fn subscribe_request(
     session: &Arc<AccountSession>,
-    aor: &str,
-    cseq: u32,
-    expires: u32,
-    call_id: Option<String>,
-    from_tag: Option<String>,
-    to_tag: Option<String>,
+    spec: &SubscribeSpec,
 ) -> Result<Request, BlfError> {
     let account = &session.account;
-    let uri: Uri = aor
+    let uri: Uri = spec
+        .aor
         .parse()
-        .map_err(|_| BlfError::BadTarget(aor.to_string()))?;
+        .map_err(|_| BlfError::BadTarget(spec.aor.to_string()))?;
 
     let caller: Uri = aor_of(account)
         .parse()
@@ -502,7 +634,7 @@ fn subscribe_request(
     // Our tag on the `From`. A refresh carries the **same** one: the
     // dialog is identified by the two tags, and a new one would make a
     // new dialog.
-    let from = match from_tag {
+    let from = match spec.from_tag.clone() {
         Some(tag) if !tag.is_empty() => rsipstack::sip::typed::From {
             display_name: None,
             uri: caller,
@@ -518,7 +650,7 @@ fn subscribe_request(
 
     // The server's tag, when this is a refresh: an in-dialog request
     // carries the tags of the dialog it belongs to.
-    let params = match to_tag {
+    let params = match spec.to_tag.clone() {
         Some(tag) if !tag.is_empty() => vec![rsipstack::sip::uri::Param::Tag(tag.into())],
         _ => vec![],
     };
@@ -528,7 +660,7 @@ fn subscribe_request(
         params,
     };
 
-    let call_id = match call_id {
+    let call_id = match spec.call_id.clone() {
         Some(call_id) => Some(rsipstack::sip::headers::CallId::new(call_id)),
         None => Some(rsipstack::transaction::make_call_id(
             None,
@@ -536,21 +668,25 @@ fn subscribe_request(
         )),
     };
 
-    let mut request =
-        session
-            .endpoint
-            .inner
-            .make_request(Method::Subscribe, uri, via, from, to, cseq, call_id);
+    let mut request = session.endpoint.inner.make_request(
+        Method::Subscribe,
+        uri,
+        via,
+        from,
+        to,
+        spec.cseq,
+        call_id,
+    );
 
     request
         .headers
-        .push(Header::Event(Event::new(EVENT_PACKAGE)));
+        .push(Header::Event(Event::new(spec.event.package())));
     request
         .headers
-        .push(Header::Accept(Accept::new(EVENT_CONTENT_TYPE)));
+        .push(Header::Accept(Accept::new(spec.event.content_type())));
     request
         .headers
-        .push(Header::Expires(Expires::new(expires.to_string())));
+        .push(Header::Expires(Expires::new(spec.expires.to_string())));
     request.headers.push(Header::Contact(Contact::new(
         crate::call::contact_uri(account, session).to_string(),
     )));
@@ -564,6 +700,12 @@ fn subscribe_request(
 /// `NOTIFY` that is not answered is a subscription the server gives up
 /// on. The document is read afterwards — the answer does not depend on
 /// it.
+///
+/// **Which** document it is comes from the subscription the `NOTIFY`
+/// belongs to, and the subscription is found by its **Call-ID**: the
+/// `dialog` event comes back as a `dialog-info+xml` document and the
+/// `presence` event as a PIDF one, and the two are read by different
+/// parsers.
 pub async fn handle_notify(
     session: Arc<AccountSession>,
     mut transaction: Transaction,
@@ -586,17 +728,33 @@ pub async fn handle_notify(
         .await
         .map_err(|e| BlfError::Sip(e.to_string()))?;
 
-    let body = String::from_utf8_lossy(&request.body).to_string();
-    let Some(info) = blf::parse(&body) else {
-        warn!("the Busy Lamp Field document was not read");
+    // A NOTIFY for a subscription we do not have: somebody else's
+    // business, or one that has already ended.
+    let Some(event) = session.blf_event_of(&call_id) else {
         return Ok(());
     };
 
-    let Some(state) = session.apply_blf(&call_id, &info) else {
-        // A NOTIFY for a subscription we do not have: somebody else's
-        // business, or one that has already ended.
+    let body = String::from_utf8_lossy(&request.body).to_string();
+    let state = match event {
+        BlfEvent::Dialog => {
+            let Some(info) = blf::parse(&body) else {
+                warn!("the Busy Lamp Field document was not read");
+                return Ok(());
+            };
+            session.apply_blf(&call_id, &info)
+        }
+        BlfEvent::Presence => {
+            let Some(presence) = blf::parse_presence(&body) else {
+                warn!("the presence document was not read");
+                return Ok(());
+            };
+            session.apply_presence(&call_id, &presence)
+        }
+    };
+
+    let Some(state) = state else {
         return Ok(());
     };
-    info!(call_id, state = ?state, "the Busy Lamp Field state arrived");
+    info!(call_id, event = event.package(), state = ?state, "the Busy Lamp Field state arrived");
     Ok(())
 }
