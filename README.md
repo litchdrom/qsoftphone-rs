@@ -4604,6 +4604,53 @@ lamps are a list in the session.
 
 ---
 
+## M6.8 — The account page you can get through
+
+*"The problem is in usability of adding new account. First expanded with
+the headers and blf. No way to scroll or collapse persisting account."*
+
+The account editor is **one long column**: the ten fields, the custom
+headers, the watched extensions, the buttons, the registration, the form
+for another account and the paths. It did not scroll, and the two blocks
+that grow with the account — the headers and the lamps — could not be
+folded away.
+
+So the first account, the one with a dozen headers and a dozen watched
+extensions, filled the page twice over, and the form for the **next**
+account was somewhere below the bottom of the window with no way to get
+to it. There was no scrolling and nothing to collapse.
+
+Three things changed, and they are all in the interface:
+
+* **The account page scrolls.** A field that cannot be reached is a
+  field that does not exist, and the settings page has scrolled since
+  M6.1 — the account page had not, and now it does.
+* **The headers and the lamps fold away.** `CUSTOM HEADERS` and
+  `WATCHED EXTENSIONS` are collapsible blocks, open to begin with, and
+  the account underneath them is a page of its own again.
+* **The **+ Add** button brings the form with it.** It opens the form
+  for another account *and* scrolls the page to it, so the button that
+  says "add" puts the place to add in front of the user. The form
+  closes again once the account is saved, because a form that stays
+  open is a form that gets the same account saved twice.
+
+Nothing on the wire changed, and nothing in the database did: the same
+fields, the same headers, the same lamps, the same account.
+
+### What is proved
+
+* **The page scrolls.** The form for another account is below the fold
+  in a short window — it is not painted at all — and after the **+ Add**
+  button is pressed it is on the screen: the page scrolled to it.
+* **The headers and the lamps fold away.** Clicking `CUSTOM HEADERS`
+  takes the header rows with it; clicking `WATCHED EXTENSIONS` takes
+  the watched extensions with it. Both are folded away *by the user*,
+  not by the app deciding they are not interesting.
+* **The **+ Add** button opens the form**, and the form's own **Add**
+  button is there when it is open.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -4657,6 +4704,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.5** | The transfer completed while the target is ringing: **Complete transfer** is live as soon as the target rings, the server finishes the transfer, and a consultation that dies after the REFER is the server's business rather than the user calling it off | **done** |
 | **M6.6** | The headers an account puts on its own calls: a per-account list of `X-var1=…` that goes on the INVITE, with `$callerid` / `$called` / `$user` / `$account` as the values | **done** |
 | **M6.7** | The Busy Lamp Field: RFC 3903 `dialog` **and** `presence` subscriptions, the two kinds of `NOTIFY` document read by hand, and the lamps in the left panel below the accounts — each lamp a button that dials the number the account has for that extension, and each lamp able to say *busy*, *ringing*, *free*, *offline* or *unknown* | **done** |
+| **M6.8** | The account page you can get through: the page scrolls, the custom headers and the watched extensions fold away, and the **+ Add** button opens the form for another account and scrolls to it | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -4720,7 +4768,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 499 tests, all passing.
+* `cargo test --workspace` — 501 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -4885,6 +4933,11 @@ player lands.
 * **One device that is there is enough.** An address of record with two
   devices, one registered and one not, is an extension that is at its
   desk: `open` wins over `closed`.
+* **The account page scrolls, and the blocks on it fold away.** The
+  custom headers and the watched extensions are collapsible, and the
+  form for another account is reachable: the **+ Add** button in the
+  left panel opens it and scrolls the page to it, so the button that
+  says "add" puts the place to add in front of the user.
 * **A server that serves only one of the two events still lights the
   lamp.** It answers `489 Bad Event` for the package it does not know,
   and the lamp goes on the other one — *busy*, *ringing* and *free* all

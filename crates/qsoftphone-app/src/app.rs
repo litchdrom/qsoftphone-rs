@@ -87,6 +87,13 @@ pub struct QSoftphoneApp {
     /// shared draft, typing a new account silently changed what
     /// "save" would write to the selected one.
     new_account: Draft,
+    /// What the user asked the "Add another account" form to do.
+    ///
+    /// The **+ Add** button in the left panel opens it, and a
+    /// successful add closes it again: a form that stays open after
+    /// the account is saved is a form that gets the same account
+    /// saved twice.
+    add_account_form: AddAccountForm,
     /// The form for the selected account.
     edit_account: Draft,
     /// The id the editor was loaded from.
@@ -253,6 +260,23 @@ enum View {
     Account,
     /// The sound and the codecs.
     Settings,
+}
+
+/// What the user asked the "Add another account" form to do.
+///
+/// The form is a collapsible block at the bottom of the account page,
+/// and the page is taller than a short window — so the **+ Add** button
+/// in the left panel has to be able to open it, or the button is a
+/// button that makes the user hunt for the thing it opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum AddAccountForm {
+    /// Leave the form as it is.
+    #[default]
+    Leave,
+    /// Open the form.
+    Open,
+    /// Close it again.
+    Close,
 }
 
 /// What the UI shows about one call.
@@ -563,6 +587,7 @@ impl QSoftphoneApp {
                 transport: "udp".to_string(),
                 ..Default::default()
             },
+            add_account_form: AddAccountForm::default(),
             edit_account: Draft::default(),
             editing_id: None,
             status: "Ready.".to_string(),
@@ -2106,6 +2131,10 @@ impl QSoftphoneApp {
                 self.selected = self.accounts.iter().position(|a| a.id == stored.id);
                 self.load_selected();
                 self.persist_active_account();
+                // The form closes again: a form that stays open after
+                // the account is saved is a form that gets the same
+                // account saved twice.
+                self.add_account_form = AddAccountForm::Close;
             }
             Err(e) => self.status = format!("Could not save the account: {e}"),
         }
@@ -2297,6 +2326,11 @@ impl QSoftphoneApp {
                 ui.horizontal(|ui| {
                     if ui.button("+ Add").clicked() {
                         self.view = View::Account;
+                        // The form is at the bottom of the account page,
+                        // and the page is longer than a short window:
+                        // the button opens the form rather than making
+                        // the user go and find it.
+                        self.add_account_form = AddAccountForm::Open;
                     }
                     if ui.button("Remove").clicked() {
                         self.delete_selected();
@@ -3349,7 +3383,21 @@ impl QSoftphoneApp {
     }
 
     /// The account page: the settings and the registration.
+    /// The account page.
+    ///
+    /// It **scrolls**. The editor is taller than a short window — ten
+    /// fields, the custom headers, the watched extensions and the form
+    /// for another account — and a field that cannot be reached is a
+    /// field that does not exist. The settings page scrolls for the
+    /// same reason.
     fn draw_account(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("account")
+            .show(ui, |ui| self.draw_account_body(ui));
+    }
+
+    /// The account editor itself.
+    fn draw_account_body(&mut self, ui: &mut egui::Ui) {
         let Some(account) = self.selected_account().cloned() else {
             ui.weak("Select an account, or add one.");
             return;
@@ -3463,8 +3511,141 @@ impl QSoftphoneApp {
         // They are their own block rather than two more rows of the
         // grid: there is one of them per header, and a grid row holds
         // one field.
+        //
+        // The block **collapses**: an account with a dozen headers and
+        // a dozen watched extensions is twice the page, and a page the
+        // user cannot get through is a page they stop using.
         ui.separator();
-        ui.label(egui::RichText::new("CUSTOM HEADERS").strong().size(11.0));
+        egui::CollapsingHeader::new(egui::RichText::new("CUSTOM HEADERS").strong().size(11.0))
+            .default_open(true)
+            .show(ui, |ui| {
+                self.draw_custom_headers(ui);
+            });
+
+        // The extensions whose lamps this account watches.
+        ui.separator();
+        egui::CollapsingHeader::new(
+            egui::RichText::new("WATCHED EXTENSIONS")
+                .strong()
+                .size(11.0),
+        )
+        .default_open(true)
+        .show(ui, |ui| {
+            self.draw_watched_extensions(ui);
+        });
+
+        ui.horizontal(|ui| {
+            if ui.button("Save").clicked() {
+                self.save_selected();
+            }
+            if ui.button("Revert").clicked() {
+                self.load_selected();
+                self.status = "Reverted.".to_string();
+            }
+        });
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Registration").strong());
+            ui.label(self.registration_state(&account.id).summary());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Unregister").clicked() {
+                    self.unregister_selected();
+                }
+                if ui.button("Register").clicked() {
+                    self.register_selected();
+                }
+            });
+        });
+
+        // The form for another account.
+        //
+        // It opens when the user asks for it: the **+ Add** button in
+        // the left panel opens the form and brings it into view. A
+        // button that leaves the form folded away at the bottom of a
+        // long page is a button that makes the user hunt for the thing
+        // it opened — and adding an account is the one thing on this
+        // page that has to be easy.
+        ui.separator();
+        let add_id = ui.make_persistent_id("add_account");
+        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            add_id,
+            false,
+        );
+        let mut opened = false;
+        match self.add_account_form {
+            AddAccountForm::Open => {
+                state.set_open(true);
+                state.store(ui.ctx());
+                opened = true;
+            }
+            AddAccountForm::Close => {
+                state.set_open(false);
+                state.store(ui.ctx());
+            }
+            AddAccountForm::Leave => {}
+        }
+        self.add_account_form = AddAccountForm::Leave;
+
+        // The header's own rectangle, so the page can scroll to it.
+        let mut header_rect: Option<egui::Rect> = None;
+        let mut title_clicked = false;
+        {
+            let mut header = state.show_header(ui, |ui| {
+                let title = ui.label(egui::RichText::new("Add another account").strong());
+                title_clicked = title.clicked();
+                header_rect = Some(ui.min_rect());
+            });
+            // The title folds the form away, like every other title on
+            // this page.
+            if title_clicked {
+                header.toggle();
+            }
+            header.body_unindented(|ui| {
+                let draft = &mut self.new_account;
+                ui.label("Label");
+                ui.text_edit_singleline(&mut draft.label);
+                ui.label("Registrar");
+                ui.text_edit_singleline(&mut draft.registrar);
+                ui.label("User");
+                ui.text_edit_singleline(&mut draft.user);
+                ui.label("Password");
+                ui.add(egui::TextEdit::singleline(&mut draft.password).password(true));
+                ui.horizontal(|ui| {
+                    ui.label("Transport");
+                    egui::ComboBox::from_id_salt("new_transport")
+                        .selected_text(&draft.transport)
+                        .show_ui(ui, |ui| {
+                            for t in ["udp", "tcp", "tls"] {
+                                ui.selectable_value(&mut draft.transport, t.to_string(), t);
+                            }
+                        });
+                });
+                if ui.button("Add").clicked() {
+                    self.add_account();
+                }
+            });
+        }
+        if opened {
+            if let Some(rect) = header_rect {
+                ui.scroll_to_rect(rect, Some(egui::Align::Center));
+            }
+        }
+
+        ui.separator();
+        egui::CollapsingHeader::new("Paths").show(ui, |ui| {
+            ui.monospace(format!("config  {}", self.paths.config_file().display()));
+            ui.monospace(format!("data    {}", self.paths.data_dir().display()));
+            ui.monospace(format!("logs    {}", self.paths.log_dir().display()));
+        });
+    }
+
+    /// The extra headers this account puts on its calls.
+    ///
+    /// They are the account's own policy, and a policy that lives on
+    /// another page is a policy nobody edits.
+    fn draw_custom_headers(&mut self, ui: &mut egui::Ui) {
         ui.weak(
             "Extra headers to send on the calls this account makes — a ticket number, \
              a CRM id, the queue.",
@@ -3510,14 +3691,10 @@ impl QSoftphoneApp {
         if ui.button("+ Add a header").clicked() {
             draft.custom_headers.push((String::new(), String::new()));
         }
+    }
 
-        // The extensions whose lamps this account watches.
-        ui.separator();
-        ui.label(
-            egui::RichText::new("WATCHED EXTENSIONS")
-                .strong()
-                .size(11.0),
-        );
+    /// The extensions whose lamps this account watches.
+    fn draw_watched_extensions(&mut self, ui: &mut egui::Ui) {
         ui.weak(
             "The lamps in the left panel say whether these extensions are free, busy or \
              ringing. Pressing a lamp dials the number in the second column — leave it \
@@ -3560,63 +3737,6 @@ impl QSoftphoneApp {
         if ui.button("+ Add an extension").clicked() {
             draft.blf_extensions.push(BlfEntry::default());
         }
-
-        ui.horizontal(|ui| {
-            if ui.button("Save").clicked() {
-                self.save_selected();
-            }
-            if ui.button("Revert").clicked() {
-                self.load_selected();
-                self.status = "Reverted.".to_string();
-            }
-        });
-
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Registration").strong());
-            ui.label(self.registration_state(&account.id).summary());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Unregister").clicked() {
-                    self.unregister_selected();
-                }
-                if ui.button("Register").clicked() {
-                    self.register_selected();
-                }
-            });
-        });
-
-        ui.separator();
-        egui::CollapsingHeader::new("Add another account").show(ui, |ui| {
-            let draft = &mut self.new_account;
-            ui.label("Label");
-            ui.text_edit_singleline(&mut draft.label);
-            ui.label("Registrar");
-            ui.text_edit_singleline(&mut draft.registrar);
-            ui.label("User");
-            ui.text_edit_singleline(&mut draft.user);
-            ui.label("Password");
-            ui.add(egui::TextEdit::singleline(&mut draft.password).password(true));
-            ui.horizontal(|ui| {
-                ui.label("Transport");
-                egui::ComboBox::from_id_salt("new_transport")
-                    .selected_text(&draft.transport)
-                    .show_ui(ui, |ui| {
-                        for t in ["udp", "tcp", "tls"] {
-                            ui.selectable_value(&mut draft.transport, t.to_string(), t);
-                        }
-                    });
-            });
-            if ui.button("Add").clicked() {
-                self.add_account();
-            }
-        });
-
-        ui.separator();
-        egui::CollapsingHeader::new("Paths").show(ui, |ui| {
-            ui.monospace(format!("config  {}", self.paths.config_file().display()));
-            ui.monospace(format!("data    {}", self.paths.data_dir().display()));
-            ui.monospace(format!("logs    {}", self.paths.log_dir().display()));
-        });
     }
 
     /// The Busy Lamp Field: the lamps of the extensions the selected
@@ -4896,6 +5016,26 @@ mod tests {
         })
     }
 
+    /// Where a piece of text is painted, as a rectangle.
+    ///
+    /// The shapes carry the text that was laid out, so this is where
+    /// the text ended up — even when it is below the fold of a scroll
+    /// area, which is the point: a test needs to know that the text
+    /// moved when the page was scrolled.
+    fn text_rect(output: &egui::FullOutput, text: &str) -> Option<egui::Rect> {
+        for clipped in &output.shapes {
+            if let egui::epaint::Shape::Text(text_shape) = &clipped.shape {
+                if text_shape.galley.job.text == text {
+                    return Some(egui::Rect::from_min_size(
+                        text_shape.pos,
+                        text_shape.galley.size(),
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     /// Click a button, by where it is.
     fn click_at(app: &mut QSoftphoneApp, ctx: &egui::Context, at: egui::Rect) {
         let pos = at.center();
@@ -5101,6 +5241,139 @@ mod tests {
         let cleaned = Draft::clean_entries(&entries);
         assert_eq!(cleaned.len(), 1);
         assert_eq!(cleaned[0].watch, "102");
+    }
+
+    #[tokio::test]
+    async fn the_add_button_opens_the_form_and_brings_it_into_view() {
+        // The user's report: the first account's headers and lamps fill
+        // the page, there is no way to scroll, and there is no way to
+        // fold the account away — so the form for another account is
+        // out of reach.
+        //
+        // The **+ Add** button in the left panel has to bring the form
+        // with it: it opens the form and the page scrolls to it.
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let handle = tokio::runtime::Handle::current();
+        let (mut app, _bus) = build_app(handle);
+        app.view = View::Account;
+
+        // A short window: the form is below the fold.
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1100.0, 400.0));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.draw(ui));
+        output.textures_delta.clear();
+
+        assert!(
+            text_rect(&output, "Add another account").is_none(),
+            "the form was on the screen to begin with, so there is nothing to prove"
+        );
+
+        // Press **+ Add** in the left panel.
+        let add = button_at(&output, "+ Add").expect("the left panel has no add button");
+        let pos = add.center();
+        let mut input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        input.events.push(egui::Event::PointerMoved(pos));
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        let mut output = ctx.run_ui(input, |ui| app.draw(ui));
+        output.textures_delta.clear();
+
+        // The page scrolls to it, and the scroll is animated — so the
+        // page needs a few frames to get there.
+        let mut painted = false;
+        for _ in 0..30 {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| app.draw(ui));
+            output.textures_delta.clear();
+            if text_rect(&output, "Add another account").is_some() {
+                painted = true;
+                break;
+            }
+        }
+        assert!(
+            painted,
+            "the + Add button did not bring the form for another account into view"
+        );
+
+        // And the form is open: its own **Add** button is there.
+        let output = frame(&mut app, &ctx);
+        assert!(
+            button_at(&output, "Add").is_some(),
+            "the form was not opened"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_headers_and_the_lamps_can_be_folded_away() {
+        // The user's report: the first account's headers and lamps
+        // fill the page, and there is no way to fold them away to get
+        // to the form for another account.
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+
+        app.accounts[0].custom_headers = vec![("X-var1".to_string(), "one".to_string())];
+        app.accounts[0].blf_extensions = vec![qsoftphone_core::model::account::BlfEntry {
+            watch: "105".to_string(),
+            dial: String::new(),
+        }];
+        app.load_selected();
+        app.view = View::Account;
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("X-var1"),
+            "the header is not on the page:\n{text}"
+        );
+
+        // Fold the headers away.
+        let header = button_at(&output, "CUSTOM HEADERS").expect("the page has no headers block");
+        click_at(&mut app, &ctx, header);
+        // The fold is an animation, so it takes a few frames.
+        for _ in 0..30 {
+            frame(&mut app, &ctx);
+        }
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            !text.contains("X-var1"),
+            "the headers did not fold away:\n{text}"
+        );
+
+        // And the lamps.
+        let output = frame(&mut app, &ctx);
+        let header = button_at(&output, "WATCHED EXTENSIONS").expect("the page has no lamps block");
+        click_at(&mut app, &ctx, header);
+        for _ in 0..30 {
+            frame(&mut app, &ctx);
+        }
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            !text.contains("The lamps in the left panel say"),
+            "the lamps did not fold away:\n{text}"
+        );
     }
 
     #[tokio::test]
