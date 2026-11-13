@@ -4651,6 +4651,80 @@ fields, the same headers, the same lamps, the same account.
 
 ---
 
+## M6.9 — Every account is a group
+
+*"Hello. Nice. Lets fix some ui issue — now to see all field for second and
+more accounts."*
+
+*"Second and after accounts simplified. Let's redo to expandable group for
+accounts — expand 104 — headers — ring tone; second have all registration
+field and also expandable and grouped. BLF should also have a link to
+account: like 105 — from acc 104 and so on."*
+
+M6.8 made the account page fit on the screen. It did not make the **second**
+account fit on it: the page showed the **selected** account and nothing
+else, so a second account had no fields at all — it could not be looked at,
+and it could not be changed.
+
+The page is now a list of **groups**, one per account:
+
+* **The selected account is open.** Its group shows the whole form.
+* **The others are folded to their title.** The title carries the account's
+  name, its user and server, and its registration state — so a folded
+  account still says who it is and whether it is up.
+* **A folded account keeps all of its fields.** Unfolding it is one click on
+  the arrow, and the fields are the same fields the first account has.
+* **Clicking the title picks the account.** The lamps in the left panel and
+  the registration follow the pick, the group's own **Register** and
+  **Unregister** buttons act on **that** account, and the account picked
+  before it folds away — so adding an account does not make the page long
+  again.
+
+Inside a group, the parts that grow with the account are **groups of their
+own** — `RING TONE`, `CUSTOM HEADERS` and `WATCHED EXTENSIONS` — folded
+away until they are asked for. The ten registration fields stay in the
+open, because they are what an account *is*.
+
+Each account also has a **form of its own** now. One shared draft meant that
+a field typed into the second account could be written into the first when
+the form was saved; every account has its own draft, its own **Save** and
+**Revert**, and its own ringtone.
+
+And the **lamps say whose they are**. The panel in the left side lists the
+watched extensions of **every** account, each row saying the account it
+belongs to:
+
+```
+● 105  00105
+  from acc 104 · unknown
+```
+
+The same extension watched by two accounts is two lamps — one per
+subscription — and the user can tell them apart. Pressing a lamp dials from
+the account that watches it.
+
+### What is proved
+
+* **Every account is a group.** With two accounts, both titles are on the
+  page; the selected one's fields are on the page and the other one's are
+  not, until it is picked.
+* **The title picks the account and opens its group.** Clicking the title
+  of the second account makes it the selected one, its fields come with it,
+  and the first account's fields fold away.
+* **Each account keeps a form of its own.** A field written into one
+  account's form is not in the other's, and saving one account leaves the
+  other exactly as it was in the store.
+* **The lamps say whose they are.** Both accounts' lamps are in the panel,
+  and each says `from acc …`.
+* **The blocks still fold.** The ringtone, the headers and the lamps are
+  folded away to begin with, and they open when they are asked for.
+
+Nothing on the wire changed, and nothing in the database did: the same
+fields, the same headers, the same lamps, the same accounts. What changed
+is that **every** account can now be seen and changed.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -4705,6 +4779,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.6** | The headers an account puts on its own calls: a per-account list of `X-var1=…` that goes on the INVITE, with `$callerid` / `$called` / `$user` / `$account` as the values | **done** |
 | **M6.7** | The Busy Lamp Field: RFC 3903 `dialog` **and** `presence` subscriptions, the two kinds of `NOTIFY` document read by hand, and the lamps in the left panel below the accounts — each lamp a button that dials the number the account has for that extension, and each lamp able to say *busy*, *ringing*, *free*, *offline* or *unknown* | **done** |
 | **M6.8** | The account page you can get through: the page scrolls, the custom headers and the watched extensions fold away, and the **+ Add** button opens the form for another account and scrolls to it | **done** |
+| **M6.9** | Every account is a group: the selected account is open, the others are folded to their title with all their fields in them, each account has a form of its own, and every lamp in the panel says the account that watches it | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -4768,7 +4843,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 501 tests, all passing.
+* `cargo test --workspace` — 506 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and

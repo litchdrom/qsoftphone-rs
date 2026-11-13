@@ -8,7 +8,7 @@
 //! which hands over a root `Ui` rather than a `Context`, and the
 //! panel types are unified into `egui::Panel`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -94,13 +94,25 @@ pub struct QSoftphoneApp {
     /// the account is saved is a form that gets the same account
     /// saved twice.
     add_account_form: AddAccountForm,
-    /// The form for the selected account.
-    edit_account: Draft,
-    /// The id the editor was loaded from.
+    /// The draft of each account, by account id.
     ///
-    /// The editor is reloaded whenever the selection changes, so a
-    /// form left half-typed is never written to a different account.
-    editing_id: Option<String>,
+    /// Every account is edited in its own group on the account page,
+    /// and two of them can be open at the same time — so each has its
+    /// own draft, and a form left half-typed in one is never written
+    /// to another.
+    edit_accounts: HashMap<String, Draft>,
+    /// The accounts whose group is open, by account id.
+    ///
+    /// The account page shows every account in a group of its own. The
+    /// account the user is working on is open; the others are folded
+    /// away to their title, and they keep all their fields — a folded
+    /// group is a group that can be unfolded, not an account that has
+    /// been taken away.
+    ///
+    /// There is one open group as a rule, and the arrow may open a
+    /// second one: the user asked for that one, and the app does not
+    /// take it away.
+    open_groups: HashSet<String>,
     status: String,
     /// The theme is applied once, on the first frame.
     theme_applied: bool,
@@ -588,8 +600,8 @@ impl QSoftphoneApp {
                 ..Default::default()
             },
             add_account_form: AddAccountForm::default(),
-            edit_account: Draft::default(),
-            editing_id: None,
+            edit_accounts: HashMap::new(),
+            open_groups: HashSet::new(),
             status: "Ready.".to_string(),
             theme_applied: false,
             first_frame_drawn: false,
@@ -1307,37 +1319,76 @@ impl QSoftphoneApp {
     }
 
     /// Load the selected account into the editor.
+    ///
+    /// The draft is loaded **once**: a form left half-typed in one
+    /// account is still there when the user comes back to it, and it
+    /// is never written to another account.
+    ///
+    /// The group of the selected account opens with it, and the others
+    /// fold away: the account the app is on is the one the user is
+    /// working on, and a group that stays folded away when the account
+    /// is picked is a group the user has to unfold before they can do
+    /// anything. The other groups fold too — otherwise adding an
+    /// account would leave the page as long as it was, which is the
+    /// thing M6.8 fixed.
     fn load_selected(&mut self) {
-        match self.selected_account().cloned() {
-            Some(account) => {
-                self.edit_account = Draft::from_account(&account);
-                self.editing_id = Some(account.id.clone());
-            }
-            None => {
-                self.edit_account = Draft::default();
-                self.editing_id = None;
-            }
+        if let Some(account) = self.selected_account().cloned() {
+            self.edit_accounts
+                .entry(account.id.clone())
+                .or_insert_with(|| Draft::from_account(&account));
+            self.open_groups.clear();
+            self.open_groups.insert(account.id);
         }
     }
 
-    /// Write the editor back to the selected account.
+    /// The draft of one account.
+    ///
+    /// It is loaded from the account the first time the account is
+    /// edited.
+    fn draft_of(&mut self, account: &Account) -> &mut Draft {
+        self.edit_accounts
+            .entry(account.id.clone())
+            .or_insert_with(|| Draft::from_account(account))
+    }
+
+    /// Pick one account, by its id.
+    ///
+    /// The group of the account opens with it: the account the user
+    /// picked is the one they are working on, and a group that stays
+    /// folded away when the account is picked is a group the user has
+    /// to unfold before they can do anything.
+    fn select_account_by_id(&mut self, account_id: &str) {
+        let Some(index) = self.accounts.iter().position(|a| a.id == account_id) else {
+            return;
+        };
+        if self.selected != Some(index) {
+            self.selected = Some(index);
+            // The editor follows the selection, so the form is never
+            // stale.
+            self.load_selected();
+            self.persist_active_account();
+        }
+        self.open_groups.insert(account_id.to_string());
+    }
+
+    /// Write one account's draft back to the store.
     ///
     /// The id and the creation time are kept: the account is the same
     /// one, with different settings.
-    fn save_selected(&mut self) {
-        let Some(index) = self.selected else {
+    fn save_account(&mut self, account_id: &str) {
+        let Some(stored) = self
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .cloned()
+        else {
             return;
         };
-        let Some(stored) = self.accounts.get(index).cloned() else {
+        let Some(draft) = self.edit_accounts.get(account_id).cloned() else {
             return;
         };
-        if self.editing_id.as_deref() != Some(stored.id.as_str()) {
-            self.status = "The selection changed — pick the account again.".to_string();
-            self.load_selected();
-            return;
-        }
 
-        let mut account = self.edit_account.to_account();
+        let mut account = draft.to_account();
         account.id = stored.id.clone();
         account.created_at = stored.created_at;
         account.capture_headers = stored.capture_headers.clone();
@@ -1347,7 +1398,9 @@ impl QSoftphoneApp {
             Ok(saved) => {
                 self.status = format!("Saved account {}.", saved.label);
                 self.reload();
-                self.load_selected();
+                // The draft is the saved one now.
+                self.edit_accounts
+                    .insert(saved.id.clone(), Draft::from_account(&saved));
                 // The lamps follow the account: an extension that was
                 // added is watched, and one that was taken out is not.
                 if self.registration_state(&stored.id).is_registered() {
@@ -1358,29 +1411,57 @@ impl QSoftphoneApp {
         }
     }
 
+    /// Throw one account's edits away and start again from the store.
+    fn revert_account(&mut self, account_id: &str) {
+        let Some(stored) = self
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .cloned()
+        else {
+            return;
+        };
+        self.edit_accounts
+            .insert(stored.id.clone(), Draft::from_account(&stored));
+        self.status = "Reverted.".to_string();
+    }
+
     fn register_selected(&mut self) {
         let Some(account) = self.selected_account().cloned() else {
             return;
         };
-        if account.registrar.trim().is_empty() {
-            self.status = "That account has no registrar.".to_string();
-            return;
-        }
-        self.registrations.start(&account, self.config.network.port);
-        self.status = format!("Registering {}…", account.label);
+        self.register_account(&account);
     }
 
     fn unregister_selected(&mut self) {
         let Some(account) = self.selected_account().cloned() else {
             return;
         };
+        self.unregister_account(&account);
+    }
+
+    /// Register one account.
+    ///
+    /// The button is in the account's own group, so it registers
+    /// **that** account — not whichever one happens to be picked in the
+    /// list on the left.
+    fn register_account(&mut self, account: &Account) {
+        if account.registrar.trim().is_empty() {
+            self.status = "That account has no registrar.".to_string();
+            return;
+        }
+        self.registrations.start(account, self.config.network.port);
+        self.status = format!("Registering {}…", account.label);
+    }
+
+    /// Unregister one account.
+    fn unregister_account(&mut self, account: &Account) {
         self.registrations.stop(&account.id);
-        let account_id = account.id.clone();
         self.states
-            .insert(account_id.clone(), RegistrationState::Idle);
+            .insert(account.id.clone(), RegistrationState::Idle);
         // The lamps go with the registration: there is no session to
         // send a subscription on any more.
-        self.unwatch_blf(&account_id);
+        self.unwatch_blf(&account.id);
         self.status = format!("Unregistered {}.", account.label);
     }
 
@@ -2054,15 +2135,23 @@ impl QSoftphoneApp {
                 tracing::info!(file = %file, "the ringtone file was picked");
             }
             Target::AccountRingtone { account_id } => {
-                // The editor may have moved on while the dialog was
-                // open — the user can pick another account behind it.
-                if self.editing_id.as_deref() != Some(account_id.as_str()) {
+                // The account may have been removed while the dialog
+                // was open — the user can close a group behind it.
+                let Some(account) = self
+                    .accounts
+                    .iter()
+                    .find(|account| account.id == account_id)
+                    .cloned()
+                else {
                     self.status =
-                        "The account changed while the dialog was open — pick the file again."
+                        "The account was removed while the dialog was open — pick the file again."
                             .to_string();
                     return;
-                }
-                self.edit_account.ringtone_file = file.clone();
+                };
+                // The file goes into **this** account's draft. Every
+                // account has a draft of its own, so the file cannot
+                // land in another account's form.
+                self.draft_of(&account).ringtone_file = file.clone();
                 self.status = format!("Picked {file}. Save the account to keep it.");
                 tracing::info!(account_id = %account_id, file = %file, "the account's ringtone file was picked");
             }
@@ -2130,6 +2219,9 @@ impl QSoftphoneApp {
                 self.reload();
                 self.selected = self.accounts.iter().position(|a| a.id == stored.id);
                 self.load_selected();
+                // The new account is the one the user is working on,
+                // so its group is open on the account page.
+                self.open_groups.insert(stored.id.clone());
                 self.persist_active_account();
                 // The form closes again: a form that stays open after
                 // the account is saved is a form that gets the same
@@ -2153,6 +2245,11 @@ impl QSoftphoneApp {
                 self.registrations.stop(&account.id);
                 self.states.remove(&account.id);
                 self.unwatch_blf(&account.id);
+                // The account is gone: its draft and its group go with
+                // it, or the page would keep a form for an account
+                // that is not there any more.
+                self.edit_accounts.remove(&account.id);
+                self.open_groups.remove(&account.id);
                 self.reload();
                 self.load_selected();
             }
@@ -2317,7 +2414,8 @@ impl QSoftphoneApp {
                 if let Some(index) = pending_select {
                     self.selected = Some(index);
                     // The editor follows the selection, so the form is
-                    // never stale.
+                    // never stale — and the group of the account the
+                    // user picked opens with it.
                     self.load_selected();
                     self.persist_active_account();
                 }
@@ -3396,167 +3494,28 @@ impl QSoftphoneApp {
             .show(ui, |ui| self.draw_account_body(ui));
     }
 
-    /// The account editor itself.
+    /// The account page itself.
+    ///
+    /// Every account is a **group** of its own. The account the user is
+    /// working on is open; the others are folded away to their title —
+    /// but they keep all their fields, and unfolding one is a click.
+    ///
+    /// A second account used to have no form at all on this page: the
+    /// page showed the selected account and nothing else, so the second
+    /// account could not be looked at, let alone changed.
     fn draw_account_body(&mut self, ui: &mut egui::Ui) {
-        let Some(account) = self.selected_account().cloned() else {
+        if self.accounts.is_empty() {
             ui.weak("Select an account, or add one.");
             return;
-        };
-
-        ui.horizontal(|ui| {
-            let title = if account.label.is_empty() {
-                "(unnamed account)".to_string()
-            } else {
-                account.label.clone()
-            };
-            ui.label(egui::RichText::new(title).strong().size(15.0));
-            ui.weak(format!("id {}", account.id));
-        });
-
-        // The editor. The borrow of the draft ends with this block, so
-        // the buttons below can take `&mut self`.
-        let browse = {
-            let draft = &mut self.edit_account;
-            // The grid hands back what its body returns, and what it
-            // returns is whether the file dialog was asked for: the
-            // dialog is opened after the block, because opening it
-            // needs `&mut self` and the draft is holding it.
-            egui::Grid::new("account_editor")
-                .num_columns(2)
-                .striped(true)
-                .show(ui, |ui| {
-                    let mut browse = false;
-                    ui.label("Label");
-                    ui.text_edit_singleline(&mut draft.label);
-                    ui.end_row();
-
-                    ui.label("Registrar");
-                    ui.text_edit_singleline(&mut draft.registrar);
-                    ui.end_row();
-
-                    ui.label("User");
-                    ui.text_edit_singleline(&mut draft.user);
-                    ui.end_row();
-
-                    ui.label("Password");
-                    ui.add(egui::TextEdit::singleline(&mut draft.password).password(true));
-                    ui.end_row();
-
-                    ui.label("Transport");
-                    egui::ComboBox::from_id_salt("edit_transport")
-                        .selected_text(&draft.transport)
-                        .show_ui(ui, |ui| {
-                            for t in ["udp", "tcp", "tls"] {
-                                ui.selectable_value(&mut draft.transport, t.to_string(), t);
-                            }
-                        });
-                    ui.end_row();
-
-                    ui.label("Domain");
-                    ui.text_edit_singleline(&mut draft.domain);
-                    ui.end_row();
-
-                    ui.label("Outbound proxy");
-                    ui.text_edit_singleline(&mut draft.outbound_proxy);
-                    ui.end_row();
-
-                    ui.label("Caller name header");
-                    ui.text_edit_singleline(&mut draft.caller_id_header);
-                    ui.end_row();
-
-                    ui.label("Dialled number header");
-                    ui.text_edit_singleline(&mut draft.dialed_number_header);
-                    ui.end_row();
-
-                    ui.label("Ringtone file");
-                    ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut draft.ringtone_file);
-                        // The same two buttons the settings page has
-                        // (M6.4): the operating system's own file
-                        // dialog, and the way back to the app's own
-                        // ringtone.
-                        if ui
-                            .add_enabled(!self.picker.is_open(), egui::Button::new("Browse…"))
-                            .clicked()
-                        {
-                            browse = true;
-                        }
-                        let has_file = !draft.ringtone_file.trim().is_empty();
-                        if ui
-                            .add_enabled(has_file, egui::Button::new("Reset"))
-                            .clicked()
-                        {
-                            draft.ringtone_file.clear();
-                        }
-                    });
-                    ui.end_row();
-                    ui.label("");
-                    ui.weak(
-                        "A WAV file for this account's calls. Leave it empty for the app's \
-                         own ringtone.",
-                    );
-                    ui.end_row();
-                    browse
-                })
-                .inner
-        };
-        if browse {
-            self.browse_for(Target::AccountRingtone {
-                account_id: account.id.clone(),
-            });
         }
 
-        // The extra headers this account puts on its calls.
-        //
-        // They are their own block rather than two more rows of the
-        // grid: there is one of them per header, and a grid row holds
-        // one field.
-        //
-        // The block **collapses**: an account with a dozen headers and
-        // a dozen watched extensions is twice the page, and a page the
-        // user cannot get through is a page they stop using.
-        ui.separator();
-        egui::CollapsingHeader::new(egui::RichText::new("CUSTOM HEADERS").strong().size(11.0))
-            .default_open(true)
-            .show(ui, |ui| {
-                self.draw_custom_headers(ui);
-            });
-
-        // The extensions whose lamps this account watches.
-        ui.separator();
-        egui::CollapsingHeader::new(
-            egui::RichText::new("WATCHED EXTENSIONS")
-                .strong()
-                .size(11.0),
-        )
-        .default_open(true)
-        .show(ui, |ui| {
-            self.draw_watched_extensions(ui);
-        });
-
-        ui.horizontal(|ui| {
-            if ui.button("Save").clicked() {
-                self.save_selected();
-            }
-            if ui.button("Revert").clicked() {
-                self.load_selected();
-                self.status = "Reverted.".to_string();
-            }
-        });
-
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Registration").strong());
-            ui.label(self.registration_state(&account.id).summary());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Unregister").clicked() {
-                    self.unregister_selected();
-                }
-                if ui.button("Register").clicked() {
-                    self.register_selected();
-                }
-            });
-        });
+        // The accounts are copied: a group is drawn for each of them,
+        // and the drawing asks the app about the accounts — so the list
+        // is read once, up front.
+        for account in self.accounts.clone() {
+            self.draw_account_group(ui, &account);
+            ui.separator();
+        }
 
         // The form for another account.
         //
@@ -3593,7 +3552,13 @@ impl QSoftphoneApp {
         let mut title_clicked = false;
         {
             let mut header = state.show_header(ui, |ui| {
-                let title = ui.label(egui::RichText::new("Add another account").strong());
+                // The title folds the form away, like every other
+                // title on this page — so it has to be a label that can
+                // be clicked.
+                let title = ui.add(
+                    egui::Label::new(egui::RichText::new("Add another account").strong())
+                        .sense(egui::Sense::click()),
+                );
                 title_clicked = title.clicked();
                 header_rect = Some(ui.min_rect());
             });
@@ -3641,17 +3606,230 @@ impl QSoftphoneApp {
         });
     }
 
+    /// One account, as a group.
+    ///
+    /// The title is the account's name, its server and its
+    /// registration state; the body is the account's whole form. The
+    /// arrow folds the group away, and the title picks the account —
+    /// the lamps in the left panel and the registration follow it.
+    fn draw_account_group(&mut self, ui: &mut egui::Ui, account: &Account) {
+        let id = ui.make_persistent_id(("account_group", account.id.clone()));
+        let mut state =
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+        // The app holds the state of the groups, not egui: the account
+        // the user picks has to open its group, and a group the user
+        // folded away has to stay folded away.
+        state.set_open(self.open_groups.contains(&account.id));
+        state.store(ui.ctx());
+
+        let selected = self
+            .selected_account()
+            .is_some_and(|current| current.id == account.id);
+        let summary = self.registration_state(&account.id).summary();
+        let title = account_name(account);
+
+        let mut title_clicked = false;
+        let mut header = state.show_header(ui, |ui| {
+            // The title is a label that can be clicked: the account it
+            // names is the account the user is working on.
+            let label = ui.add(
+                egui::Label::new(egui::RichText::new(title.clone()).strong().size(15.0))
+                    .sense(egui::Sense::click()),
+            );
+            title_clicked = label.clicked();
+            if selected {
+                ui.label(
+                    egui::RichText::new("current")
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
+            }
+            if !account.user.trim().is_empty() {
+                ui.weak(format!("{} @ {}", account.user, account.registrar));
+            }
+            ui.weak(&summary);
+        });
+
+        // The title picks the account, and the account's group opens
+        // with it.
+        if title_clicked {
+            self.select_account_by_id(&account.id);
+            header.set_open(true);
+        }
+
+        let open = header.is_open();
+        header.body_unindented(|ui| self.draw_account_editor(ui, account));
+
+        // What the arrow did is what the app remembers.
+        if open {
+            self.open_groups.insert(account.id.clone());
+        } else {
+            self.open_groups.remove(&account.id);
+        }
+    }
+
+    /// The form of one account: its registration, its ringtone, its
+    /// extra headers and the extensions it watches.
+    fn draw_account_editor(&mut self, ui: &mut egui::Ui, account: &Account) {
+        // The fields.
+        //
+        // The borrow of the draft ends with this block, so the buttons
+        // below can take `&mut self`.
+        {
+            let draft = self.draft_of(account);
+            // The grid is the account's own: every account on the page
+            // has one, so the id has to say which account it is.
+            egui::Grid::new(("account_editor", account.id.clone()))
+                .num_columns(2)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("Label");
+                    ui.text_edit_singleline(&mut draft.label);
+                    ui.end_row();
+
+                    ui.label("Registrar");
+                    ui.text_edit_singleline(&mut draft.registrar);
+                    ui.end_row();
+
+                    ui.label("User");
+                    ui.text_edit_singleline(&mut draft.user);
+                    ui.end_row();
+
+                    ui.label("Password");
+                    ui.add(egui::TextEdit::singleline(&mut draft.password).password(true));
+                    ui.end_row();
+
+                    ui.label("Transport");
+                    egui::ComboBox::from_id_salt(("edit_transport", &account.id))
+                        .selected_text(&draft.transport)
+                        .show_ui(ui, |ui| {
+                            for t in ["udp", "tcp", "tls"] {
+                                ui.selectable_value(&mut draft.transport, t.to_string(), t);
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("Domain");
+                    ui.text_edit_singleline(&mut draft.domain);
+                    ui.end_row();
+
+                    ui.label("Outbound proxy");
+                    ui.text_edit_singleline(&mut draft.outbound_proxy);
+                    ui.end_row();
+
+                    ui.label("Caller name header");
+                    ui.text_edit_singleline(&mut draft.caller_id_header);
+                    ui.end_row();
+
+                    ui.label("Dialled number header");
+                    ui.text_edit_singleline(&mut draft.dialed_number_header);
+                    ui.end_row();
+                });
+        }
+
+        // The rest of the account is in groups of its own.
+        //
+        // A ringtone, a dozen headers and a dozen watched extensions
+        // are three times the page — and a page the user cannot get
+        // through is a page they stop using. Each group is folded
+        // away until it is asked for, and each belongs to the account
+        // above it.
+        ui.separator();
+        egui::CollapsingHeader::new(egui::RichText::new("RING TONE").strong().size(11.0))
+            .id_salt(("ring_tone", &account.id))
+            .show(ui, |ui| self.draw_ringtone(ui, account));
+
+        ui.separator();
+        egui::CollapsingHeader::new(egui::RichText::new("CUSTOM HEADERS").strong().size(11.0))
+            .id_salt(("custom_headers", &account.id))
+            .show(ui, |ui| self.draw_custom_headers(ui, account));
+
+        ui.separator();
+        egui::CollapsingHeader::new(
+            egui::RichText::new("WATCHED EXTENSIONS")
+                .strong()
+                .size(11.0),
+        )
+        .id_salt(("watched_extensions", &account.id))
+        .show(ui, |ui| self.draw_watched_extensions(ui, account));
+
+        ui.horizontal(|ui| {
+            if ui.button("Save").clicked() {
+                self.save_account(&account.id);
+            }
+            if ui.button("Revert").clicked() {
+                self.revert_account(&account.id);
+            }
+        });
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Registration").strong());
+            ui.label(self.registration_state(&account.id).summary());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Unregister").clicked() {
+                    self.unregister_account(account);
+                }
+                if ui.button("Register").clicked() {
+                    self.register_account(account);
+                }
+            });
+        });
+    }
+
+    /// The WAV file this account rings with.
+    ///
+    /// It is a group of its own, because it is one field of the many,
+    /// and an account's ringtone is the one thing about it that is
+    /// used now and then.
+    fn draw_ringtone(&mut self, ui: &mut egui::Ui, account: &Account) {
+        let picker_open = self.picker.is_open();
+        let mut browse = false;
+        {
+            let draft = self.draft_of(account);
+            ui.horizontal(|ui| {
+                ui.label("Ringtone file");
+                ui.text_edit_singleline(&mut draft.ringtone_file);
+                // The same two buttons the settings page has (M6.4):
+                // the operating system's own file dialog, and the way
+                // back to the app's own ringtone.
+                if ui
+                    .add_enabled(!picker_open, egui::Button::new("Browse…"))
+                    .clicked()
+                {
+                    browse = true;
+                }
+                let has_file = !draft.ringtone_file.trim().is_empty();
+                if ui
+                    .add_enabled(has_file, egui::Button::new("Reset"))
+                    .clicked()
+                {
+                    draft.ringtone_file.clear();
+                }
+            });
+        }
+        if browse {
+            self.browse_for(Target::AccountRingtone {
+                account_id: account.id.clone(),
+            });
+        }
+        ui.weak(
+            "A WAV file for this account's calls. Leave it empty for the app's own \
+             ringtone.",
+        );
+    }
+
     /// The extra headers this account puts on its calls.
     ///
     /// They are the account's own policy, and a policy that lives on
     /// another page is a policy nobody edits.
-    fn draw_custom_headers(&mut self, ui: &mut egui::Ui) {
+    fn draw_custom_headers(&mut self, ui: &mut egui::Ui, account: &Account) {
         ui.weak(
             "Extra headers to send on the calls this account makes — a ticket number, \
              a CRM id, the queue.",
         );
 
-        let draft = &mut self.edit_account;
+        let draft = self.draft_of(account);
         // The row to take out, applied after the loop: the list is
         // borrowed while it is being drawn.
         let mut remove: Option<usize> = None;
@@ -3663,13 +3841,13 @@ impl QSoftphoneApp {
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(name)
-                        .id_source(("custom_header_name", index))
+                        .id_source((("custom_header_name", index), &account.id))
                         .desired_width(140.0)
                         .hint_text("X-var1"),
                 );
                 ui.add(
                     egui::TextEdit::singleline(value)
-                        .id_source(("custom_header_value", index))
+                        .id_source((("custom_header_value", index), &account.id))
                         .desired_width(180.0)
                         .hint_text("value"),
                 );
@@ -3694,14 +3872,14 @@ impl QSoftphoneApp {
     }
 
     /// The extensions whose lamps this account watches.
-    fn draw_watched_extensions(&mut self, ui: &mut egui::Ui) {
+    fn draw_watched_extensions(&mut self, ui: &mut egui::Ui, account: &Account) {
         ui.weak(
             "The lamps in the left panel say whether these extensions are free, busy or \
              ringing. Pressing a lamp dials the number in the second column — leave it \
              empty to dial the extension itself.",
         );
 
-        let draft = &mut self.edit_account;
+        let draft = self.draft_of(account);
         // The row to take out, applied after the loop: the list is
         // borrowed while it is being drawn.
         let mut remove: Option<usize> = None;
@@ -3716,13 +3894,13 @@ impl QSoftphoneApp {
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut entry.watch)
-                        .id_source(("blf_watch", index))
+                        .id_source((("blf_watch", index), &account.id))
                         .desired_width(110.0)
                         .hint_text("101"),
                 );
                 ui.add(
                     egui::TextEdit::singleline(&mut entry.dial)
-                        .id_source(("blf_dial", index))
+                        .id_source((("blf_dial", index), &account.id))
                         .desired_width(150.0)
                         .hint_text("same as the extension"),
                 );
@@ -3739,8 +3917,8 @@ impl QSoftphoneApp {
         }
     }
 
-    /// The Busy Lamp Field: the lamps of the extensions the selected
-    /// account watches.
+    /// The Busy Lamp Field: the lamps of the extensions the accounts
+    /// watch.
     ///
     /// They are in the left panel, **below the accounts**: the lights
     /// say whether the people are free, and they are worth looking at
@@ -3748,49 +3926,66 @@ impl QSoftphoneApp {
     /// anything is grey — a lamp that says "free" when the truth is
     /// "we do not know" is a lamp that lies.
     ///
-    /// The rows are the account's **watched extensions**, not the live
+    /// The rows are the accounts' **watched extensions**, not the live
     /// subscriptions: an extension whose subscription has not been
     /// established is still on the list, and it is still a speed dial.
     /// That is what the list is for — a lamp is a light on a speed
     /// dial.
+    ///
+    /// Every account's lamps are here, and **each row says whose lamp
+    /// it is**: the same extension can be watched by two accounts, and
+    /// then there are two lamps for it — one per subscription — and the
+    /// user has to be able to tell them apart.
     fn draw_blf_panel(&mut self, ui: &mut egui::Ui) {
-        let Some(account) = self.selected_account().cloned() else {
-            return;
-        };
-        let entries = account.blf_extensions.clone();
-        let account_id = account.id.clone();
-
         ui.separator();
         ui.label(egui::RichText::new("EXTENSIONS").strong().size(11.0));
 
-        if entries.is_empty() {
-            ui.weak("No extensions are being watched.");
-            return;
+        // The accounts are copied: the panel asks the app about the
+        // lamps of each of them, and the app cannot be borrowed while
+        // it is being asked.
+        let mut any = false;
+        for account in self.accounts.clone() {
+            let name = account_name(&account);
+            for entry in &account.blf_extensions {
+                let watch = entry.watch.trim().to_string();
+                if watch.is_empty() {
+                    continue;
+                }
+                any = true;
+                let dial = entry.dial_target().to_string();
+                let state = self.blf.state_of(&account.id, &watch);
+                ui.horizontal(|ui| {
+                    let (r, g, b) = state.colour();
+                    let colour = egui::Color32::from_rgb(r, g, b);
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 5.0, colour);
+                    // The extension is the button: pressing it dials
+                    // the number the account has for it — which is
+                    // often not the extension itself — and it dials
+                    // from **that** account.
+                    if ui.selectable_label(false, &watch).clicked() {
+                        let _ = self.place_call_on(&account, &dial);
+                    }
+                    if dial != watch {
+                        // The number that is actually dialled, when it
+                        // is not the extension.
+                        ui.weak(&dial);
+                    }
+                });
+                // Whose lamp this is, and what it says.
+                //
+                // It is on its own line: the panel is narrow, and a
+                // row that says everything at once is a row whose
+                // last word is cut off.
+                ui.indent(("lamp", &watch, &account.id), |ui| {
+                    ui.weak(format!("from acc {name} · {}", state.label()));
+                });
+            }
         }
 
-        for entry in entries {
-            let watch = entry.watch.trim().to_string();
-            let dial = entry.dial_target().to_string();
-            let state = self.blf.state_of(&account_id, &watch);
-            ui.horizontal(|ui| {
-                let (r, g, b) = state.colour();
-                let colour = egui::Color32::from_rgb(r, g, b);
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                ui.painter().circle_filled(rect.center(), 5.0, colour);
-                // The extension is the button: pressing it dials the
-                // number the account has for it — which is often not
-                // the extension itself.
-                if ui.selectable_label(false, &watch).clicked() {
-                    self.place_call_to(&dial);
-                }
-                if dial != watch {
-                    // The number that is actually dialled, when it is
-                    // not the extension.
-                    ui.weak(&dial);
-                }
-                ui.weak(state.label());
-            });
+        if !any {
+            ui.weak("No extensions are being watched.");
         }
     }
 
@@ -4830,6 +5025,24 @@ pub fn mark_started() {
     let _ = STARTED.set(std::time::Instant::now());
 }
 
+/// The name of an account.
+///
+/// It is the label the user gave it, and when there is no label it is
+/// the account's own user — which is the extension the account calls
+/// from. The places that say whose something is — the lamp in the left
+/// panel, the title of a group — use it.
+fn account_name(account: &Account) -> String {
+    let label = account.label.trim();
+    if !label.is_empty() {
+        return label.to_string();
+    }
+    let user = account.user.trim();
+    if !user.is_empty() {
+        return user.to_string();
+    }
+    account.id.clone()
+}
+
 /// The media settings, read out of the settings file.
 ///
 /// The settings file keeps the codecs as names — it is a plain JSON
@@ -4870,6 +5083,32 @@ mod tests {
     /// An app with one account, and the bus its call events arrive on.
     fn build_app(handle: tokio::runtime::Handle) -> (QSoftphoneApp, CallBus) {
         build_app_with(Db::open_in_memory().expect("db"), handle)
+    }
+
+    /// An app with **two** accounts, and the bus its call events arrive
+    /// on.
+    ///
+    /// The second account is the one the account page used to have no
+    /// room for. Both of them go into the store: saving one of them
+    /// must not take the other one away.
+    fn build_app_with_two_accounts(handle: tokio::runtime::Handle) -> (QSoftphoneApp, CallBus) {
+        let (mut app, bus) = build_app(handle);
+        let mut first = app.accounts[0].clone();
+        // The domain is in the form and nowhere else, so a test can
+        // tell one account's fields from the other's.
+        first.domain = "office.example".to_string();
+        let mut second = Account::new("Home", "sip.home.com:5060", "105", "pw", "udp");
+        second.id = "acct-ui-2".to_string();
+        second.domain = "home.example".to_string();
+        let store = AccountStore::new(&app.db);
+        store.upsert(&first).expect("the account is saved");
+        store.upsert(&second).expect("the account is saved");
+        app.reload();
+        app.selected = app.accounts.iter().position(|a| a.id == "acct-ui-1");
+        // The form is loaded from the store, so the test sees the
+        // account as it is in it.
+        reload_the_editor(&mut app);
+        (app, bus)
     }
 
     /// An app with one account, over a given database.
@@ -4915,6 +5154,18 @@ mod tests {
         app.load_selected();
 
         (app, bus, sessions)
+    }
+
+    /// The account with this id.
+    ///
+    /// The store lists the accounts by label, so a test that wants a
+    /// particular one has to ask for it by id.
+    fn account_by_id(app: &QSoftphoneApp, id: &str) -> Account {
+        app.accounts
+            .iter()
+            .find(|account| account.id == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("there is no account {id}"))
     }
 
     /// An incoming call, as the SIP layer would report it.
@@ -5056,6 +5307,47 @@ mod tests {
         frame_with(app, ctx, input);
     }
 
+    /// Load the selected account's form again.
+    ///
+    /// The draft of an account is loaded **once** — a form left
+    /// half-typed is still there when the user comes back to it — so a
+    /// test that changes the stored account has to say that the editor
+    /// is to be loaded again.
+    fn reload_the_editor(app: &mut QSoftphoneApp) {
+        if let Some(account) = app.selected_account().cloned() {
+            app.edit_accounts
+                .insert(account.id.clone(), Draft::from_account(&account));
+        }
+        app.load_selected();
+    }
+
+    /// Run the frames an opening animation needs.
+    ///
+    /// egui animates a block that opens, and the widgets in it are only
+    /// laid out once the animation is over.
+    fn settle(app: &mut QSoftphoneApp, ctx: &egui::Context) {
+        for _ in 0..40 {
+            frame(app, ctx);
+        }
+    }
+
+    /// Open a folded block on the account page.
+    ///
+    /// The blocks of an account — its ringtone, its extra headers, the
+    /// extensions it watches — are folded away until they are asked
+    /// for. The fold is an animation, so it takes a few frames.
+    fn open_block(app: &mut QSoftphoneApp, ctx: &egui::Context, title: &str) {
+        ctx.enable_accesskit();
+        // The account's own group opens first — it is the block the
+        // other ones are in.
+        settle(app, ctx);
+        let output = frame(app, ctx);
+        let header = button_at(&output, title)
+            .unwrap_or_else(|| panic!("the page has no {title} block:\n{}", screen_text(&output)));
+        click_at(app, ctx, header);
+        settle(app, ctx);
+    }
+
     #[tokio::test]
     async fn a_frame_draws_without_a_panic() {
         let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
@@ -5188,7 +5480,7 @@ mod tests {
                 dial: String::new(),
             },
         ];
-        app.load_selected();
+        reload_the_editor(&mut app);
         app.view = View::Account;
 
         let output = frame(&mut app, &ctx);
@@ -5197,6 +5489,12 @@ mod tests {
             text.contains("WATCHED EXTENSIONS"),
             "the account page has no field for the watched extensions:\n{text}"
         );
+
+        // The lamps are a block of their own, folded away until they
+        // are asked for.
+        open_block(&mut app, &ctx, "WATCHED EXTENSIONS");
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
         assert!(
             text.contains("101"),
             "the watched extension is not shown as it was set:\n{text}"
@@ -5204,6 +5502,143 @@ mod tests {
         assert!(
             text.contains("00101"),
             "the number to dial is not shown:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_account_is_a_group_and_the_second_one_is_folded_away() {
+        // The user's report: the account page showed the selected
+        // account and nothing else, so the second account could not be
+        // looked at.
+        //
+        // Every account is a group now. The selected one is open, the
+        // others are folded to their title — and they keep all their
+        // fields, a click away.
+        let (mut app, _bus) = build_app_with_two_accounts(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        app.view = View::Account;
+
+        settle(&mut app, &ctx);
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Office"),
+            "the first account is not on the page:\n{text}"
+        );
+        assert!(
+            text.contains("Home"),
+            "the second account is not on the page:\n{text}"
+        );
+        assert!(
+            !text.contains("home.example"),
+            "the second account's fields are on the page:\n{text}"
+        );
+        assert!(
+            text.contains("office.example"),
+            "the first account's fields are not on the page:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_title_of_an_account_picks_it_and_opens_its_group() {
+        // The account the user picks is the one they are working on:
+        // its group opens with it, and its fields are there.
+        let (mut app, _bus) = build_app_with_two_accounts(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        app.view = View::Account;
+
+        settle(&mut app, &ctx);
+        let output = frame(&mut app, &ctx);
+        let title = text_at(&output, "Home").expect("the second account has no title");
+        click_at(&mut app, &ctx, title);
+        settle(&mut app, &ctx);
+
+        assert_eq!(
+            app.selected_account().map(|account| account.id.as_str()),
+            Some("acct-ui-2"),
+            "the account was not picked"
+        );
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("home.example"),
+            "the second account's fields did not open:\n{text}"
+        );
+        assert!(
+            !text.contains("office.example"),
+            "the first account's fields did not fold away:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_keeps_a_form_of_its_own() {
+        // Two accounts, two forms: a field typed in one is never
+        // written into the other.
+        let (mut app, _bus) = build_app_with_two_accounts(tokio::runtime::Handle::current());
+        app.view = View::Account;
+
+        // The second account's form is a form of its own.
+        let second = account_by_id(&app, "acct-ui-2");
+        app.draft_of(&second).label = "Second".to_string();
+        assert_eq!(
+            app.edit_accounts["acct-ui-1"].label, "Office",
+            "the other account's form was written into"
+        );
+        assert_eq!(app.edit_accounts["acct-ui-2"].label, "Second");
+    }
+
+    #[tokio::test]
+    async fn saving_one_account_does_not_touch_the_other() {
+        // The store is the truth: saving the first account leaves the
+        // second one exactly as it was.
+        let (mut app, _bus) = build_app_with_two_accounts(tokio::runtime::Handle::current());
+        app.view = View::Account;
+
+        let first = account_by_id(&app, "acct-ui-1");
+        app.draft_of(&first).domain = "office.example".to_string();
+        app.save_account("acct-ui-1");
+
+        let first = account_by_id(&app, "acct-ui-1");
+        let second = account_by_id(&app, "acct-ui-2");
+        assert_eq!(first.domain, "office.example", "the account was not saved");
+        assert_eq!(
+            second.domain, "home.example",
+            "the other account was written into"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_lamp_says_which_account_watches_it() {
+        // The lamps of every account are in the panel, and each of them
+        // says whose lamp it is: the same extension can be watched by
+        // two accounts, and then there are two lamps for it.
+        let (mut app, _bus) = build_app_with_two_accounts(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.accounts[0].blf_extensions = vec![BlfEntry {
+            watch: "105".to_string(),
+            dial: String::new(),
+        }];
+        app.accounts[1].blf_extensions = vec![BlfEntry {
+            watch: "106".to_string(),
+            dial: String::new(),
+        }];
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("from acc Office"),
+            "the first account's lamp does not say whose it is:\n{text}"
+        );
+        assert!(
+            text.contains("from acc Home"),
+            "the second account's lamp does not say whose it is:\n{text}"
+        );
+        assert!(
+            text.contains("105") && text.contains("106"),
+            "the lamps of both accounts are not in the panel:\n{text}"
         );
     }
 
@@ -5267,9 +5702,11 @@ mod tests {
         let mut output = ctx.run_ui(input, |ui| app.draw(ui));
         output.textures_delta.clear();
 
+        // The form is folded away to begin with: its own **Add** button
+        // is not on the page.
         assert!(
-            text_rect(&output, "Add another account").is_none(),
-            "the form was on the screen to begin with, so there is nothing to prove"
+            button_at(&output, "Add").is_none(),
+            "the form for another account was open before it was asked for"
         );
 
         // Press **+ Add** in the left panel.
@@ -5328,6 +5765,9 @@ mod tests {
         // The user's report: the first account's headers and lamps
         // fill the page, and there is no way to fold them away to get
         // to the form for another account.
+        //
+        // They are folded away to begin with now — and they open again
+        // when they are asked for.
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
@@ -5337,42 +5777,32 @@ mod tests {
             watch: "105".to_string(),
             dial: String::new(),
         }];
-        app.load_selected();
+        reload_the_editor(&mut app);
         app.view = View::Account;
 
-        let output = frame(&mut app, &ctx);
-        let text = screen_text(&output);
-        assert!(
-            text.contains("X-var1"),
-            "the header is not on the page:\n{text}"
-        );
-
-        // Fold the headers away.
-        let header = button_at(&output, "CUSTOM HEADERS").expect("the page has no headers block");
-        click_at(&mut app, &ctx, header);
-        // The fold is an animation, so it takes a few frames.
-        for _ in 0..30 {
-            frame(&mut app, &ctx);
-        }
         let output = frame(&mut app, &ctx);
         let text = screen_text(&output);
         assert!(
             !text.contains("X-var1"),
             "the headers did not fold away:\n{text}"
         );
-
-        // And the lamps.
-        let output = frame(&mut app, &ctx);
-        let header = button_at(&output, "WATCHED EXTENSIONS").expect("the page has no lamps block");
-        click_at(&mut app, &ctx, header);
-        for _ in 0..30 {
-            frame(&mut app, &ctx);
-        }
-        let output = frame(&mut app, &ctx);
-        let text = screen_text(&output);
         assert!(
             !text.contains("The lamps in the left panel say"),
             "the lamps did not fold away:\n{text}"
+        );
+
+        // And they open again when they are asked for.
+        open_block(&mut app, &ctx, "CUSTOM HEADERS");
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(text.contains("X-var1"), "the headers did not open:\n{text}");
+
+        open_block(&mut app, &ctx, "WATCHED EXTENSIONS");
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("The lamps in the left panel say"),
+            "the lamps did not open:\n{text}"
         );
     }
 
@@ -5388,9 +5818,12 @@ mod tests {
             ("X-var1".to_string(), "one".to_string()),
             ("X-var2".to_string(), "$called".to_string()),
         ];
-        app.load_selected();
+        reload_the_editor(&mut app);
         app.view = View::Account;
 
+        // The headers are a block of their own, folded away until they
+        // are asked for.
+        open_block(&mut app, &ctx, "CUSTOM HEADERS");
         let output = frame(&mut app, &ctx);
         let text = screen_text(&output);
         assert!(
@@ -5420,9 +5853,10 @@ mod tests {
         let ctx = egui::Context::default();
 
         app.accounts[0].custom_headers = vec![("X bad".to_string(), "one".to_string())];
-        app.load_selected();
+        reload_the_editor(&mut app);
         app.view = View::Account;
 
+        open_block(&mut app, &ctx, "CUSTOM HEADERS");
         let output = frame(&mut app, &ctx);
         let text = screen_text(&output);
         assert!(
@@ -8066,6 +8500,10 @@ mod tests {
         let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
         let ctx = egui::Context::default();
         app.view = View::Account;
+
+        // The ringtone is a block of its own, folded away until it is
+        // asked for.
+        open_block(&mut app, &ctx, "RING TONE");
         let output = frame(&mut app, &ctx);
         let text = screen_text(&output);
         assert!(
@@ -8198,6 +8636,9 @@ mod tests {
         ctx.enable_accesskit();
 
         app.view = View::Account;
+        // The ringtone is a block of its own, folded away until it is
+        // asked for.
+        open_block(&mut app, &ctx, "RING TONE");
         let output = frame(&mut app, &ctx);
         let text = screen_text(&output);
         assert!(
@@ -8249,13 +8690,15 @@ mod tests {
         let account_id = app.accounts[0].id.clone();
 
         app.picker.deliver(Picked::File {
-            target: Target::AccountRingtone { account_id },
+            target: Target::AccountRingtone {
+                account_id: account_id.clone(),
+            },
             path: std::path::PathBuf::from(r"C:\sounds\office.wav"),
         });
         frame(&mut app, &ctx);
 
         assert_eq!(
-            app.edit_account.ringtone_file, r"C:\sounds\office.wav",
+            app.edit_accounts[&account_id].ringtone_file, r"C:\sounds\office.wav",
             "the picked file did not become the account's ringtone"
         );
     }
@@ -8263,8 +8706,8 @@ mod tests {
     #[tokio::test]
     async fn a_pick_for_another_account_is_refused() {
         // The dialog is open while the user carries on with the app,
-        // and they may pick another account behind it. A file picked
-        // for one account must not land on another.
+        // and they may remove the account behind it. A file picked for
+        // an account that is not there must not land on another one.
         let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
         let ctx = egui::Context::default();
 
@@ -8277,12 +8720,13 @@ mod tests {
         frame(&mut app, &ctx);
 
         assert!(
-            app.edit_account.ringtone_file.is_empty(),
-            "the file landed on the wrong account: {}",
-            app.edit_account.ringtone_file
+            app.edit_accounts
+                .values()
+                .all(|draft| draft.ringtone_file.is_empty()),
+            "the file landed on the wrong account"
         );
         assert!(
-            app.status.contains("account changed"),
+            app.status.contains("removed"),
             "the app did not say what happened: {}",
             app.status
         );
