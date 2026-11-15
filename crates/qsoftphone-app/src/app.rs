@@ -94,6 +94,16 @@ pub struct QSoftphoneApp {
     /// the account is saved is a form that gets the same account
     /// saved twice.
     add_account_form: AddAccountForm,
+    /// How many frames the page is to keep the form for another
+    /// account in view.
+    ///
+    /// The form is opened by the **+ Add** button, and the page scrolls
+    /// to it — but the page grows while it settles, because the
+    /// account's own group opens at the same time, and the form moves
+    /// down with it. So the scroll is asked for again for a while
+    /// after: otherwise the button that says "add" opens a form whose
+    /// own **Add** button is below the fold.
+    add_form_scroll: u32,
     /// The draft of each account, by account id.
     ///
     /// Every account is edited in its own group on the account page,
@@ -600,6 +610,7 @@ impl QSoftphoneApp {
                 ..Default::default()
             },
             add_account_form: AddAccountForm::default(),
+            add_form_scroll: 0,
             edit_accounts: HashMap::new(),
             open_groups: HashSet::new(),
             status: "Ready.".to_string(),
@@ -2402,6 +2413,14 @@ impl QSoftphoneApp {
                         } else {
                             format!("{text} {badge}")
                         };
+                        // The account's own number.
+                        //
+                        // Two accounts that are both called "104" are
+                        // two accounts the user cannot tell apart, and
+                        // a number is a name they can both say out
+                        // loud. It is the same number as the one in
+                        // the title of the account's group.
+                        let text = format!("{}  {text}", index + 1);
                         if ui
                             .selectable_value(&mut self.selected, Some(index), text)
                             .clicked()
@@ -2429,6 +2448,9 @@ impl QSoftphoneApp {
                         // the button opens the form rather than making
                         // the user go and find it.
                         self.add_account_form = AddAccountForm::Open;
+                        // And the page keeps it in view while the page
+                        // settles.
+                        self.add_form_scroll = 30;
                     }
                     if ui.button("Remove").clicked() {
                         self.delete_selected();
@@ -3512,8 +3534,8 @@ impl QSoftphoneApp {
         // The accounts are copied: a group is drawn for each of them,
         // and the drawing asks the app about the accounts — so the list
         // is read once, up front.
-        for account in self.accounts.clone() {
-            self.draw_account_group(ui, &account);
+        for (index, account) in self.accounts.clone().into_iter().enumerate() {
+            self.draw_account_group(ui, &account, index + 1);
             ui.separator();
         }
 
@@ -3532,12 +3554,10 @@ impl QSoftphoneApp {
             add_id,
             false,
         );
-        let mut opened = false;
         match self.add_account_form {
             AddAccountForm::Open => {
                 state.set_open(true);
                 state.store(ui.ctx());
-                opened = true;
             }
             AddAccountForm::Close => {
                 state.set_open(false);
@@ -3549,6 +3569,9 @@ impl QSoftphoneApp {
 
         // The header's own rectangle, so the page can scroll to it.
         let mut header_rect: Option<egui::Rect> = None;
+        // And the form's own: the whole form is scrolled to, so that
+        // its **Add** button is in view too — not only its title.
+        let mut body_rect: Option<egui::Rect> = None;
         let mut title_clicked = false;
         {
             let mut header = state.show_header(ui, |ui| {
@@ -3587,13 +3610,33 @@ impl QSoftphoneApp {
                             }
                         });
                 });
+                // The four settings an account is made with.
+                //
+                // They are in the form that **makes** the account: a
+                // domain, a proxy and the two header names are what the
+                // account is, and a form that cannot say them leaves
+                // the user to edit the account right after making it.
+                ui.label("Domain");
+                ui.text_edit_singleline(&mut draft.domain);
+                ui.label("Outbound proxy");
+                ui.text_edit_singleline(&mut draft.outbound_proxy);
+                ui.label("Caller name header");
+                ui.text_edit_singleline(&mut draft.caller_id_header);
+                ui.label("Dialled number header");
+                ui.text_edit_singleline(&mut draft.dialed_number_header);
                 if ui.button("Add").clicked() {
                     self.add_account();
                 }
+                body_rect = Some(ui.min_rect());
             });
         }
-        if opened {
-            if let Some(rect) = header_rect {
+        // The page keeps the form in view while the page settles: the
+        // account's own group opens at the same time, and it moves the
+        // form down as it grows.
+        if self.add_form_scroll > 0 {
+            self.add_form_scroll -= 1;
+            let target = body_rect.or(header_rect);
+            if let Some(rect) = target {
                 ui.scroll_to_rect(rect, Some(egui::Align::Center));
             }
         }
@@ -3608,11 +3651,11 @@ impl QSoftphoneApp {
 
     /// One account, as a group.
     ///
-    /// The title is the account's name, its server and its
+    /// The title is the account's number, its name, its server and its
     /// registration state; the body is the account's whole form. The
     /// arrow folds the group away, and the title picks the account —
     /// the lamps in the left panel and the registration follow it.
-    fn draw_account_group(&mut self, ui: &mut egui::Ui, account: &Account) {
+    fn draw_account_group(&mut self, ui: &mut egui::Ui, account: &Account, number: usize) {
         let id = ui.make_persistent_id(("account_group", account.id.clone()));
         let mut state =
             egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
@@ -3630,6 +3673,13 @@ impl QSoftphoneApp {
 
         let mut title_clicked = false;
         let mut header = state.show_header(ui, |ui| {
+            // The account's own number, the same one the list in the
+            // left panel gives it.
+            ui.label(
+                egui::RichText::new(format!("{number}"))
+                    .small()
+                    .color(egui::Color32::GRAY),
+            );
             // The title is a label that can be clicked: the account it
             // names is the account the user is working on.
             let label = ui.add(
@@ -3946,7 +3996,7 @@ impl QSoftphoneApp {
         let mut any = false;
         for account in self.accounts.clone() {
             let name = account_name(&account);
-            for entry in &account.blf_extensions {
+            for (index, entry) in account.blf_extensions.iter().enumerate() {
                 let watch = entry.watch.trim().to_string();
                 if watch.is_empty() {
                     continue;
@@ -3972,6 +4022,22 @@ impl QSoftphoneApp {
                         // is not the extension.
                         ui.weak(&dial);
                     }
+                    // The lamp's own number in this account's list.
+                    //
+                    // It is the account's number of the lamp, so the
+                    // user can say "lamp 2 of 104" and mean one row.
+                    // Each account counts its own lamps: the second
+                    // account's first lamp is 1, like the first
+                    // account's first lamp.
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(16.0, 14.0), egui::Sense::hover());
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        format!("{}", index + 1),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::GRAY,
+                    );
                 });
                 // Whose lamp this is, and what it says.
                 //
@@ -5168,6 +5234,24 @@ mod tests {
             .unwrap_or_else(|| panic!("there is no account {id}"))
     }
 
+    /// The account with this id, to change.
+    fn account_by_id_mut<'a>(app: &'a mut QSoftphoneApp, id: &str) -> &'a mut Account {
+        app.accounts
+            .iter_mut()
+            .find(|account| account.id == id)
+            .unwrap_or_else(|| panic!("there is no account {id}"))
+    }
+
+    /// The line that follows this one.
+    ///
+    /// The lamps are a list, and a number only means something next to
+    /// the thing it numbers.
+    fn line_after(text: &str, line: &str) -> Option<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let index = lines.iter().position(|found| *found == line)?;
+        lines.get(index + 1).map(|found| (*found).to_string())
+    }
+
     /// An incoming call, as the SIP layer would report it.
     ///
     /// The event carries the peer's **URI** — that is the C++'s
@@ -5639,6 +5723,137 @@ mod tests {
         assert!(
             text.contains("105") && text.contains("106"),
             "the lamps of both accounts are not in the panel:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_accounts_are_numbered() {
+        // Two accounts that are both called "104" are two accounts the
+        // user cannot tell apart — and a number is a name they can both
+        // say out loud.
+        let (mut app, _bus) = build_app_with_two_accounts(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        // The store lists the accounts by label, so the numbers follow
+        // that order — and each account gets the number of its row.
+        let first = account_name(&account_by_id(&app, &app.accounts[0].id));
+        let second = account_name(&account_by_id(&app, &app.accounts[1].id));
+        assert!(
+            text.contains(&format!("1  {first}")),
+            "the first account has no number:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("2  {second}")),
+            "the second account has no number:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_lamp_is_numbered_in_its_own_account() {
+        // Each account counts its own lamps: the second account's
+        // first lamp is 1, like the first account's first lamp.
+        let (mut app, _bus) = build_app_with_two_accounts(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        account_by_id_mut(&mut app, "acct-ui-1").blf_extensions = vec![
+            BlfEntry {
+                watch: "201".to_string(),
+                dial: String::new(),
+            },
+            BlfEntry {
+                watch: "202".to_string(),
+                dial: String::new(),
+            },
+        ];
+        account_by_id_mut(&mut app, "acct-ui-2").blf_extensions = vec![BlfEntry {
+            watch: "203".to_string(),
+            dial: String::new(),
+        }];
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert_eq!(
+            line_after(&text, "201").as_deref(),
+            Some("1"),
+            "the first lamp of the first account is not numbered:\n{text}"
+        );
+        assert_eq!(
+            line_after(&text, "202").as_deref(),
+            Some("2"),
+            "the second lamp of the first account is not numbered:\n{text}"
+        );
+        assert_eq!(
+            line_after(&text, "203").as_deref(),
+            Some("1"),
+            "the first lamp of the second account is not numbered:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_is_made_with_the_four_settings() {
+        // The domain, the proxy and the two header names are what an
+        // account is made with — and the form that makes it says them.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        app.view = View::Account;
+
+        // Fill the form in **before** it is opened: a text edit holds
+        // the text it was given the first time it is drawn, and a value
+        // written into the form afterwards is the value the edit
+        // remembers, not the one on the screen.
+        app.new_account.label = "Branch".to_string();
+        app.new_account.registrar = "sip.example.com:5060".to_string();
+        app.new_account.domain = "example.com".to_string();
+        app.new_account.outbound_proxy = "sbc.example.com:5080".to_string();
+        app.new_account.caller_id_header = "X-Caller".to_string();
+        app.new_account.dialed_number_header = "X-Dialled".to_string();
+
+        // Open the form: the **+ Add** button in the left panel.
+        let output = frame(&mut app, &ctx);
+        let add = button_at(&output, "+ Add").expect("the left panel has no add button");
+        click_at(&mut app, &ctx, add);
+        settle(&mut app, &ctx);
+
+        // The form says all four of them.
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        for field in [
+            "Domain",
+            "Outbound proxy",
+            "Caller name header",
+            "Dialled number header",
+        ] {
+            assert!(
+                text.contains(field),
+                "the form has no {field} field:\n{text}"
+            );
+        }
+
+        // And make the account.
+        let make = button_at(&output, "Add").expect("the form has no add button");
+        click_at(&mut app, &ctx, make);
+
+        let made = app
+            .accounts
+            .iter()
+            .find(|account| account.label == "Branch")
+            .expect("the account was not made");
+        assert_eq!(made.domain, "example.com", "the domain was lost");
+        assert_eq!(
+            made.outbound_proxy, "sbc.example.com:5080",
+            "the outbound proxy was lost"
+        );
+        assert_eq!(
+            made.caller_id_header, "X-Caller",
+            "the caller name header was lost"
+        );
+        assert_eq!(
+            made.dialed_number_header, "X-Dialled",
+            "the dialled number header was lost"
         );
     }
 

@@ -4626,8 +4626,9 @@ Three things changed, and they are all in the interface:
   field that does not exist, and the settings page has scrolled since
   M6.1 — the account page had not, and now it does.
 * **The headers and the lamps fold away.** `CUSTOM HEADERS` and
-  `WATCHED EXTENSIONS` are collapsible blocks, open to begin with, and
-  the account underneath them is a page of its own again.
+  `WATCHED EXTENSIONS` are collapsible blocks, and the account
+  underneath them is a page of its own again. (M6.9 folded them to
+  begin with, and gave the ringtone a block of its own.)
 * **The **+ Add** button brings the form with it.** It opens the form
   for another account *and* scrolls the page to it, so the button that
   says "add" puts the place to add in front of the user. The form
@@ -4644,8 +4645,8 @@ fields, the same headers, the same lamps, the same account.
   button is pressed it is on the screen: the page scrolled to it.
 * **The headers and the lamps fold away.** Clicking `CUSTOM HEADERS`
   takes the header rows with it; clicking `WATCHED EXTENSIONS` takes
-  the watched extensions with it. Both are folded away *by the user*,
-  not by the app deciding they are not interesting.
+  the watched extensions with it. Both are folded away *by the user*
+  as well as by the app — the block opens again when it is asked for.
 * **The **+ Add** button opens the form**, and the form's own **Add**
   button is there when it is open.
 
@@ -4725,6 +4726,61 @@ is that **every** account can now be seen and changed.
 
 ---
 
+## M6.10 — The account is made with everything it is, and everything has a number
+
+*"Could we modify a bit account creation. I would like to see params Domain,
+Outbound proxy, Caller name header, Dialled number header on adding account."*
+
+*"Another one thing let's add indexes to account to have space — like Accounts
+1 104, 2 105; Extensions 104 1, 105 1."*
+
+Two things, and both of them are about telling one account from another.
+
+**The form that makes an account now says everything the account is.** It
+had the label, the registrar, the user, the password and the transport —
+and the domain, the proxy and the two header names were left for the
+editor. So an account was made in two steps, and the second step was
+easy to forget. The form now carries all nine, and the account it makes
+has them from the first second.
+
+The editor still lets them be changed afterwards: a domain that was typed
+wrong is a domain that should be fixable without throwing the account
+away.
+
+**Everything is numbered.** The accounts in the list on the left are
+numbered `1`, `2`, … and the title of the account's group on the account
+page carries the same number. Two accounts that are both called "104" are
+two accounts nobody can tell apart, and a number is a name both of them
+can say out loud.
+
+The lamps are numbered too, and **each account counts its own lamps**: the
+first account's lamps are 1, 2, 3 and the second account's lamps are 1, 2,
+3 again. A lamp's number says *which lamp of which account* it is:
+
+```
+● 104        1
+  from acc 104 · unknown
+```
+
+One more thing fell out of it: the **+ Add** button scrolls to the form's
+*title*, and the page then grows under it — the account's own group opens
+at the same time — so the form's own **Add** button ended up below the
+fold. The page now keeps the whole form in view while it settles.
+
+### What is proved
+
+* **The form says all four settings, and the account has them.** The form
+  is opened through the **+ Add** button, filled in, and the account that
+  comes out of the store has the domain, the proxy and the two header
+  names.
+* **The accounts are numbered.** The list says `1  <account>` and
+  `2  <account>`, in the order the accounts are listed.
+* **Each lamp is numbered in its own account.** The first account's first
+  lamp is 1, its second is 2, and the second account's first lamp is 1
+  again.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -4780,6 +4836,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.7** | The Busy Lamp Field: RFC 3903 `dialog` **and** `presence` subscriptions, the two kinds of `NOTIFY` document read by hand, and the lamps in the left panel below the accounts — each lamp a button that dials the number the account has for that extension, and each lamp able to say *busy*, *ringing*, *free*, *offline* or *unknown* | **done** |
 | **M6.8** | The account page you can get through: the page scrolls, the custom headers and the watched extensions fold away, and the **+ Add** button opens the form for another account and scrolls to it | **done** |
 | **M6.9** | Every account is a group: the selected account is open, the others are folded to their title with all their fields in them, each account has a form of its own, and every lamp in the panel says the account that watches it | **done** |
+| **M6.10** | The account is made with everything it is: the form for another account carries the domain, the outbound proxy and the two header names, the accounts are numbered, and every lamp is numbered in its own account | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -4843,7 +4900,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 506 tests, all passing.
+* `cargo test --workspace` — 509 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
