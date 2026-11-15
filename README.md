@@ -4693,11 +4693,11 @@ the form was saved; every account has its own draft, its own **Save** and
 
 And the **lamps say whose they are**. The panel in the left side lists the
 watched extensions of **every** account, each row saying the account it
-belongs to:
+belongs to — by the account's own number, the same number the list of
+accounts gives it:
 
 ```
-● 105  00105
-  from acc 104 · unknown
+●  1  105  1  unknown
 ```
 
 The same extension watched by two accounts is two lamps — one per
@@ -4716,7 +4716,7 @@ the account that watches it.
   account's form is not in the other's, and saving one account leaves the
   other exactly as it was in the store.
 * **The lamps say whose they are.** Both accounts' lamps are in the panel,
-  and each says `from acc …`.
+  and each carries the number of the account that watches it.
 * **The blocks still fold.** The ringtone, the headers and the lamps are
   folded away to begin with, and they open when they are asked for.
 
@@ -4758,9 +4758,13 @@ first account's lamps are 1, 2, 3 and the second account's lamps are 1, 2,
 3 again. A lamp's number says *which lamp of which account* it is:
 
 ```
-● 104        1
-  from acc 104 · unknown
+●  1  104  1  busy
 ```
+
+The row is the lamp, the account's number, the extension, the lamp's own
+number and what the lamp says — one line, and the account's name is not on
+it any more: the number says whose lamp it is, and the number is a name
+that fits.
 
 One more thing fell out of it: the **+ Add** button scrolls to the form's
 *title*, and the page then grows under it — the account's own group opens
@@ -4778,6 +4782,46 @@ fold. The page now keeps the whole form in view while it settles.
 * **Each lamp is numbered in its own account.** The first account's first
   lamp is 1, its second is 2, and the second account's first lamp is 1
   again.
+
+---
+
+## M6.11 — The lamp is one line
+
+*"Let's remove 'from acc 104 · unknown'"*
+
+The lamp in the left panel was two lines: the lamp itself, and under it
+the account it came from and what it said.
+
+```
+● 105  00105
+  from acc 104 · unknown
+```
+
+The second line was a sentence, and a sentence in a narrow panel is a
+sentence whose last word is cut off. It is also, now, unnecessary: the
+account is named by its **number** — the same number the list of accounts
+gives it — so the line said a thing the row already says.
+
+The row is one line now:
+
+```
+●  1  105  1  unknown
+```
+
+The lamp and its colour, the account's number, the extension, the lamp's
+own number in that account's list, and what the lamp says. The number
+that is dialled is still there when it is not the extension itself — an
+account that watches 105 and dials 00105 says so — and the state word is
+coloured like the lamp, so the row can be read without reading it.
+
+### What is proved
+
+* **The lamp is one line.** There is no `from acc …` line under it any
+  more.
+* **The account's number is on the row.** The number before the extension
+  is the number of the account that watches it — the same number the list
+  of accounts gives that account.
+* **The lamp's own number is still there**, and the state word with it.
 
 ---
 
@@ -4837,6 +4881,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.8** | The account page you can get through: the page scrolls, the custom headers and the watched extensions fold away, and the **+ Add** button opens the form for another account and scrolls to it | **done** |
 | **M6.9** | Every account is a group: the selected account is open, the others are folded to their title with all their fields in them, each account has a form of its own, and every lamp in the panel says the account that watches it | **done** |
 | **M6.10** | The account is made with everything it is: the form for another account carries the domain, the outbound proxy and the two header names, the accounts are numbered, and every lamp is numbered in its own account | **done** |
+| **M6.11** | The lamp is one line: the lamp, the account's number, the extension, the lamp's number and the state — the `from acc … · unknown` line under it is gone | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.

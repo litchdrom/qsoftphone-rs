@@ -3982,10 +3982,16 @@ impl QSoftphoneApp {
     /// That is what the list is for — a lamp is a light on a speed
     /// dial.
     ///
-    /// Every account's lamps are here, and **each row says whose lamp
-    /// it is**: the same extension can be watched by two accounts, and
-    /// then there are two lamps for it — one per subscription — and the
-    /// user has to be able to tell them apart.
+    /// Every account's lamps are here, and each row says **whose** lamp
+    /// it is — by the account's number, the same number the list of
+    /// accounts gives it:
+    ///
+    /// ```text
+    /// ●  1  104  1  busy
+    /// ```
+    ///
+    /// The account's number, the extension, the lamp's own number in
+    /// that account's list, and what the lamp says.
     fn draw_blf_panel(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.label(egui::RichText::new("EXTENSIONS").strong().size(11.0));
@@ -3994,8 +4000,7 @@ impl QSoftphoneApp {
         // lamps of each of them, and the app cannot be borrowed while
         // it is being asked.
         let mut any = false;
-        for account in self.accounts.clone() {
-            let name = account_name(&account);
+        for (account_index, account) in self.accounts.clone().into_iter().enumerate() {
             for (index, entry) in account.blf_extensions.iter().enumerate() {
                 let watch = entry.watch.trim().to_string();
                 if watch.is_empty() {
@@ -4010,6 +4015,8 @@ impl QSoftphoneApp {
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                     ui.painter().circle_filled(rect.center(), 5.0, colour);
+                    // Whose lamp this is: the account's own number.
+                    number(ui, account_index + 1);
                     // The extension is the button: pressing it dials
                     // the number the account has for it — which is
                     // often not the extension itself — and it dials
@@ -4023,29 +4030,9 @@ impl QSoftphoneApp {
                         ui.weak(&dial);
                     }
                     // The lamp's own number in this account's list.
-                    //
-                    // It is the account's number of the lamp, so the
-                    // user can say "lamp 2 of 104" and mean one row.
-                    // Each account counts its own lamps: the second
-                    // account's first lamp is 1, like the first
-                    // account's first lamp.
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(16.0, 14.0), egui::Sense::hover());
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        format!("{}", index + 1),
-                        egui::FontId::proportional(11.0),
-                        egui::Color32::GRAY,
-                    );
-                });
-                // Whose lamp this is, and what it says.
-                //
-                // It is on its own line: the panel is narrow, and a
-                // row that says everything at once is a row whose
-                // last word is cut off.
-                ui.indent(("lamp", &watch, &account.id), |ui| {
-                    ui.weak(format!("from acc {name} · {}", state.label()));
+                    number(ui, index + 1);
+                    // And what it says.
+                    ui.colored_label(colour, state.label());
                 });
             }
         }
@@ -5091,6 +5078,22 @@ pub fn mark_started() {
     let _ = STARTED.set(std::time::Instant::now());
 }
 
+/// A number in a column of its own.
+///
+/// The numbers are the same width whatever they are, so they line up
+/// down the panel — and a column of numbers is a column that can be
+/// read down as well as across.
+fn number(ui: &mut egui::Ui, value: usize) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 14.0), egui::Sense::hover());
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("{value}"),
+        egui::FontId::proportional(11.0),
+        egui::Color32::GRAY,
+    );
+}
+
 /// The name of an account.
 ///
 /// It is the label the user gave it, and when there is no label it is
@@ -5250,6 +5253,16 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         let index = lines.iter().position(|found| *found == line)?;
         lines.get(index + 1).map(|found| (*found).to_string())
+    }
+
+    /// The line that comes before this one.
+    fn line_before(text: &str, line: &str) -> Option<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let index = lines.iter().position(|found| *found == line)?;
+        index
+            .checked_sub(1)
+            .and_then(|before| lines.get(before))
+            .map(|found| (*found).to_string())
     }
 
     /// An incoming call, as the SIP layer would report it.
@@ -5696,16 +5709,16 @@ mod tests {
     #[tokio::test]
     async fn every_lamp_says_which_account_watches_it() {
         // The lamps of every account are in the panel, and each of them
-        // says whose lamp it is: the same extension can be watched by
-        // two accounts, and then there are two lamps for it.
+        // says whose lamp it is — by the account's number, the same
+        // number the list of accounts gives it.
         let (mut app, _bus) = build_app_with_two_accounts(tokio::runtime::Handle::current());
         let ctx = egui::Context::default();
 
-        app.accounts[0].blf_extensions = vec![BlfEntry {
+        account_by_id_mut(&mut app, "acct-ui-1").blf_extensions = vec![BlfEntry {
             watch: "105".to_string(),
             dial: String::new(),
         }];
-        app.accounts[1].blf_extensions = vec![BlfEntry {
+        account_by_id_mut(&mut app, "acct-ui-2").blf_extensions = vec![BlfEntry {
             watch: "106".to_string(),
             dial: String::new(),
         }];
@@ -5713,16 +5726,46 @@ mod tests {
         let output = frame(&mut app, &ctx);
         let text = screen_text(&output);
         assert!(
-            text.contains("from acc Office"),
-            "the first account's lamp does not say whose it is:\n{text}"
-        );
-        assert!(
-            text.contains("from acc Home"),
-            "the second account's lamp does not say whose it is:\n{text}"
-        );
-        assert!(
             text.contains("105") && text.contains("106"),
             "the lamps of both accounts are not in the panel:\n{text}"
+        );
+        // The row is: the lamp, the account's number, the extension,
+        // the lamp's number and what the lamp says.
+        let office = app
+            .accounts
+            .iter()
+            .position(|account| account.id == "acct-ui-1")
+            .expect("the office account is gone")
+            + 1;
+        let home = app
+            .accounts
+            .iter()
+            .position(|account| account.id == "acct-ui-2")
+            .expect("the home account is gone")
+            + 1;
+        assert_eq!(
+            line_before(&text, "105"),
+            Some(office.to_string()),
+            "the first account's lamp does not say whose it is:\n{text}"
+        );
+        assert_eq!(
+            line_before(&text, "106"),
+            Some(home.to_string()),
+            "the second account's lamp does not say whose it is:\n{text}"
+        );
+        assert_eq!(
+            line_after(&text, "105").as_deref(),
+            Some("1"),
+            "the first account's lamp is not numbered:\n{text}"
+        );
+        assert_eq!(
+            line_after(&text, "106").as_deref(),
+            Some("1"),
+            "the second account's lamp is not numbered:\n{text}"
+        );
+        assert!(
+            !text.contains("from acc"),
+            "the lamp still says where it comes from:\n{text}"
         );
     }
 
