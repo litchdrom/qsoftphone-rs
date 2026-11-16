@@ -137,8 +137,10 @@ impl Db {
             // The extensions whose Busy Lamp Field an account watches.
             // A list of extension numbers, stored as JSON.
             ("accounts", "blf_extensions", "TEXT NOT NULL DEFAULT '[]'"),
-            // The status the account shows — "ready", "online" or
-            // "pause". An account that is already in the table gets
+            // The status the account shows — the **id** of a status.
+            // The statuses themselves are the user's and live in the
+            // settings file, so the column holds a word and not a
+            // list. An account that is already in the table gets
             // "ready": that is the state a phone is in when nobody has
             // said otherwise.
             ("accounts", "status", "TEXT NOT NULL DEFAULT 'ready'"),
@@ -146,6 +148,11 @@ impl Db {
             // script to run, an HTTP query to make or a plugin to hand
             // it to. Stored as JSON, like the headers above. Empty means
             // "nothing happens".
+            //
+            // The column is **not read any more**: the hook belongs to
+            // the status and to the status alone. It is left where it
+            // is so that a database that has it and one that does not
+            // are the same database.
             ("accounts", "status_action", "TEXT NOT NULL DEFAULT ''"),
         ];
         self.with_conn(|conn| {

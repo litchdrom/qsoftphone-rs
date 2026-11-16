@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::status::{AccountStatus, StatusAction};
+use crate::model::status::DEFAULT_STATUS_ID;
 
 /// A captured SIP header set: header name to value.
 ///
@@ -119,17 +119,16 @@ pub struct Account {
     pub ringtone_file: String,
     /// The status this account shows.
     ///
-    /// **Ready**, **Online** or **Pause** — see
-    /// [`crate::model::status::AccountStatus`]. The status is the
-    /// account's own, and it is what the account's button in the left
-    /// panel shows.
-    pub status: AccountStatus,
-    /// What happens when the status is set.
+    /// The **id** of a status — `ready`, `online`, `pause`, or one of
+    /// the user's own. The statuses themselves are the user's, and
+    /// they live in the settings file
+    /// ([`crate::config::AppConfig::statuses`]): a state of the user
+    /// is a state of the user, not a state of one account.
     ///
-    /// A code to dial, a script to run, an HTTP query to make, or a
-    /// plugin to hand it to — see
-    /// [`crate::model::status::StatusAction`].
-    pub status_action: StatusAction,
+    /// What the status *does* belongs to the status and not to the
+    /// account — see
+    /// [`crate::model::status::StatusDefinition`].
+    pub status: String,
     /// Epoch milliseconds.
     pub created_at: i64,
     /// Epoch milliseconds.
@@ -153,6 +152,9 @@ impl Account {
             user: user.into(),
             password: password.into(),
             transport: transport.into(),
+            // A new account is ready: it is the state a phone is in
+            // when nobody has said otherwise.
+            status: DEFAULT_STATUS_ID.to_string(),
             created_at: now,
             updated_at: now,
             ..Default::default()

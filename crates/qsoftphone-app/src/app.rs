@@ -20,7 +20,7 @@ use qsoftphone_core::model::history::{
     CallRecord, CallResult, Direction as HistoryDirection, LocalTime, classify_result,
     format_duration, history_direction,
 };
-use qsoftphone_core::model::status::{AccountStatus, StatusAction};
+use qsoftphone_core::model::status::{HttpMethod, StatusAction, StatusDefinition};
 use qsoftphone_core::paths::AppPaths;
 use qsoftphone_core::sip::custom_headers::is_valid_name;
 use qsoftphone_core::sip::refer::TransferProgress;
@@ -483,14 +483,11 @@ struct Draft {
     ///
     /// A pair: the extension to watch, and the number to dial for it.
     blf_extensions: Vec<BlfEntry>,
-    /// The status the account shows: "ready", "online" or "pause".
+    /// The status the account shows: the id of a status.
+    ///
+    /// The statuses themselves are the user's and live in the settings
+    /// file, so this is a word and not a list of them.
     status: String,
-    /// What happens when the status is set: "", "dial", "script",
-    /// "http" or "plugin".
-    status_action_kind: String,
-    /// The value of the action: the code, the command, the URL or the
-    /// plugin's name.
-    status_action_value: String,
 }
 
 impl Draft {
@@ -513,9 +510,7 @@ impl Draft {
         account.ringtone_file = self.ringtone_file.trim().to_string();
         account.custom_headers = Self::clean_headers(&self.custom_headers);
         account.blf_extensions = Self::clean_entries(&self.blf_extensions);
-        account.status = AccountStatus::from_name(&self.status).unwrap_or_default();
-        account.status_action =
-            StatusAction::of(&self.status_action_kind, &self.status_action_value);
+        account.status = self.status.trim().to_string();
         account
     }
 
@@ -534,9 +529,7 @@ impl Draft {
             ringtone_file: account.ringtone_file.clone(),
             custom_headers: account.custom_headers.clone(),
             blf_extensions: account.blf_extensions.clone(),
-            status: account.status.name().to_ascii_lowercase(),
-            status_action_kind: account.status_action.kind().to_string(),
-            status_action_value: account.status_action.value().to_string(),
+            status: account.status.clone(),
         }
     }
 
@@ -664,7 +657,82 @@ impl QSoftphoneApp {
         // The history is read on the runtime; the rows arrive on the
         // channel and are drained at the top of the frame (§3).
         app.history.query("", None);
+        // The hooks that used to be on the account are on the status
+        // now, and the ones that are already there are moved.
+        app.migrate_legacy_hooks();
         app
+    }
+
+    /// Move the hooks that used to be on the account onto the status.
+    ///
+    /// An account saved by an older build has a hook of its own, in a
+    /// column of its own, and a status with no hook of its own: the
+    /// hook moves to the status, and it moves for **every** account —
+    /// which is what the hook was always about. "Online dials 666" was
+    /// one line on one account; it is one line on the status now.
+    ///
+    /// A status that has a hook of its own keeps it: the user wrote
+    /// that one last, and it is the one they meant. The old hook is
+    /// then dropped — the hook is on the status now, and it is not on
+    /// the account.
+    fn migrate_legacy_hooks(&mut self) {
+        // The hooks of the accounts of an older build, read straight
+        // out of the column they were kept in.
+        let legacy = match AccountStore::new(&self.db).legacy_hooks() {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the old hooks");
+                return;
+            }
+        };
+        if legacy.is_empty() {
+            return;
+        }
+
+        let mut moved: Vec<String> = Vec::new();
+        for (account_id, json) in legacy {
+            let Some(action) = StatusAction::from_legacy_json(&json) else {
+                continue;
+            };
+            // The status the account was in.
+            let Some(status_id) = self
+                .accounts
+                .iter()
+                .find(|account| account.id == account_id)
+                .map(|account| account.status.clone())
+            else {
+                continue;
+            };
+            let Some(status) = self
+                .config
+                .statuses
+                .iter_mut()
+                .find(|status| status.id == status_id)
+            else {
+                continue;
+            };
+            if status.action().is_some() {
+                continue;
+            }
+            status.action_kind = action.kind().to_string();
+            status.action_value = action.value().to_string();
+            status.action_method = action.method().name().to_string();
+            status.action_body = action.body().to_string();
+            moved.push(account_id);
+        }
+        if moved.is_empty() {
+            return;
+        }
+
+        // The statuses are written, and the accounts are let go of the
+        // hook they used to carry.
+        if let Err(e) = self.config.save(&self.paths.config_file()) {
+            tracing::warn!(error = %e, "could not write the moved hooks");
+        }
+        for account_id in moved {
+            let _ = AccountStore::new(&self.db).clear_legacy_hook(&account_id);
+        }
+        tracing::info!("the per-account hooks were moved onto the statuses");
     }
 
     /// Drain the registration state changes that arrived since the
@@ -1358,33 +1426,45 @@ impl QSoftphoneApp {
 
     /// Set an account's status, and do what the status means.
     ///
-    /// The status is the account's own and it is stored with it: two
-    /// accounts on the same server can be in different states, and that
-    /// is the ordinary case.
+    /// The status is the **id** of one of the user's statuses, and the
+    /// statuses are the same for every account: a state of the user is
+    /// a state of the user, not a state of one account.
     ///
-    /// Setting it runs the account's **action** — the button is the
-    /// switch, and the action is what the switch is wired to. The
-    /// action runs every time a state is picked, even the state the
-    /// account is already in: a user who wants to tell the PBX twice
-    /// presses the button twice.
-    fn set_account_status(&mut self, account_id: &str, status: AccountStatus) {
+    /// Setting it runs the status's **hook** — the button is the
+    /// switch, and the hook is what the switch is wired to. The hook
+    /// runs every time a state is picked, even the state the account
+    /// is already in: a user who wants to tell the PBX twice presses
+    /// the button twice.
+    fn set_account_status(&mut self, account_id: &str, status_id: &str) {
         let Some(index) = self.accounts.iter().position(|a| a.id == account_id) else {
             return;
         };
+        // A status that is not in the list is not a status: the
+        // account goes back to the default one.
+        let definition = match self.config.status(status_id) {
+            Some(definition) => definition.clone(),
+            None => {
+                tracing::warn!(
+                    status = %status_id,
+                    "the status is not one of the user's; using the default one"
+                );
+                self.config.default_status()
+            }
+        };
         let mut account = self.accounts[index].clone();
-        account.status = status;
+        account.status = definition.id.clone();
 
         // The status is saved first: it is what the user set, and it is
-        // theirs whatever the action does.
+        // theirs whatever the hook does.
         match AccountStore::new(&self.db).upsert(&account) {
             Ok(saved) => {
                 self.accounts[index] = saved.clone();
                 // The editor shows the status too, so the form does not
                 // go back to the old one.
                 if let Some(draft) = self.edit_accounts.get_mut(&account.id) {
-                    draft.status = status.name().to_ascii_lowercase();
+                    draft.status = definition.id.clone();
                 }
-                self.status = format!("{} is {}.", account.label, status.name());
+                self.status = format!("{} is {}.", account.label, definition.name);
             }
             Err(e) => {
                 self.status = format!("The status was not saved: {e}");
@@ -1392,10 +1472,59 @@ impl QSoftphoneApp {
             }
         }
 
-        self.run_status_action(&self.accounts[index].clone());
+        self.run_status_action(&self.accounts[index].clone(), &definition);
     }
 
-    /// Do what the account's action says.
+    /// The status with this id.
+    ///
+    /// The statuses are the user's, and an account may be in one that
+    /// is not in the list — the user deleted it, or the settings file
+    /// was edited by hand. The account is then in the default status,
+    /// which is what a phone is in when nobody has said otherwise.
+    fn status_of(&self, id: &str) -> StatusDefinition {
+        self.config
+            .status(id)
+            .cloned()
+            .unwrap_or_else(|| self.config.default_status())
+    }
+
+    /// Add a status of the user's own.
+    ///
+    /// It starts with no name and an id that says nothing: the id is
+    /// made from the name, and the name is what the user types.
+    fn add_status(&mut self) {
+        let taken: Vec<String> = self
+            .config
+            .statuses
+            .iter()
+            .map(|status| status.id.clone())
+            .collect();
+        self.config.statuses.push(StatusDefinition::new("", &taken));
+        self.save_settings();
+        self.status = "A status of your own — give it a name.".to_string();
+    }
+
+    /// Take a status away.
+    ///
+    /// The statuses that come with the app stay: they are what an
+    /// account falls back to, and a list without "Ready" is a list
+    /// whose accounts are all in a state that is not there.
+    fn remove_status(&mut self, index: usize) {
+        if self
+            .config
+            .statuses
+            .get(index)
+            .is_some_and(StatusDefinition::is_built_in)
+        {
+            return;
+        }
+        self.config.statuses.remove(index);
+        self.save_settings();
+        self.status =
+            "The status is gone — the accounts that were in it are in the default one.".to_string();
+    }
+
+    /// Do what the status's hook says.
     ///
     /// Four kinds, and two of them are the app's own business:
     ///
@@ -1407,8 +1536,9 @@ impl QSoftphoneApp {
     /// * **a plugin** — stored and shown, and not run: §8 of the brief
     ///   puts the plugin host out of scope, and a plugin that pretends
     ///   to work is worse than one that says it is not there yet.
-    fn run_status_action(&mut self, account: &Account) {
-        match &account.status_action {
+    fn run_status_action(&mut self, account: &Account, definition: &StatusDefinition) {
+        let action = definition.action();
+        match &action {
             StatusAction::None => {}
             StatusAction::Dial(code) => {
                 let code = code.trim();
@@ -1442,12 +1572,8 @@ impl QSoftphoneApp {
                     }
                 }
             }
-            StatusAction::Script(_) | StatusAction::Http(_) => {
-                action::spawn(
-                    &account.status_action,
-                    &account.label,
-                    self.action_updates_tx.clone(),
-                );
+            StatusAction::Script(_) | StatusAction::Http { .. } => {
+                action::spawn(&action, &account.label, self.action_updates_tx.clone());
                 self.status = format!("Running the action for {}.", account.label);
             }
             StatusAction::Plugin(name) => {
@@ -2343,7 +2469,15 @@ impl QSoftphoneApp {
 
     fn reload(&mut self) {
         match AccountStore::new(&self.db).list() {
-            Ok(accounts) => {
+            Ok(mut accounts) => {
+                // An account in a status that is not in the list is in
+                // the default one: the list of statuses is the user's
+                // and may have grown one back.
+                for account in &mut accounts {
+                    if self.config.status(&account.status).is_none() {
+                        account.status = self.config.default_status().id;
+                    }
+                }
                 self.accounts = accounts;
                 if self.selected.is_some_and(|i| i >= self.accounts.len()) {
                     self.selected = (!self.accounts.is_empty()).then_some(0);
@@ -2534,6 +2668,9 @@ impl QSoftphoneApp {
                 // Set when the user picks a different account; applied
                 // once the account list's borrow has ended.
                 let mut pending_select: Option<usize> = None;
+                // And when the user picks a different status for one of
+                // them: the account and the status it is put into.
+                let mut pending_status: Option<(String, String)> = None;
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     if self.accounts.is_empty() {
@@ -2566,16 +2703,44 @@ impl QSoftphoneApp {
                         let text = format!("{}  {text}", index + 1);
                         let selected = self.selected == Some(index);
                         ui.horizontal(|ui| {
+                            // The account's status, and the button
+                            // that changes it.
+                            //
+                            // The lamp comes **first**, the way the
+                            // lamps of the Busy Lamp Field do below:
+                            // a lamp that is pushed off the edge of the
+                            // panel is a lamp nobody can click, and
+                            // this one is the button the status is
+                            // picked with. The account's name is what
+                            // gives way when the row is too narrow.
+                            //
+                            // The list says where every account is at
+                            // a glance, and the status is picked here:
+                            // the statuses are the user's own and the
+                            // list of them is one click away, so the
+                            // account the user is looking at is the
+                            // account they change.
+                            let status = self.status_of(&account.status);
+                            let mut picked: Option<String> = None;
+                            ui.menu_button(status_lamp(&status), |ui| {
+                                for definition in &self.config.statuses {
+                                    if ui
+                                        .selectable_label(
+                                            definition.id == account.status,
+                                            &definition.name,
+                                        )
+                                        .clicked()
+                                    {
+                                        picked = Some(definition.id.clone());
+                                    }
+                                }
+                            });
+                            if let Some(id) = picked {
+                                pending_status = Some((account.id.clone(), id));
+                            }
                             if ui.selectable_label(selected, text).clicked() {
                                 pending_select = Some(index);
                             }
-                            // The account's status, as a lamp.
-                            //
-                            // The list says where every account is at a
-                            // glance, and the button that changes it is
-                            // in the account's own title on the account
-                            // page.
-                            ui.colored_label(status_colour(account.status), "●");
                         });
                     }
                 });
@@ -2587,6 +2752,13 @@ impl QSoftphoneApp {
                     // user picked opens with it.
                     self.load_selected();
                     self.persist_active_account();
+                }
+
+                // The status is set after the list is let go of: the
+                // account is saved and the hook runs, and both of them
+                // need the app.
+                if let Some((account_id, status_id)) = pending_status {
+                    self.set_account_status(&account_id, &status_id);
                 }
 
                 ui.separator();
@@ -3822,7 +3994,7 @@ impl QSoftphoneApp {
         let title = account_name(account);
 
         let mut title_clicked = false;
-        let mut picked_status: Option<AccountStatus> = None;
+        let mut picked_status: Option<String> = None;
         let mut header = state.show_header(ui, |ui| {
             // The account's own number, the same one the list in the
             // left panel gives it.
@@ -3854,22 +4026,27 @@ impl QSoftphoneApp {
             // It is in the title and not in the body, because the body
             // is folded away: a status that is only visible when the
             // group is open is a status nobody can see.
-            ui.menu_button(status_label(account.status), |ui| {
-                for status in AccountStatus::ALL {
+            //
+            // The statuses are the user's own, so the list is the one
+            // in the settings — and the same list the button in the
+            // accounts list offers.
+            let status = self.status_of(&account.status);
+            ui.menu_button(status_label(&status), |ui| {
+                for definition in &self.config.statuses {
                     if ui
-                        .selectable_label(status == account.status, status.name())
+                        .selectable_label(definition.id == account.status, &definition.name)
                         .clicked()
                     {
-                        picked_status = Some(status);
+                        picked_status = Some(definition.id.clone());
                     }
                 }
             });
         });
 
-        // The state the user picked is set, and the account's action
+        // The state the user picked is set, and the hook of the status
         // runs with it.
         if let Some(status) = picked_status {
-            self.set_account_status(&account.id, status);
+            self.set_account_status(&account.id, &status);
         }
 
         // The title picks the account, and the account's group opens
@@ -4004,39 +4181,194 @@ impl QSoftphoneApp {
         });
     }
 
-    /// The account's status, and what it does.
+    /// The account's status.
     ///
-    /// The status itself is a button in the account's title — it is
-    /// there whether the group is open or not. This is where the
-    /// **action** is: what happens when the status is set.
-    ///
-    /// The point of the action is that the state lives outside the
-    /// softphone: a user who is ready tells the PBX so with a feature
-    /// code, and a user who is online tells a CRM so with an HTTP
-    /// query.
+    /// The status is picked in the **accounts list** — it is a state of
+    /// the user, and the user picks it where the accounts are. What the
+    /// status *does* belongs to the status and is set in the settings,
+    /// where the statuses live: one hook for "Online", and every
+    /// account that is online gets it.
     fn draw_status(&mut self, ui: &mut egui::Ui, account: &Account) {
+        let status = self.status_of(&account.status);
         ui.horizontal(|ui| {
             ui.label("Status");
-            ui.label(status_label(account.status));
-            ui.weak("— the button in the title changes it.");
+            ui.label(status_label(&status));
+            ui.weak("— pick it in the accounts list; what it does is set in the settings.");
         });
+    }
 
+    /// The statuses, and what each of them does.
+    ///
+    /// The list is the **user's**: the three that come with the app
+    /// are the start of it, and every one of them — the built-ins
+    /// included — can be renamed, recoloured and given a hook.
+    ///
+    /// The hook is here and not on the account: "Online dials 666" is
+    /// one line, and it holds for every account that is online. A hook
+    /// on the account would be the same line written down twice, once
+    /// for every account the user has.
+    fn draw_statuses(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("STATUSES").strong().size(11.0));
+        ui.separator();
+        ui.weak(
+            "The states an account can be put into. Every account uses the same list, and \
+             what a status does when it is set is set here.",
+        );
         ui.add_space(4.0);
-        ui.label(egui::RichText::new("When the status changes").strong());
-        {
-            let draft = self.draft_of(account);
-            egui::ComboBox::from_id_salt(("status_action", &account.id))
-                .selected_text(action_kind_label(&draft.status_action_kind))
-                .show_ui(ui, |ui| {
-                    for (kind, label) in ACTION_KINDS {
-                        ui.selectable_value(&mut draft.status_action_kind, kind.to_string(), label);
+
+        // A status that is taken out is applied after the loop: a list
+        // that is edited while it is walked moves the statuses under
+        // the fields that are being typed into.
+        let mut remove: Option<usize> = None;
+        let mut changed = false;
+
+        for index in 0..self.config.statuses.len() {
+            let original = self.config.statuses[index].clone();
+            // The fields are drawn on a copy and written back.
+            //
+            // A field that is drawn on the status itself is a field
+            // that cannot be read while the widget is on it, and a
+            // copy is what the widget owns: what the user types lands
+            // in the copy, and the copy is what the settings get.
+            let mut draft = original.clone();
+
+            ui.horizontal(|ui| {
+                // The lamp, in the colour of the status.
+                ui.colored_label(status_colour(&draft), "●");
+                // The name of the status.
+                ui.add(
+                    egui::TextEdit::singleline(&mut draft.name)
+                        .id_source(("status_name", index))
+                        .desired_width(150.0)
+                        .hint_text("Ready"),
+                );
+                // The colour: a word of hex, and the swatches.
+                ui.add(
+                    egui::TextEdit::singleline(&mut draft.colour)
+                        .id_source(("status_colour", index))
+                        .desired_width(80.0)
+                        .hint_text("#4cc06a"),
+                );
+                for (hex, (red, green, blue)) in STATUS_PALETTE {
+                    let colour = egui::Color32::from_rgb(red, green, blue);
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("■").color(colour))
+                                .min_size(egui::vec2(16.0, 16.0)),
+                        )
+                        .clicked()
+                    {
+                        draft.colour = hex.to_string();
                     }
-                });
-            // What the kind means, and the value it takes.
-            ui.weak(action_hint(&draft.status_action_kind));
-            if !draft.status_action_kind.is_empty() {
-                ui.text_edit_singleline(&mut draft.status_action_value);
+                }
+                // The statuses that come with the app cannot be taken
+                // away: they are what an account falls back to.
+                if !original.is_built_in() && ui.small_button("×").clicked() {
+                    remove = Some(index);
+                }
+            });
+
+            // The hook: what happens when the status is set.
+            ui.horizontal(|ui| {
+                ui.weak("When set");
+                let label = action_kind_label(&draft.action_kind);
+                egui::ComboBox::from_id_salt(("status_kind", index))
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        for (kind, kind_label) in ACTION_KINDS {
+                            ui.selectable_value(
+                                &mut draft.action_kind,
+                                kind.to_string(),
+                                kind_label,
+                            );
+                        }
+                    });
+                if !draft.action_kind.is_empty() {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut draft.action_value)
+                            .id_source(("status_value", index))
+                            .desired_width(200.0)
+                            .hint_text(action_value_hint(&draft.action_kind)),
+                    );
+                }
+                // The method and the body of an HTTP query.
+                //
+                // A GET is what a status that only *reports* needs, and
+                // a CRM that is told to change something wants a
+                // PATCH: the method is part of what the hook does, and
+                // the body is what it says.
+                if draft.action_kind == "http" {
+                    let method = HttpMethod::from_name(&draft.action_method).unwrap_or_default();
+                    egui::ComboBox::from_id_salt(("status_method", index))
+                        .selected_text(method.name())
+                        .show_ui(ui, |ui| {
+                            for method in HttpMethod::ALL {
+                                ui.selectable_value(
+                                    &mut draft.action_method,
+                                    method.name().to_string(),
+                                    method.name(),
+                                );
+                            }
+                        });
+                    if method.carries_body() {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut draft.action_body)
+                                .id_source(("status_body", index))
+                                .desired_width(180.0)
+                                .hint_text("{\"state\":\"online\"}"),
+                        );
+                    }
+                }
+            });
+            // What the kind means, under the field: a field with no
+            // name is a field the user does not know what to put in it.
+            if !draft.action_kind.is_empty() {
+                ui.weak(action_hint(&draft.action_kind));
             }
+
+            if draft != original {
+                // The id follows the name while nobody is in the
+                // status: an account's row holds the id, and an id
+                // that changes under an account is an account that
+                // loses its status.
+                if draft.name != original.name {
+                    let in_use = self
+                        .accounts
+                        .iter()
+                        .any(|account| account.status == original.id);
+                    if !in_use {
+                        let taken: Vec<String> = self
+                            .config
+                            .statuses
+                            .iter()
+                            .filter(|status| status.id != original.id)
+                            .map(|status| status.id.clone())
+                            .collect();
+                        draft.id = StatusDefinition::id_for(&draft.name, &taken);
+                    }
+                }
+                self.config.statuses[index] = draft;
+                changed = true;
+            }
+        }
+
+        if let Some(index) = remove {
+            self.remove_status(index);
+            changed = true;
+        }
+
+        // A status of the user's own.
+        if ui.button("+ Add a status").clicked() {
+            self.add_status();
+            changed = true;
+        }
+        ui.weak(
+            "The three that come with the app cannot be taken away — they are what an \
+             account falls back to.",
+        );
+
+        if changed {
+            self.save_settings();
         }
     }
 
@@ -4591,6 +4923,9 @@ impl QSoftphoneApp {
                 ));
             }
         }
+
+        ui.add_space(10.0);
+        self.draw_statuses(ui);
     }
 }
 
@@ -5354,14 +5689,25 @@ fn action_kind_label(kind: &str) -> &'static str {
 fn action_hint(kind: &str) -> &'static str {
     match kind {
         "dial" => {
-            "The code is sent as DTMF if a call is up on this account, and called if there is none."
+            "The code is sent as DTMF if a call is up on the account, and called if there is none."
         }
         "script" => {
             "The command runs as it would be typed in a console — a screen capture, for example."
         }
-        "http" => "The URL is fetched with GET, on a thread of its own.",
+        "http" => "The URL is fetched on a thread of its own, with the method and the body below.",
         "plugin" => "The plugin is stored and shown, and not run: the plugin host is out of scope.",
-        _ => "Nothing happens when the status changes.",
+        _ => "Nothing happens when the status is set.",
+    }
+}
+
+/// What the value of a kind of action is, in a word.
+fn action_value_hint(kind: &str) -> &'static str {
+    match kind {
+        "dial" => "666",
+        "script" => "capture.exe --screen",
+        "http" => "https://crm.example.com/api/state",
+        "plugin" => "bitrix",
+        _ => "",
     }
 }
 
@@ -5369,23 +5715,48 @@ fn action_hint(kind: &str) -> &'static str {
 ///
 /// The lamp is the same shape as the lamps in the left panel: a dot and
 /// a word, in the colour of the state.
-fn status_label(status: AccountStatus) -> egui::RichText {
-    egui::RichText::new(format!("● {}", status.name()))
+fn status_label(status: &StatusDefinition) -> egui::RichText {
+    egui::RichText::new(format!("● {}", status.name))
+        .color(status_colour(status))
+        .strong()
+}
+
+/// The lamp alone, for the list in the left panel.
+///
+/// The list is narrow, and a word in it would push the account's own
+/// name out of sight: the list says *that* the account is busy, and
+/// the button says which busy it is.
+fn status_lamp(status: &StatusDefinition) -> egui::RichText {
+    egui::RichText::new("●")
         .color(status_colour(status))
         .strong()
 }
 
 /// The colour of a status.
 ///
-/// The same three as the lamps of the Busy Lamp Field: green for free,
-/// amber for busy, grey for not there.
-fn status_colour(status: AccountStatus) -> egui::Color32 {
-    match status {
-        AccountStatus::Ready => egui::Color32::from_rgb(0x4c, 0xc0, 0x6a),
-        AccountStatus::Online => egui::Color32::from_rgb(0xd8, 0xa6, 0x30),
-        AccountStatus::Pause => egui::Color32::GRAY,
-    }
+/// It is the colour the user gave it, and the three that come with the
+/// app are the colours of the lamps of the Busy Lamp Field: green for
+/// free, amber for busy, grey for not there.
+fn status_colour(status: &StatusDefinition) -> egui::Color32 {
+    let (red, green, blue) = status.colour_rgb();
+    egui::Color32::from_rgb(red, green, blue)
 }
+
+/// The colours a status can be given, in the settings.
+///
+/// They are the ones the lamps use, and a few more: a status is a
+/// lamp, and a lamp that is only ever green or grey is a lamp that
+/// says very little.
+const STATUS_PALETTE: [(&str, (u8, u8, u8)); 8] = [
+    ("#4cc06a", (0x4c, 0xc0, 0x6a)),
+    ("#d8a630", (0xd8, 0xa6, 0x30)),
+    ("#e74c3c", (0xe7, 0x4c, 0x3c)),
+    ("#55aaff", (0x55, 0xaa, 0xff)),
+    ("#9b59b6", (0x9b, 0x59, 0xb6)),
+    ("#1abc9c", (0x1a, 0xbc, 0x9c)),
+    ("#808080", (0x80, 0x80, 0x80)),
+    ("#f5f5f5", (0xf5, 0xf5, 0xf5)),
+];
 
 /// The media settings, read out of the settings file.
 ///
@@ -5471,6 +5842,36 @@ mod tests {
         handle: tokio::runtime::Handle,
     ) -> (QSoftphoneApp, CallBus, SessionRegistry) {
         let paths = AppPaths::under(std::env::temp_dir().join("qsoftphone-app-ui-test"));
+        build_app_with_paths(paths, db, handle)
+    }
+
+    /// An app with one account, in a folder of its own.
+    ///
+    /// The settings file is in the folder, and a test that writes it
+    /// must not write into the folder of another test: the tests run
+    /// at the same time, and a test that reads a file another test is
+    /// writing is a test that fails now and then.
+    fn build_app_in_own_folder(
+        name: &str,
+        handle: tokio::runtime::Handle,
+    ) -> (QSoftphoneApp, CallBus) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let paths = AppPaths::under(
+            std::env::temp_dir().join(format!("qsoftphone-app-ui-test-{name}-{stamp}")),
+        );
+        let (app, bus, _) = build_app_with_paths(paths, Db::open_in_memory().expect("db"), handle);
+        (app, bus)
+    }
+
+    /// An app with one account, in a given folder.
+    fn build_app_with_paths(
+        paths: AppPaths,
+        db: Db,
+        handle: tokio::runtime::Handle,
+    ) -> (QSoftphoneApp, CallBus, SessionRegistry) {
         let sessions = SessionRegistry::new();
         let (bus, receiver) = CallBus::new();
 
@@ -5745,24 +6146,326 @@ mod tests {
         );
     }
 
-    /// The status is the account's own, and it is stored with it.
+    /// Give a status a hook, and say which status it is.
+    ///
+    /// The hook belongs to the **status** now: "Online dials 666" is
+    /// one line in the settings, and it holds for every account that
+    /// is online. A hook on the account would be the same line
+    /// written down once for every account the user has.
+    fn status_with_hook(app: &mut QSoftphoneApp, id: &str, action: StatusAction) -> String {
+        let definition = app
+            .config
+            .statuses
+            .iter_mut()
+            .find(|status| status.id == id)
+            .expect("the status is one of the built-ins");
+        definition.action_kind = action.kind().to_string();
+        definition.action_value = action.value().to_string();
+        definition.action_method = action.method().name().to_string();
+        definition.action_body = action.body().to_string();
+        id.to_string()
+    }
+
+    /// The accounts list is where the status is picked.
+    ///
+    /// The list says where every account is at a glance, and the lamp
+    /// in it is the switch: the account the user is looking at is the
+    /// account they change.
+    #[tokio::test]
+    async fn the_accounts_list_carries_the_status_button() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        let output = frame(&mut app, &ctx);
+        assert!(
+            button_at(&output, "●").is_some(),
+            "the accounts list has no status button:\n{}",
+            screen_text(&output)
+        );
+    }
+
+    /// The list of the user's statuses is what the button offers.
+    #[tokio::test]
+    async fn the_status_button_offers_the_users_statuses() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        let output = frame(&mut app, &ctx);
+        let lamp = button_at(&output, "●").expect("the accounts list has no status button");
+
+        click_at(&mut app, &ctx, lamp);
+        // The menu is a window of its own, and it is drawn on the
+        // frame after the one that opened it.
+        frame(&mut app, &ctx);
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        for name in ["Ready", "Online", "Pause"] {
+            assert!(
+                text.contains(name),
+                "the status button does not offer {name}:\n{text}"
+            );
+        }
+    }
+
+    /// The settings page is where the statuses are made.
+    #[tokio::test]
+    async fn the_settings_page_has_the_statuses() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        app.view = View::Settings;
+        let output = frame(&mut app, &ctx);
+
+        assert!(
+            text_at(&output, "STATUSES").is_some(),
+            "the settings page has no statuses section:\n{}",
+            screen_text(&output)
+        );
+        assert!(
+            button_at(&output, "+ Add a status").is_some(),
+            "the settings page has no way to add a status:\n{}",
+            screen_text(&output)
+        );
+    }
+
+    /// A status of the user's own can be added, and it is in the list
+    /// from then on.
+    #[tokio::test]
+    async fn a_status_of_the_users_own_can_be_added() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        assert_eq!(app.config.statuses.len(), 3);
+
+        app.add_status();
+
+        assert_eq!(app.config.statuses.len(), 4);
+        let added = app.config.statuses.last().expect("the status is there");
+        assert!(!added.is_built_in());
+        assert_eq!(added.name, "");
+    }
+
+    /// The statuses that come with the app cannot be taken away: they
+    /// are what an account falls back to.
+    #[tokio::test]
+    async fn a_built_in_status_cannot_be_taken_away() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+
+        app.remove_status(0);
+        assert_eq!(
+            app.config.statuses.len(),
+            3,
+            "a built-in status was taken away"
+        );
+        assert!(app.config.status("ready").is_some());
+    }
+
+    /// A status of the user's own can be taken away.
+    #[tokio::test]
+    async fn a_status_of_the_users_own_can_be_taken_away() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+
+        app.add_status();
+        assert_eq!(app.config.statuses.len(), 4);
+
+        app.remove_status(3);
+        assert_eq!(app.config.statuses.len(), 3);
+    }
+
+    /// The hook is written to the settings file, and read back from it.
+    #[tokio::test]
+    async fn the_hook_is_saved_with_the_status() {
+        let (mut app, _bus) = build_app_in_own_folder("hook", tokio::runtime::Handle::current());
+
+        // "Online dials 666" — and the method of the HTTP hook is the
+        // one the user chose.
+        status_with_hook(&mut app, "online", StatusAction::Dial("666".to_string()));
+        app.save_settings();
+
+        let path = app.paths.config_file();
+        let loaded = AppConfig::load(&path).expect("the settings file reads back");
+        let online = loaded.status("online").expect("the status is there");
+        assert_eq!(online.action_kind, "dial");
+        assert_eq!(online.action_value, "666");
+    }
+
+    /// An HTTP hook keeps its method and its body.
+    #[tokio::test]
+    async fn an_http_hook_keeps_its_method_and_its_body() {
+        let (mut app, _bus) = build_app_in_own_folder("http", tokio::runtime::Handle::current());
+
+        status_with_hook(
+            &mut app,
+            "online",
+            StatusAction::Http {
+                method: HttpMethod::Patch,
+                url: "https://crm.example.com/api/state".to_string(),
+                body: "{\"state\":\"online\"}".to_string(),
+            },
+        );
+        app.save_settings();
+
+        let path = app.paths.config_file();
+        let loaded = AppConfig::load(&path).expect("the settings file reads back");
+        let online = loaded.status("online").expect("the status is there");
+        assert_eq!(online.action_kind, "http");
+        assert_eq!(online.action_method, "PATCH");
+        assert_eq!(online.action_value, "https://crm.example.com/api/state");
+        assert_eq!(online.action_body, "{\"state\":\"online\"}");
+    }
+
+    /// The hook of an account of an older build is not lost: it moves
+    /// onto the status the account was in.
+    ///
+    /// "Online dials 666" was one line on one account; it is one line
+    /// on the status now, and it holds for every account.
+    #[tokio::test]
+    async fn the_old_per_account_hook_moves_onto_the_status() {
+        let db = Db::open_in_memory().expect("db");
+        let store = AccountStore::new(&db);
+        let mut account = Account::new("Office", "sip.example.com:5060", "104", "pw", "udp");
+        account.id = "acct-ui-1".to_string();
+        account.status = "pause".to_string();
+        store.upsert(&account).expect("the account is saved");
+        // The hook of an older build, in the column it was kept in.
+        store
+            .write_legacy_hook("acct-ui-1", r#"{"dial":"666"}"#)
+            .expect("the old hook is written");
+
+        let paths = AppPaths::under(std::env::temp_dir().join("qsoftphone-app-ui-test-migrate"));
+        let sessions = SessionRegistry::new();
+        let (bus, receiver) = CallBus::new();
+        let app = QSoftphoneApp::new(
+            paths,
+            db,
+            AppConfig::default(),
+            tokio::runtime::Handle::current(),
+            sessions,
+            bus,
+            receiver,
+        );
+
+        // The hook is on the status now.
+        let pause = app.config.status("pause").expect("the status is there");
+        assert_eq!(pause.action_kind, "dial");
+        assert_eq!(pause.action_value, "666");
+
+        // And the account has let it go.
+        assert!(
+            AccountStore::new(&app.db)
+                .legacy_hooks()
+                .expect("the old hooks are read")
+                .is_empty(),
+            "the old hook is still on the account"
+        );
+    }
+
+    /// A status that has a hook of its own keeps it: the user wrote
+    /// that one last, and it is the one they meant.
+    #[tokio::test]
+    async fn a_status_with_a_hook_of_its_own_keeps_it() {
+        let db = Db::open_in_memory().expect("db");
+        let store = AccountStore::new(&db);
+        let mut account = Account::new("Office", "sip.example.com:5060", "104", "pw", "udp");
+        account.id = "acct-ui-1".to_string();
+        account.status = "pause".to_string();
+        store.upsert(&account).expect("the account is saved");
+        store
+            .write_legacy_hook("acct-ui-1", r#"{"dial":"666"}"#)
+            .expect("the old hook is written");
+
+        // The status has a hook of its own: "Pause dials 555".
+        let mut config = AppConfig::default();
+        let pause = config
+            .statuses
+            .iter_mut()
+            .find(|status| status.id == "pause")
+            .expect("the status is there");
+        pause.action_kind = "dial".to_string();
+        pause.action_value = "555".to_string();
+
+        let paths = AppPaths::under(std::env::temp_dir().join("qsoftphone-app-ui-test-migrate-2"));
+        let sessions = SessionRegistry::new();
+        let (bus, receiver) = CallBus::new();
+        let app = QSoftphoneApp::new(
+            paths,
+            db,
+            config,
+            tokio::runtime::Handle::current(),
+            sessions,
+            bus,
+            receiver,
+        );
+
+        let pause = app.config.status("pause").expect("the status is there");
+        assert_eq!(
+            pause.action_value, "555",
+            "the hook of the status was overwritten"
+        );
+    }
+
+    /// The status is the account's own, and it is stored with the account.
     #[tokio::test]
     async fn setting_the_status_saves_it() {
         let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
         let account_id = app.accounts[0].id.clone();
 
-        app.set_account_status(&account_id, AccountStatus::Pause);
+        app.set_account_status(&account_id, "pause");
 
         // It is in the store.
         let stored = AccountStore::new(&app.db)
             .get(&account_id)
             .expect("the account is read")
             .expect("the account is there");
-        assert_eq!(stored.status, AccountStatus::Pause);
+        assert_eq!(stored.status, "pause");
 
         // And in the app's own list, so the lamp in the left panel says
         // it without the page being opened.
-        assert_eq!(app.accounts[0].status, AccountStatus::Pause);
+        assert_eq!(app.accounts[0].status, "pause");
+    }
+
+    /// A status of the user's own is a status like any other.
+    #[tokio::test]
+    async fn a_status_of_the_users_own_can_be_set() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let account_id = app.accounts[0].id.clone();
+
+        app.config.statuses.push(StatusDefinition {
+            id: "in a meeting".to_string(),
+            name: "In a meeting".to_string(),
+            colour: "#9b59b6".to_string(),
+            ..Default::default()
+        });
+
+        app.set_account_status(&account_id, "in a meeting");
+
+        let stored = AccountStore::new(&app.db)
+            .get(&account_id)
+            .expect("the account is read")
+            .expect("the account is there");
+        assert_eq!(stored.status, "in a meeting");
+        assert!(
+            app.status.contains("In a meeting"),
+            "the status line does not say the status: {}",
+            app.status
+        );
+    }
+
+    /// A status that is not in the list is not a status: the account
+    /// goes back to the default one.
+    #[tokio::test]
+    async fn a_status_that_is_not_there_falls_back_to_the_default() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let account_id = app.accounts[0].id.clone();
+
+        app.set_account_status(&account_id, "lunch");
+
+        let stored = AccountStore::new(&app.db)
+            .get(&account_id)
+            .expect("the account is read")
+            .expect("the account is there");
+        assert_eq!(stored.status, "ready");
     }
 
     /// The button says what the account's status is.
@@ -5774,7 +6477,7 @@ mod tests {
         ctx.enable_accesskit();
 
         app.view = View::Account;
-        app.set_account_status(&account_id, AccountStatus::Online);
+        app.set_account_status(&account_id, "online");
 
         let output = frame(&mut app, &ctx);
         let text = screen_text(&output);
@@ -5784,25 +6487,21 @@ mod tests {
         );
     }
 
-    /// The action is saved with the account, and it is the action the
-    /// editor holds.
+    /// The hook is the status's, and it runs when the status is set.
     #[tokio::test]
-    async fn the_action_is_saved_with_the_account() {
+    async fn the_hook_belongs_to_the_status() {
         let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
         let account_id = app.accounts[0].id.clone();
 
-        // The form holds the action.
-        let account = app.accounts[0].clone();
-        let draft = app.draft_of(&account);
-        draft.status_action_kind = "dial".to_string();
-        draft.status_action_value = "*51".to_string();
-        app.save_account(&account_id);
+        // "Pause dials 555" — one line, and it holds for every
+        // account that is paused.
+        status_with_hook(&mut app, "pause", StatusAction::Dial("555".to_string()));
 
-        let stored = AccountStore::new(&app.db)
-            .get(&account_id)
-            .expect("the account is read")
-            .expect("the account is there");
-        assert_eq!(stored.status_action, StatusAction::Dial("*51".to_string()));
+        app.set_account_status(&account_id, "pause");
+
+        // There is no call up, so the code is called: the dialer holds
+        // what was dialled.
+        assert_eq!(app.dial_number, "555");
     }
 
     /// A call that is up on the account takes the code as DTMF; a call
@@ -5812,17 +6511,10 @@ mod tests {
         let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
         let account_id = app.accounts[0].id.clone();
 
-        let mut account = app.accounts[0].clone();
-        account.status_action = StatusAction::Dial("*51".to_string());
-        AccountStore::new(&app.db)
-            .upsert(&account)
-            .expect("the account is saved");
-        app.reload();
+        status_with_hook(&mut app, "ready", StatusAction::Dial("*51".to_string()));
 
-        app.set_account_status(&account_id, AccountStatus::Ready);
+        app.set_account_status(&account_id, "ready");
 
-        // There is no call up, so the code is called: the dialer holds
-        // what was dialled.
         assert_eq!(app.dial_number, "*51");
     }
 
@@ -5833,18 +6525,17 @@ mod tests {
         let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
         let account_id = app.accounts[0].id.clone();
 
-        let mut account = app.accounts[0].clone();
-        account.status_action = StatusAction::Script(if cfg!(target_os = "windows") {
-            "cmd /C exit 0".to_string()
-        } else {
-            "true".to_string()
-        });
-        AccountStore::new(&app.db)
-            .upsert(&account)
-            .expect("the account is saved");
-        app.reload();
+        status_with_hook(
+            &mut app,
+            "online",
+            StatusAction::Script(if cfg!(target_os = "windows") {
+                "cmd /C exit 0".to_string()
+            } else {
+                "true".to_string()
+            }),
+        );
 
-        app.set_account_status(&account_id, AccountStatus::Online);
+        app.set_account_status(&account_id, "online");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
@@ -5868,14 +6559,13 @@ mod tests {
         let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
         let account_id = app.accounts[0].id.clone();
 
-        let mut account = app.accounts[0].clone();
-        account.status_action = StatusAction::Plugin("bitrix".to_string());
-        AccountStore::new(&app.db)
-            .upsert(&account)
-            .expect("the account is saved");
-        app.reload();
+        status_with_hook(
+            &mut app,
+            "online",
+            StatusAction::Plugin("bitrix".to_string()),
+        );
 
-        app.set_account_status(&account_id, AccountStatus::Online);
+        app.set_account_status(&account_id, "online");
 
         assert!(
             app.status.contains("not there yet"),

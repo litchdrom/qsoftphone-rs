@@ -178,7 +178,7 @@ Pinned in the workspace `Cargo.toml`, locked in `Cargo.lock`.
 | `cpal` | 0.18.2 | microphone capture and speaker playback |
 | `nanoaudio-g722` | 0.1.1 | the G.722 wideband codec |
 | `rusty-opus` | 1.1.1 | the Opus codec (M6.12) — pure Rust, no dependencies of its own |
-| `ureq` | 3.5.2 | the HTTP client for the account's status action (M6.13) |
+| `ureq` | 3.5.2 | the HTTP client for the status hook (M6.13, M6.14) |
 | `egui` / `eframe` | 0.37.0 | the UI (default wgpu backend) |
 | `rusqlite` | 0.41 | storage, `bundled` — SQLite is compiled in |
 | `tokio` | 1.54.1 | the async runtime the SIP stack runs on |
@@ -5019,6 +5019,11 @@ is told the same rate, so the two ends agree on what a frame is.
 
 *"Softphone should have call_enter button with select Ready Online Pause with per acoount selection and additional settings: 1) dial some code 2) run a script (screen capture for example) 3) run some http query 4) plugin selected (bitrix creatio and so on in the future)"*
 
+> **This is what M6.13 did.** [M6.14](#m614--the-statuses-are-the-users-and-the-hook-is-on-the-status)
+> took it further: the list of statuses moved into the settings and became
+> the user's own, the hook moved onto the status, and the button moved into
+> the accounts list.
+
 ### The button
 
 Every account has a **status**, and the status is one of three words:
@@ -5170,6 +5175,205 @@ it, and a blocking client is simpler than an async one. It declares
 
 ---
 
+## M6.14 — The statuses are the user's, and the hook is on the status
+
+*"Better to add status selector to accounts. Https query might need put post or patch method. Also statuses should be configurable per status — Online dials 666, Pause dials 555. Possible it needs to be main settings for all accounts. So user adds inline status with hooks on that. Maybe with a color selection."*
+
+M6.13 gave every account a status out of three and a hook of its own. This
+milestone makes both of them the **user's**:
+
+* the status is picked **in the accounts list**, not only in the account's
+  title;
+* the list of statuses is **global** — the user's own, in the main settings,
+  with a status of their own added inline;
+* the **hook belongs to the status**, not to the account: "Online dials 666"
+  is one line and it holds for every account that is online;
+* each status has a **colour** of its own;
+* the HTTP hook has a **method** and a **body**: `GET`, `POST`, `PUT`,
+  `PATCH` or `DELETE`.
+
+(The fifth part of that message — *the history says which account the call
+was on* — is [M6.15](#m615--the-history-says-which-account-the-call-was-on).)
+
+### The status is picked in the accounts list
+
+The left panel shows a lamp next to every account, and M6.13 left the
+button that changes the status in the account's title on the account page.
+That is two places to look, and the second one is a page away from the
+list that says which account is in which state.
+
+The lamp in the list **is** the button now:
+
+```
+● 1  Office
+● 2  Home
+```
+
+The lamp comes first, the way the lamps of the Busy Lamp Field do below
+it: a lamp that is pushed off the edge of the panel is a lamp nobody can
+click, and this one is the button the status is picked with.
+
+Clicking it opens the list of the user's statuses, and picking one sets the
+status of that account and runs the hook of the status. The account's title
+keeps its own button — it says *which* state the account is in, in words —
+and both of them offer the same list.
+
+### The statuses are the user's
+
+The settings page has a **STATUSES** section. The three that come with the
+app — **Ready**, **Online** and **Pause** — are the start of the list and
+not the whole of it, and every one of them can be renamed, recoloured and
+given a hook of its own. **+ Add a status** adds one of the user's own.
+
+Each status is a **name**, a **colour** and a **hook**:
+
+```
+● Ready            #4cc06a                                    ×
+  When set  [Nothing ▾]
+● Online           #d8a630                                    ×
+  When set  [Dial a code ▾]  [666                    ]
+● Pause            #808080                                    ×
+  When set  [Run an HTTP query ▾]  [https://crm/api/state]  [PATCH ▾]  [{"state":"pause"}]
+● In a meeting     #9b59b6                                    ×
+  When set  [Run a script ▾]  [capture.exe --screen]
+```
+
+The colour is a word of hex and a row of swatches: a lamp that is only ever
+green or grey is a lamp that says very little.
+
+The list is **global** — every account uses it. A state of the user is a
+state of the user, not a state of one account, and two accounts of the same
+person are the same person.
+
+### The hook is on the status
+
+This is the part that changed the shape of the feature. In M6.13 the hook
+was on the **account**, which meant "the same line written down once for
+every account the user has" — and the moment the user has two accounts, the
+two lines can disagree.
+
+Now the hook is on the **status**:
+
+| Kind | What happens when the status is set |
+|---|---|
+| **Dial a code** | the code is sent as **DTMF** if a call is up on the account, and **called** if there is none |
+| **Run a script** | the command runs, as it would be typed in a console |
+| **Run an HTTP query** | the URL is fetched with the method and the body the user chose |
+| **Use a plugin** | nothing yet — §8 of the brief puts the plugin host out of scope |
+
+So "Online dials 666" and "Pause dials 555" are two lines in the settings,
+and they hold for every account.
+
+### The HTTP hook has a method and a body
+
+A `GET` is what a status that only *reports* needs. A CRM that is told to
+change something wants a `PATCH`, and a `GET` that changes something is a
+request that anything which reads the log can repeat.
+
+So the HTTP hook carries the method — `GET`, `POST`, `PUT`, `PATCH` or
+`DELETE` — and a body. The body goes with the methods that carry one: a
+`GET` and a `DELETE` carry none.
+
+The method is proved against a server of the app's own: the test starts a
+socket, sends a request through the hook, and reads the request line and
+the body off the wire.
+
+```
+POST /state HTTP/1.1
+{"state":"online"}
+```
+
+### The old per-account hook is moved, not lost
+
+An account saved by M6.13 has a hook of its own, in a column of its own.
+That hook is the user's configuration, and it is **read** — not thrown away:
+the hook moves onto the status the account was in, and it moves for every
+account, which is what the hook was always about.
+
+* a status that has a hook of its own **keeps it** — the user wrote that one
+  last, and it is the one they meant;
+* the old HTTP action was a URL and nothing else (`{"http":"…"}`), and it is
+  read as a **GET**: a user who had one had a GET;
+* the column is emptied afterwards, so the two cannot both say what
+  happens.
+
+### Where it is stored
+
+The statuses are in the **settings file**, in a `statuses` section:
+
+```json
+"statuses": [
+  { "id": "ready",  "name": "Ready",  "colour": "#4cc06a",
+    "actionKind": "",   "actionValue": "", "actionMethod": "GET", "actionBody": "" },
+  { "id": "online", "name": "Online", "colour": "#d8a630",
+    "actionKind": "dial", "actionValue": "666", "actionMethod": "GET", "actionBody": "" }
+]
+```
+
+The fields are plain strings on purpose: this is a document a user may edit
+by hand, and a file that says `"actionKind": "http"` says what it means.
+
+The account's row holds the **id** of the status and nothing else:
+
+| Column | What it holds |
+|---|---|
+| `status` | the id of a status — `ready`, `online`, `pause`, or one of the user's own |
+
+The `status_action` column is left where it is and is **not read any more**:
+the hook is on the status, and the migration above empties it.
+
+A settings file that has no `statuses` section — one written by an older
+build — gets the three that come with the app. A hand-edited one is put
+right: a status with no id gets one made from its name, a status with no
+name gets one made from its id, two statuses with one id get one of them a
+new id, and the three built-ins are put back if they are missing.
+
+An id never changes: a user who renames "Pause" to "Не беспокоить" has
+renamed the same status, and the accounts that are in it are still in it.
+
+### What is proved
+
+* **The status is picked in the accounts list** — the lamp is a button, and
+  it offers the user's statuses.
+* **The statuses are the user's** — a status of their own can be added, and
+  it is in the list from then on; the built-ins cannot be taken away,
+  because they are what an account falls back to.
+* **The hook belongs to the status** — "Pause dials 555" is one line, and
+  the code is dialled when the account is put into that status.
+* **The status is stored as an id**, and a status of the user's own is a
+  status like any other.
+* **A status that is not in the list is not a status**: the account goes
+  back to the default one.
+* **The HTTP hook carries its method and its body** — proved against a
+  server of the app's own, which reads the request line and the body off
+  the wire.
+* **The old per-account hook is moved onto the status**, and a status that
+  has a hook of its own keeps it.
+* **The settings file round-trips**: the statuses, their colours and their
+  hooks come back out of it.
+
+### The dependency cost: nothing
+
+No new package: `ureq` was already in the tree for M6.13, and a method is
+one more arm of a `match`. The lock file and the per-target tree are
+unchanged — 593 entries, 318 package names for Windows.
+
+### What is *not* in M6.14
+
+* **The history does not say which account the call was on.** That is
+  M6.15.
+* **The status does not change what the softphone does.** A paused account
+  is still dialled and its lamps still say what they say: the state lives in
+  the PBX, and the hook is what tells it.
+* **The plugin is not run.** It is stored and it says so.
+* **The colours are not picked from a full colour wheel.** There is a hex
+  field and eight swatches — the eight the lamps of the Busy Lamp Field
+  use, and a few more.
+* **The script is not sandboxed.** It runs as the user typed it, with the
+  user's own rights — which is what "run a script" means.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -5229,6 +5433,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.11** | The lamp is one line: the lamp, the account's number, the extension, the lamp's number and the state — the `from acc … · unknown` line under it is gone | **done** |
 | **M6.12** | Opus: the codec itself (`rusty-opus`, one package and no dependencies of its own), the offer that names it on 111 with `opus/48000/2` and the parameters of RFC 7587 §7, an RTP layer that carries packets of whatever size the codec chose, and a 48 kHz clock whose timestamp advances by 960 | **done** |
 | **M6.13** | The account's status: a button per account that says **Ready**, **Online** or **Pause** and lets the user pick another one, and the account's **action** — dial a code (DTMF if a call is up, a call if there is not), run a script, run an HTTP query, or name a plugin that is not there yet | **done** |
+| **M6.14** | The statuses are the user's: a **global** list in the main settings with a status of their own added inline, a **colour** and a **hook** on each of them, the hook on the **status** rather than on the account, the status picked in the **accounts list**, and an HTTP hook with a **method** and a **body** | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -5292,7 +5497,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 544 tests, all passing.
+* `cargo test --workspace` — 576 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and

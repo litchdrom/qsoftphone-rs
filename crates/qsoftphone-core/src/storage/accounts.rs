@@ -9,7 +9,7 @@ use rusqlite::{Row, params};
 
 use crate::error::Result;
 use crate::model::account::{Account, BlfEntry, now_ms};
-use crate::model::status::{AccountStatus, StatusAction};
+use crate::model::status::DEFAULT_STATUS_ID;
 use crate::storage::db::Db;
 
 /// The columns of the `accounts` table, in the order they are read.
@@ -17,10 +17,14 @@ use crate::storage::db::Db;
 /// The order is the order of the `SELECT` and of the row reader, and
 /// both have to agree: a column read from the wrong place is an
 /// account's password in its label.
+///
+/// The `status_action` column is **not** in the list: the hook belongs
+/// to the status now, and to the status alone, so the column is left
+/// where it is and nothing reads it.
 const COLUMNS: &str = "id, label, registrar, user, password, transport, domain,
                         outbound_proxy, caller_id_header, dialed_number_header,
                         capture_headers, custom_headers, blf_extensions, crm_preset_id,
-                        ringtone_file, status, status_action, created_at, updated_at";
+                        ringtone_file, status, created_at, updated_at";
 
 /// CRUD over the `accounts` table.
 pub struct AccountStore<'a> {
@@ -78,9 +82,12 @@ impl<'a> AccountStore<'a> {
         let capture = serde_json::to_string(&account.capture_headers)?;
         let custom = serde_json::to_string(&account.custom_headers)?;
         let blf = serde_json::to_string(&account.blf_extensions)?;
-        // The action is JSON too: it is a kind and a value, and the
-        // value may be a command with quotes in it.
-        let action = serde_json::to_string(&account.status_action)?;
+        // The status is the **id** of a status, and a status with no
+        // id is the default one: an account with no status is ready.
+        let status = match account.status.trim() {
+            "" => DEFAULT_STATUS_ID.to_string(),
+            id => id.to_string(),
+        };
 
         self.db.with_conn(|conn| {
             conn.execute(
@@ -88,8 +95,8 @@ impl<'a> AccountStore<'a> {
                     (id, label, registrar, user, password, transport, domain,
                      outbound_proxy, caller_id_header, dialed_number_header,
                      capture_headers, custom_headers, blf_extensions, crm_preset_id,
-                     ringtone_file, status, status_action, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                     ringtone_file, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
                  ON CONFLICT(id) DO UPDATE SET
                     label                = excluded.label,
                     registrar            = excluded.registrar,
@@ -106,7 +113,6 @@ impl<'a> AccountStore<'a> {
                     crm_preset_id        = excluded.crm_preset_id,
                     ringtone_file        = excluded.ringtone_file,
                     status               = excluded.status,
-                    status_action        = excluded.status_action,
                     updated_at           = excluded.updated_at",
                 params![
                     account.id,
@@ -124,8 +130,7 @@ impl<'a> AccountStore<'a> {
                     blf,
                     account.crm_preset_id,
                     account.ringtone_file,
-                    account.status.name().to_ascii_lowercase(),
-                    action,
+                    status,
                     account.created_at,
                     account.updated_at,
                 ],
@@ -133,6 +138,10 @@ impl<'a> AccountStore<'a> {
             Ok(())
         })?;
 
+        // The account that comes back is the one that is in the store:
+        // an account that was saved with no status is in the default
+        // one, and the caller has to be told so.
+        account.status = status;
         Ok(account)
     }
 
@@ -149,6 +158,55 @@ impl<'a> AccountStore<'a> {
         self.db.with_conn(|conn| {
             let n: i64 = conn.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))?;
             Ok(n as usize)
+        })
+    }
+
+    /// The hooks of the accounts of an older build, and the account
+    /// each of them belongs to.
+    ///
+    /// The column is not read any more — the hook is on the status
+    /// now — but it is not thrown away either: an account that was
+    /// saved by an older build has a hook in it, and that hook is the
+    /// user's configuration.
+    pub fn legacy_hooks(&self) -> Result<Vec<(String, String)>> {
+        self.db.with_conn(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT id, status_action FROM accounts WHERE status_action <> ''")?;
+            let mut rows = stmt.query([])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                out.push((row.get(0)?, row.get(1)?));
+            }
+            Ok(out)
+        })
+    }
+
+    /// Forget the hook an account used to carry.
+    ///
+    /// The hook is on the status now, and the column is emptied so
+    /// that the two cannot both say what happens.
+    pub fn clear_legacy_hook(&self, id: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE accounts SET status_action = '' WHERE id = ?1",
+                params![id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Write the hook an account of an older build carried.
+    ///
+    /// The column is not written by this build any more: the hook is
+    /// on the status. This is here for the migration that reads the
+    /// old hooks and puts them where they belong.
+    pub fn write_legacy_hook(&self, id: &str, json: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE accounts SET status_action = ?1 WHERE id = ?2",
+                params![json, id],
+            )?;
+            Ok(())
         })
     }
 }
@@ -218,40 +276,17 @@ fn row_to_account(row: &Row<'_>) -> rusqlite::Result<Account> {
             }
         },
     };
-    // The status the account shows.
+    // The status the account shows — the **id** of a status.
     //
-    // A column that cannot be read is an account whose status is
-    // lost — and a lost status is a phone that is "Ready" when the user
-    // has it "Paused" — so an unknown word is the default and a
-    // warning, not a failure.
+    // The statuses themselves live in the settings file, and the
+    // store does not know them: an id that is not one of the user's
+    // statuses is kept as it is, because the list of statuses is the
+    // user's and may grow one back. An empty id is the default one —
+    // the state a phone is in when nobody has said otherwise.
     let status: String = row.get(15)?;
-    let status = match AccountStatus::from_name(&status) {
-        Some(status) => status,
-        None => {
-            tracing::warn!(
-                account_id = %id,
-                "account has an unknown status; treating it as ready"
-            );
-            AccountStatus::default()
-        }
-    };
-    // What happens when the status is set. An empty column is the
-    // ordinary case: an account with no action.
-    let action: String = row.get(16)?;
-    let status_action = if action.trim().is_empty() {
-        StatusAction::None
-    } else {
-        match serde_json::from_str::<StatusAction>(&action) {
-            Ok(value) => value,
-            Err(e) => {
-                tracing::warn!(
-                    account_id = %id,
-                    error = %e,
-                    "account has a malformed status_action; treating it as none"
-                );
-                StatusAction::None
-            }
-        }
+    let status = match status.trim() {
+        "" => DEFAULT_STATUS_ID.to_string(),
+        id => id.to_string(),
     };
     Ok(Account {
         id,
@@ -270,9 +305,8 @@ fn row_to_account(row: &Row<'_>) -> rusqlite::Result<Account> {
         crm_preset_id: row.get(13)?,
         ringtone_file: row.get(14)?,
         status,
-        status_action,
-        created_at: row.get(17)?,
-        updated_at: row.get(18)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
     })
 }
 
@@ -467,57 +501,64 @@ mod tests {
     }
 
     #[test]
-    fn the_status_and_its_action_survive_a_round_trip() {
-        // The status is the account's own, and the action is what
-        // happens when it is set: both are stored with the account.
+    fn the_status_survives_a_round_trip() {
+        // The status is the **id** of a status, and the statuses are
+        // the user's: one of their own is as good a status as "pause".
         let db = Db::open_in_memory().unwrap();
         let store = AccountStore::new(&db);
 
         let mut account = Account::new("Office", "example.com", "104", "", "udp");
-        account.status = AccountStatus::Pause;
-        account.status_action = StatusAction::Dial("*60".to_string());
+        account.status = "in a meeting".to_string();
         store.upsert(&account).unwrap();
 
         let fetched = store.get(&account.id).unwrap().unwrap();
-        assert_eq!(fetched.status, AccountStatus::Pause);
-        assert_eq!(fetched.status_action, StatusAction::Dial("*60".to_string()));
+        assert_eq!(fetched.status, "in a meeting");
 
         // And it is there for every account in the list, too.
         let listed = store.list().unwrap();
-        assert_eq!(listed[0].status, AccountStatus::Pause);
+        assert_eq!(listed[0].status, "in a meeting");
     }
 
     #[test]
-    fn an_account_with_no_status_is_ready() {
+    fn a_status_that_is_not_one_of_the_users_is_kept_as_it_is() {
+        // The list of statuses is the user's and may grow one back, so
+        // an id the store does not know is kept, not thrown away.
+        let db = Db::open_in_memory().unwrap();
+        let store = AccountStore::new(&db);
+
+        let mut account = Account::new("Office", "example.com", "104", "", "udp");
+        account.status = "lunch".to_string();
+        store.upsert(&account).unwrap();
+
+        let fetched = store.get(&account.id).unwrap().unwrap();
+        assert_eq!(fetched.status, "lunch");
+    }
+
+    #[test]
+    fn an_account_with_no_status_is_in_the_default_one() {
+        let db = Db::open_in_memory().unwrap();
+        let store = AccountStore::new(&db);
+
+        let mut account = Account::new("Office", "example.com", "104", "", "udp");
+        account.status = String::new();
+        let stored = store.upsert(&account).unwrap();
+        assert_eq!(stored.status, DEFAULT_STATUS_ID);
+
+        let fetched = store.get(&account.id).unwrap().unwrap();
+        assert_eq!(fetched.status, DEFAULT_STATUS_ID);
+    }
+
+    #[test]
+    fn a_new_account_is_ready() {
         let db = Db::open_in_memory().unwrap();
         let store = AccountStore::new(&db);
 
         let account = Account::new("Office", "example.com", "104", "", "udp");
+        assert_eq!(account.status, DEFAULT_STATUS_ID);
         store.upsert(&account).unwrap();
 
         let fetched = store.get(&account.id).unwrap().unwrap();
-        assert_eq!(fetched.status, AccountStatus::Ready);
-        assert_eq!(fetched.status_action, StatusAction::None);
-    }
-
-    #[test]
-    fn every_kind_of_action_survives_a_round_trip() {
-        let db = Db::open_in_memory().unwrap();
-        let store = AccountStore::new(&db);
-
-        for action in [
-            StatusAction::Dial("*51".to_string()),
-            StatusAction::Script("capture.exe --screen".to_string()),
-            StatusAction::Http("https://crm.example.com/api/ready".to_string()),
-            StatusAction::Plugin("bitrix".to_string()),
-        ] {
-            let mut account = Account::new("Office", "example.com", "104", "", "udp");
-            account.status_action = action.clone();
-            store.upsert(&account).unwrap();
-
-            let fetched = store.get(&account.id).unwrap().unwrap();
-            assert_eq!(fetched.status_action, action);
-        }
+        assert_eq!(fetched.status, DEFAULT_STATUS_ID);
     }
 
     #[test]

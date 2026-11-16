@@ -12,6 +12,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::model::status::{DEFAULT_COLOUR, DEFAULT_STATUS_ID, StatusDefinition};
 
 /// The settings document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -26,6 +27,13 @@ pub struct AppConfig {
     pub ui: UiConfig,
     /// The account the UI should select at startup.
     pub active_account_id: Option<String>,
+    /// The statuses an account can be put into.
+    ///
+    /// The list is **global**: every account uses these, and each of
+    /// them carries a colour and a hook of its own. The three that
+    /// come with the app — Ready, Online and Pause — are the start of
+    /// the list rather than the whole of it.
+    pub statuses: Vec<StatusDefinition>,
 }
 
 impl Default for AppConfig {
@@ -38,6 +46,7 @@ impl Default for AppConfig {
             network: NetworkConfig::default(),
             ui: UiConfig::default(),
             active_account_id: None,
+            statuses: StatusDefinition::built_ins(),
         }
     }
 }
@@ -172,16 +181,18 @@ impl AppConfig {
     /// error: silently replacing a user's settings with defaults
     /// would lose their configuration.
     pub fn load(path: &Path) -> Result<Self> {
-        match std::fs::read_to_string(path) {
+        let mut config = match std::fs::read_to_string(path) {
             Ok(text) => serde_json::from_str(&text).map_err(|e| {
                 Error::Message(format!(
                     "config file {} is not valid JSON: {e}",
                     path.display()
                 ))
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(Error::Io(e)),
-        }
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => return Err(Error::Io(e)),
+        };
+        config.repair_statuses();
+        Ok(config)
     }
 
     /// Write the settings file.
@@ -193,6 +204,82 @@ impl AppConfig {
         }
         let text = serde_json::to_string_pretty(self)?;
         write_atomic(path, text.as_bytes())
+    }
+
+    /// The status with this id.
+    pub fn status(&self, id: &str) -> Option<&StatusDefinition> {
+        self.statuses.iter().find(|status| status.id == id)
+    }
+
+    /// The status an account is in when its own status is not known.
+    ///
+    /// It is the **Ready** status: the state a phone is in when
+    /// nobody has said otherwise.
+    pub fn default_status(&self) -> StatusDefinition {
+        self.status(DEFAULT_STATUS_ID)
+            .cloned()
+            .or_else(|| self.statuses.first().cloned())
+            .unwrap_or_else(StatusDefinition::fallback)
+    }
+
+    /// Make the statuses usable.
+    ///
+    /// A settings file is a document a user may edit by hand, and a
+    /// hand-edited document is missing things:
+    ///
+    /// * a status with **no id** gets one made from its name, and one
+    ///   with **no name** gets one made from its id;
+    /// * two statuses with **one id** — the second one gets another,
+    ///   because an id that says two things says nothing;
+    /// * the three the app comes with are **put back** if they are
+    ///   missing: they are what an account falls back to, and a list
+    ///   without "Ready" is a list whose accounts are all in a state
+    ///   that is not there.
+    pub fn repair_statuses(&mut self) {
+        let mut taken: Vec<String> = Vec::new();
+        for index in 0..self.statuses.len() {
+            let name = self.statuses[index].name.trim().to_string();
+            let id = self.statuses[index].id.trim().to_string();
+            let id = if id.is_empty() {
+                StatusDefinition::id_for(&name, &taken)
+            } else if taken.iter().any(|other| other == &id) {
+                StatusDefinition::id_for(&id, &taken)
+            } else {
+                id
+            };
+            taken.push(id.clone());
+            self.statuses[index].id = id;
+            if self.statuses[index].name.trim().is_empty() {
+                let fallback = StatusDefinition::name_from_id(&self.statuses[index].id);
+                self.statuses[index].name = fallback;
+            }
+            if self.statuses[index].colour.trim().is_empty() {
+                self.statuses[index].colour = DEFAULT_COLOUR.to_string();
+            }
+            if self.statuses[index].action_method.trim().is_empty() {
+                self.statuses[index].action_method = "GET".to_string();
+            }
+        }
+        // The built-ins are put back, and their names and colours are
+        // kept for the ones that are there: the user may have renamed
+        // "Ready" and that is their business.
+        for built_in in StatusDefinition::built_ins() {
+            match self
+                .statuses
+                .iter_mut()
+                .find(|status| status.id == built_in.id)
+            {
+                Some(status) => {
+                    if status.name.trim().is_empty() {
+                        status.name = built_in.name.clone();
+                    }
+                    if status.colour.trim().is_empty() {
+                        status.colour = built_in.colour.clone();
+                    }
+                }
+                None => self.statuses.push(built_in),
+            }
+        }
     }
 }
 
@@ -214,6 +301,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::status::StatusAction;
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -281,6 +369,111 @@ mod tests {
         std::fs::write(&path, r#"{"version":1,"somethingNew":42}"#).unwrap();
         let config = AppConfig::load(&path).unwrap();
         assert_eq!(config.version, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_statuses_come_with_the_app() {
+        let config = AppConfig::default();
+        assert_eq!(config.statuses.len(), 3);
+        assert_eq!(config.statuses[0].id, "ready");
+        assert!(config.status("pause").is_some());
+        assert!(config.status("busy").is_none());
+    }
+
+    #[test]
+    fn a_settings_file_without_the_statuses_gets_the_defaults() {
+        // The statuses are a section that came later: a file written
+        // before it must still open, with the three that come with the
+        // app in it.
+        let path = temp_path("no-statuses");
+        std::fs::write(&path, r#"{"version":1,"network":{"port":5080}}"#).unwrap();
+        let config = AppConfig::load(&path).unwrap();
+        assert_eq!(config.statuses.len(), 3);
+        assert_eq!(config.network.port, 5080);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_statuses_survive_a_round_trip() {
+        let path = temp_path("statuses");
+        let mut config = AppConfig::default();
+        config.statuses.push(StatusDefinition {
+            id: "in a meeting".to_string(),
+            name: "In a meeting".to_string(),
+            colour: "#ff0000".to_string(),
+            action_kind: "dial".to_string(),
+            action_value: "666".to_string(),
+            ..Default::default()
+        });
+        config.save(&path).unwrap();
+
+        let loaded = AppConfig::load(&path).unwrap();
+        assert_eq!(loaded.statuses.len(), 4);
+        let meeting = loaded.status("in a meeting").expect("the status is there");
+        assert_eq!(meeting.name, "In a meeting");
+        assert_eq!(meeting.colour, "#ff0000");
+        assert_eq!(meeting.action_value, "666");
+        assert_eq!(
+            meeting.action(),
+            StatusAction::Dial("666".to_string()),
+            "the hook is built from what the status carries"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_hand_edited_status_is_put_right() {
+        // A status with no name, a status with no id and two statuses
+        // with one id: all of them are read, and all of them end up
+        // saying one thing each.
+        let path = temp_path("hand-edited");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"statuses":[
+                 {"id":"","name":"Busy"},
+                 {"id":"away","name":""},
+                 {"id":"away","name":"Away again"}
+               ]}"#,
+        )
+        .unwrap();
+        let config = AppConfig::load(&path).unwrap();
+
+        // The built-ins are back.
+        assert!(config.status("ready").is_some());
+        assert!(config.status("online").is_some());
+        assert!(config.status("pause").is_some());
+
+        // The nameless one got the name of its id.
+        let away = config.status("away").expect("the status is there");
+        assert_eq!(away.name, "Away");
+
+        // The second one with the same id got an id of its own, and
+        // kept the name it was given.
+        let other = config
+            .statuses
+            .iter()
+            .find(|status| status.name == "Away again")
+            .expect("the second status is there");
+        assert_eq!(other.id, "away-2");
+
+        // And every id says one thing.
+        let mut ids: Vec<&str> = config.statuses.iter().map(|s| s.id.as_str()).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "two statuses share one id");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_empty_list_of_statuses_gets_the_defaults_back() {
+        let path = temp_path("empty-statuses");
+        std::fs::write(&path, r#"{"version":1,"statuses":[]}"#).unwrap();
+        let config = AppConfig::load(&path).unwrap();
+        assert_eq!(config.statuses.len(), 3);
         let _ = std::fs::remove_file(&path);
     }
 }

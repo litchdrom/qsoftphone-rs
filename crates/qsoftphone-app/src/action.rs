@@ -1,19 +1,19 @@
 //! What a status change does.
 //!
-//! ## The button is the switch, and the action is what it is wired to
+//! ## The button is the switch, and the hook is what it is wired to
 //!
-//! An account's status — **Ready**, **Online**, **Pause** — is the
-//! state the account is in. Setting it runs the account's action, and
-//! the action is one of four kinds:
+//! A status — **Ready**, **Online**, **Pause**, or one of the user's
+//! own — is the state the account is in. Setting it runs the **hook**
+//! that belongs to the status, and the hook is one of four kinds:
 //!
 //! | Kind | What happens |
 //! |---|---|
 //! | dial a code | DTMF if a call is up on the account, a call to the code otherwise |
 //! | run a script | the command, as the user typed it |
-//! | run an HTTP query | a `GET` of the URL |
+//! | run an HTTP query | the URL, with the method and the body the user chose |
 //! | use a plugin | nothing yet — §8 puts the plugin host out of scope |
 //!
-//! The point of the action is that the *state* lives outside the
+//! The point of the hook is that the *state* lives outside the
 //! softphone: a user who is ready tells the PBX so with a feature
 //! code, and a user who is online tells a CRM so with an HTTP query.
 //!
@@ -33,7 +33,7 @@
 use std::process::Command;
 use std::sync::mpsc::Sender;
 
-use qsoftphone_core::model::status::StatusAction;
+use qsoftphone_core::model::status::{HttpMethod, StatusAction};
 
 /// What an action says when it is done.
 #[derive(Debug, Clone)]
@@ -62,13 +62,15 @@ pub fn spawn(action: &StatusAction, account: &str, sender: Sender<ActionReport>)
                 })
                 .ok();
         }
-        StatusAction::Http(url) => {
+        StatusAction::Http { method, url, body } => {
+            let method = *method;
             let url = url.clone();
+            let body = body.clone();
             let account = account.to_string();
             std::thread::Builder::new()
                 .name("qsoftphone-action".to_string())
                 .spawn(move || {
-                    let result = run_http(&url);
+                    let result = run_http(method, &url, &body);
                     let _ = sender.send(ActionReport { account, result });
                 })
                 .ok();
@@ -120,15 +122,35 @@ fn run_script(command: &str) -> Result<String, String> {
     }
 }
 
-/// Fetch a URL.
-fn run_http(url: &str) -> Result<String, String> {
+/// Fetch a URL, with the method the user chose.
+///
+/// The method is not a detail: a GET that fetches is a GET that can be
+/// repeated by anything that reads the log, and a CRM that is told to
+/// change a call's state wants a PATCH. The body goes with the
+/// methods that carry one — a GET and a DELETE carry none.
+///
+/// The answer is the status code and nothing else: a hook that reports
+/// the body of the answer would put a CRM's answer on the status line
+/// of a softphone.
+fn run_http(method: HttpMethod, url: &str, body: &str) -> Result<String, String> {
     let url = url.trim();
     if url.is_empty() {
         return Err("there is no URL to fetch.".to_string());
     }
+    let body = body.trim();
 
-    match ureq::get(url).call() {
-        Ok(response) => Ok(format!("the query answered {}.", response.status())),
+    let answer = match method {
+        HttpMethod::Get => ureq::get(url).call().map(|response| response.status()),
+        HttpMethod::Delete => ureq::delete(url).call().map(|response| response.status()),
+        HttpMethod::Post => ureq::post(url).send(body).map(|response| response.status()),
+        HttpMethod::Put => ureq::put(url).send(body).map(|response| response.status()),
+        HttpMethod::Patch => ureq::patch(url)
+            .send(body)
+            .map(|response| response.status()),
+    };
+
+    match answer {
+        Ok(code) => Ok(format!("the query answered {code}.")),
         Err(ureq::Error::StatusCode(code)) => Err(format!("the query answered {code}.")),
         Err(e) => Err(format!("the query did not go through: {e}")),
     }
@@ -137,7 +159,56 @@ fn run_http(url: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::mpsc::channel;
+
+    /// A server that answers one request and says what it saw.
+    ///
+    /// It is a socket and a thread: a hook that fetches a URL is worth
+    /// testing against something that answers, and a server of one's
+    /// own is the only one that can be asked what method the request
+    /// carried.
+    fn one_request_server() -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("the server binds");
+        let port = listener
+            .local_addr()
+            .expect("the server has an address")
+            .port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the server accepts");
+            // The head, then the body the head asks for.
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => head.push(byte[0]),
+                }
+            }
+            let text = String::from_utf8_lossy(&head).to_string();
+            let length: usize = text
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.trim().eq_ignore_ascii_case("content-length") {
+                        value.trim().parse().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; length];
+            if length > 0 {
+                let _ = stream.read_exact(&mut body);
+            }
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.flush();
+            format!("{text}{}", String::from_utf8_lossy(&body))
+        });
+        (format!("http://127.0.0.1:{port}/state"), handle)
+    }
 
     #[test]
     fn a_script_that_runs_says_so() {
@@ -198,13 +269,92 @@ mod tests {
     fn an_http_query_to_nothing_says_so() {
         // A URL that cannot be reached is an error, and the error is
         // what the user is told.
-        let result = run_http("http://127.0.0.1:1/nothing");
+        let result = run_http(HttpMethod::Get, "http://127.0.0.1:1/nothing", "");
         assert!(result.is_err(), "the query to nothing succeeded");
     }
 
     #[test]
     fn an_empty_url_is_not_fetched() {
-        let result = run_http("  ");
+        let result = run_http(HttpMethod::Get, "  ", "");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_get_is_a_get() {
+        let (url, server) = one_request_server();
+        let result = run_http(HttpMethod::Get, &url, "");
+        let request = server.join().expect("the server is done");
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            request.starts_with("GET /state "),
+            "the request was not a GET:\n{request}"
+        );
+    }
+
+    #[test]
+    fn a_post_carries_its_method_and_its_body() {
+        // The user asked for this: a query that changes something is
+        // not a GET, and it says what it changes.
+        let (url, server) = one_request_server();
+        let result = run_http(HttpMethod::Post, &url, r#"{"state":"online"}"#);
+        let request = server.join().expect("the server is done");
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            request.starts_with("POST /state "),
+            "the request was not a POST:\n{request}"
+        );
+        assert!(
+            request.ends_with(r#"{"state":"online"}"#),
+            "the body did not arrive:\n{request}"
+        );
+    }
+
+    #[test]
+    fn a_patch_is_a_patch() {
+        let (url, server) = one_request_server();
+        let result = run_http(HttpMethod::Patch, &url, "{\"state\":\"pause\"}");
+        let request = server.join().expect("the server is done");
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            request.starts_with("PATCH /state "),
+            "the request was not a PATCH:\n{request}"
+        );
+        assert!(
+            request.ends_with("{\"state\":\"pause\"}"),
+            "the body did not arrive:\n{request}"
+        );
+    }
+
+    #[test]
+    fn a_delete_carries_no_body() {
+        let (url, server) = one_request_server();
+        let result = run_http(HttpMethod::Delete, &url, "");
+        let request = server.join().expect("the server is done");
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            request.starts_with("DELETE /state "),
+            "the request was not a DELETE:\n{request}"
+        );
+    }
+
+    #[test]
+    fn an_http_hook_runs_on_a_thread_of_its_own() {
+        let (url, server) = one_request_server();
+        let (sender, receiver) = channel();
+        spawn(
+            &StatusAction::Http {
+                method: HttpMethod::Post,
+                url: url.clone(),
+                body: "{}".to_string(),
+            },
+            "Office",
+            sender,
+        );
+        let report = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the query reported back");
+        assert_eq!(report.account, "Office");
+        assert!(report.result.is_ok(), "{:?}", report.result);
+        let _ = server.join();
     }
 }
