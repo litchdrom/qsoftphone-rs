@@ -323,13 +323,17 @@ impl MediaSession {
         let socket = RtpSocket::bind().map_err(|e| AudioError::Backend(e.to_string()))?;
         let codec = config.codecs.first().copied().unwrap_or(Codec::Pcmu);
         let state = Arc::new(AudioState::new(config.microphone_gain, config.speaker_gain));
+        // The frame is bigger for G.722 and for Opus, and the playout
+        // buffer is measured in frames — so the state has to know the
+        // codec even before the negotiation says which one it is.
+        state.set_frame_samples(codec.frame_samples());
 
         Ok(Self {
             inner: Arc::new(MediaInner {
                 socket,
                 state,
                 codec: AtomicU8::new(codec.code()),
-                payload_type: AtomicU8::new(codec.static_payload_type()),
+                payload_type: AtomicU8::new(codec.payload_type()),
                 remote: Mutex::new(None),
                 ssrc: rtp::random_ssrc(),
                 running: AtomicBool::new(false),
@@ -528,7 +532,8 @@ impl MediaSession {
             let state = self.inner.state.clone();
             let stop = stop.clone();
             let codec = self.codec();
-            let mut sender = rtp::RtpSender::new(socket.clone(), self.payload_type(), self.ssrc());
+            let mut sender =
+                rtp::RtpSender::new(socket.clone(), codec, self.payload_type(), self.ssrc());
             if let Some(remote) = *self.inner.remote.lock().expect("remote lock") {
                 sender.set_remote(remote);
             }
@@ -1078,7 +1083,10 @@ mod tests {
     #[test]
     fn the_default_config_offers_every_codec() {
         let config = MediaConfig::default();
-        assert_eq!(config.codecs, vec![Codec::Pcmu, Codec::Pcma, Codec::G722]);
+        assert_eq!(
+            config.codecs,
+            vec![Codec::Pcmu, Codec::Pcma, Codec::G722, Codec::Opus]
+        );
     }
 
     #[test]

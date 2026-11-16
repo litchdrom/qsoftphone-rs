@@ -18,6 +18,10 @@ cpal = { workspace = true }
 # ship with sippy/libg722. It brings `nanoaudio-core` (shared types) and
 # `wide` (the SIMD helpers) with it.
 nanoaudio-g722 = "0.1.1"
+# The Opus codec (RFC 6716). It is a pure-Rust port of libopus — no C, no
+# FFI, and **no dependencies of its own**, so it adds exactly one crate to
+# the tree. Its MSRV is 1.85, which is the workspace's own.
+rusty-opus = "1.1"
 rtc = { workspace = true }
 tracing = { workspace = true }
 

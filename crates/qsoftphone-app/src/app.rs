@@ -4118,7 +4118,7 @@ impl QSoftphoneApp {
         }
 
         ui.add_space(4.0);
-        ui.weak("A PBX has to be told to allow G.722: allow=g722 on the PJSIP endpoint.");
+        ui.weak("A PBX has to be told to allow G.722 and Opus: allow=g722,opus on the PJSIP endpoint — and Asterisk has no Opus until its Opus module is built.");
         ui.add_space(10.0);
 
         ui.label(egui::RichText::new("VOLUME").strong().size(11.0));
@@ -5037,6 +5037,7 @@ fn codec_note(codec: Codec) -> &'static str {
         Codec::Pcmu => "G.711 µ-law, 8 kHz",
         Codec::Pcma => "G.711 A-law, 8 kHz",
         Codec::G722 => "G.722, 16 kHz wideband",
+        Codec::Opus => "Opus, 16 kHz wideband, RFC 6716",
     }
 }
 
@@ -7473,6 +7474,25 @@ mod tests {
 
         app.view = View::Settings;
         app.echo_test = EchoTest::Running;
+
+        // The settings page is longer than the window and the echo
+        // test is at the bottom of it, so the page is scrolled the way
+        // a user scrolls it: with the wheel, over the page.
+        for _ in 0..12 {
+            let mut input = egui::RawInput::default();
+            input
+                .events
+                .push(egui::Event::PointerMoved(egui::pos2(550.0, 500.0)));
+            input.events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -150.0),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+                modifiers: egui::Modifiers::default(),
+            });
+            let _ = frame_with(&mut app, &ctx, input);
+        }
+
         let output = frame(&mut app, &ctx);
 
         let text = screen_text(&output);
@@ -7825,7 +7845,7 @@ mod tests {
         let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
         assert_eq!(
             app.config.media.codecs,
-            vec!["PCMU", "PCMA", "G722"],
+            vec!["PCMU", "PCMA", "G722", "opus"],
             "the wideband codec is there by default"
         );
 
@@ -7833,20 +7853,29 @@ mod tests {
         // allows G.722 wants.
         app.move_codec(Codec::G722, true);
         app.move_codec(Codec::G722, true);
-        assert_eq!(app.config.media.codecs, vec!["G722", "PCMU", "PCMA"]);
+        assert_eq!(
+            app.config.media.codecs,
+            vec!["G722", "PCMU", "PCMA", "opus"]
+        );
 
         // And the call layer was told, because the registrar and the
         // call layer share the settings.
         let media = app.calls.media_config();
-        assert_eq!(media.codecs, vec![Codec::G722, Codec::Pcmu, Codec::Pcma]);
+        assert_eq!(
+            media.codecs,
+            vec![Codec::G722, Codec::Pcmu, Codec::Pcma, Codec::Opus]
+        );
 
         // Out it goes, and back in again.
         app.remove_codec(Codec::G722);
-        assert_eq!(app.config.media.codecs, vec!["PCMU", "PCMA"]);
+        assert_eq!(app.config.media.codecs, vec!["PCMU", "PCMA", "opus"]);
         assert!(!app.enabled_codecs().contains(&Codec::G722));
 
         app.add_codec(Codec::G722);
-        assert_eq!(app.config.media.codecs, vec!["PCMU", "PCMA", "G722"]);
+        assert_eq!(
+            app.config.media.codecs,
+            vec!["PCMU", "PCMA", "opus", "G722"]
+        );
     }
 
     #[tokio::test]

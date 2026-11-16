@@ -3456,6 +3456,7 @@ dependencies = [
  "cpal",
  "nanoaudio-g722",
  "rtc",
+ "rusty-opus",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4142,6 +4143,12 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "rusty-opus"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8acfb69e58b5082d511451aae511dd1b1d0fe693e54ddb29535b480ac48bf8b9"
 
 [[package]]
 name = "safe_arch"

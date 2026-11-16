@@ -14,8 +14,8 @@ app starts and exits cleanly, an account can be registered against a SIP
 registrar with digest authentication (MD5 and SHA-256), and calls can be
 placed and received over that registration — outbound INVITE, inbound
 INVITE with an automatic 180 Ringing, answer, decline, hang up, and DTMF.
-A call carries a voice: the RTP runs over a bound UDP port, G.711 and
-G.722 are both spoken, and the mute keeps the clock running. The codecs,
+A call carries a voice: the RTP runs over a bound UDP port, G.711,
+G.722 and Opus are all spoken, and the mute keeps the clock running. The codecs,
 the sound card and the test sound live on a settings page, and the
 history is in SQLite. The sound itself is continuous now: the playout
 waits for a jitter buffer to fill, a lost frame is concealed, the
@@ -134,9 +134,9 @@ qsoftphone-rs/
     │   ├── paths.rs               per-OS config / data / log dirs
     │   ├── sip/                   pure SIP functions (uri, identity, refer, headers)
     │   └── storage/               SQLite: accounts, contacts, history
-    ├── qsoftphone-media/          the media plane: RTP, G.711, G.722, the sound card
+    ├── qsoftphone-media/          the media plane: RTP, G.711, G.722, Opus, the sound card
     │   ├── audio.rs               the microphone, the speaker, the resampling
-    │   ├── codec.rs               G.711, computed rather than tabulated
+    │   ├── codec.rs               G.711, computed rather than tabulated; G.722; Opus
     │   ├── jitter.rs              the jitter buffer: what arrived, in order
     │   ├── lib.rs                 the session: socket, negotiation, threads
     │   └── rtp.rs                 the UDP socket and the packets on it
@@ -176,6 +176,7 @@ Pinned in the workspace `Cargo.toml`, locked in `Cargo.lock`.
 | `rtc` | 0.21.1 | RTP / SRTP / ICE / DTLS media plane |
 | `cpal` | 0.18.2 | microphone capture and speaker playback |
 | `nanoaudio-g722` | 0.1.1 | the G.722 wideband codec |
+| `rusty-opus` | 1.1.1 | the Opus codec (M6.12) — pure Rust, no dependencies of its own |
 | `egui` / `eframe` | 0.37.0 | the UI (default wgpu backend) |
 | `rusqlite` | 0.41 | storage, `bundled` — SQLite is compiled in |
 | `tokio` | 1.54.1 | the async runtime the SIP stack runs on |
@@ -187,9 +188,9 @@ Pinned in the workspace `Cargo.toml`, locked in `Cargo.lock`.
 The brief asks for a resolved tree under ~250 crates, assuming
 rsipstack would be the bulk at 134.
 
-**Measured, the real number is 310 package names** for the Windows target
-(390 for Linux, which adds X11/Wayland/ALSA). Four of those are this
-workspace's own crates, so 306 and 386 are third-party packages. The gap
+**Measured, the real number is 312 package names** for the Windows target
+(392 for Linux, which adds X11/Wayland/ALSA). Four of those are this
+workspace's own crates, so 308 and 388 are third-party packages. The gap
 is not bloat — it is two subtrees the brief's estimate did not account
 for:
 
@@ -254,6 +255,26 @@ nothing: `log`, `raw-window-handle` and `windows-sys` were **already**
 in the tree (eframe and winit need them), so on Windows the whole
 cost is one crate that compiles against the COM `IFileOpenDialog` that
 is already part of the operating system.
+
+**M6.12 added one package: `rusty-opus`, the Opus codec.**
+The lock file grew by exactly one entry — 586 → 587 — and the
+per-target tree by exactly one package name: Windows 310 → 312, Linux
+390 → 392. The one package is the codec itself: `rusty-opus` is a
+pure-Rust port of libopus with **no dependencies of its own**, so
+unlike G.722 (which brought three) and `rfd` (which brought one) it
+costs exactly what it says.
+
+The alternatives were looked at before this one was chosen:
+
+| Crate | Why not |
+|---|---|
+| `opus-pure` 0.2.1 | needs Rust 1.88, and this workspace's floor is 1.85 |
+| `opus-rs` 0.1.39 | a bigger API and an optional `libm` |
+| `opus-decoder` | a decoder only — the encoder is the half that matters here |
+| `libopus` (the C library) | an FFI dependency, a C toolchain and a build step — the whole point of the rewrite is that there is none |
+
+`rusty-opus` 1.1.1 declares `rust-version = "1.85"`, which is exactly
+this workspace's floor, so it raises nothing.
 
 **The version is 0.17 and not 0.18, on purpose.** `rfd` 0.18
 (published 2026-11-07) declares `rust-version = "1.92"`. Taking it
@@ -4825,6 +4846,153 @@ coloured like the lamp, so the row can be read without reading it.
 
 ---
 
+## M6.12 — Opus
+
+*"What is about addin opus codec (or discuss it at least)"*
+
+G.711 and G.722 are **companders**: a sample becomes a code on a
+logarithmic curve, and the curve is the whole codec. Opus is not a
+curve at all. It is a modern codec (RFC 6716) that looks at a whole
+frame of speech, decides whether to code it as speech (SILK) or as
+music (CELT), and codes it with a transform coder.
+
+It is also the codec every phone has wanted for twenty years and no
+phone had: wideband speech at a third of G.711's bandwidth.
+
+### What it looks like on the wire
+
+Three things about Opus are different from the G.711 pair, and all
+three had to be changed in this build.
+
+**It has no static payload type.** RFC 7587 §4.1 makes it a dynamic
+one, and 111 is the number every implementation settled on. The
+offer says:
+
+```
+m=audio 41234 RTP/AVP 0 8 9 111
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:9 G722/8000
+a=rtpmap:111 opus/48000/2
+a=fmtp:111 minptime=10;useinbandfec=1;sprop-stereo=0
+```
+
+The rtpmap of Opus is **always** `opus/48000/2` — two channels, 48 kHz
+— whatever the stream actually carries. RFC 7587 §4.1 fixes it so that
+every implementation reads the same line. The answer echoes the
+peer's own line back, channel count and all: an answer that dropped
+the `/2` would be saying something different from the offer, and that
+was a bug this milestone fixed (the SDP builder kept the encoding name
+and the clock rate and threw the rest away).
+
+**Its packets are not all the same size.** A frame of silence is a
+handful of bytes and a frame of speech is a couple of hundred, and the
+payload is never padded out. So the RTP layer can no longer assume
+that a frame is 160 bytes:
+
+* the MTU is the header plus the **largest** an Opus packet may be
+  (1275 bytes, RFC 6716 §4.3) and not 172;
+* the payloader is `rtc`'s own `OpusPayloader`, which puts one whole
+  frame in one packet and never fragments it (RFC 7587 §4.2);
+* the sender takes the codec's frame size from the codec.
+
+**Its clock is not the rate of its audio.** The RTP clock of an Opus
+stream is 48 kHz and a frame is 20 ms, so the timestamp advances by
+**960** ticks every frame — six times the G.711 step, and not the
+number of samples the codec was fed.
+
+### What it is coded at
+
+The codec is fed **16 kHz** and codes it in **SILK**, the speech
+mode. That is the classic VoIP configuration: wideband speech at
+24 kbit/s, against the 64 kbit/s that G.711 and G.722 each spend on
+less.
+
+The RTP clock is still 48 kHz — RFC 7587 §4.1 does not allow anything
+else — and the encoder's own rate is not signalled anywhere, because
+it is not a media parameter: the decoder at the other end resamples
+to whatever it wants. This is the same split G.722 already has (16 kHz
+of audio on an 8 kHz clock), and the build already knew how to carry
+it.
+
+The alternatives were measured rather than argued about:
+
+| Mode | Speech | Silence | Note |
+|---|---|---|---|
+| SILK at 16 kHz (SILK-only) | ~50 bytes | ~8 bytes | **chosen** — speech mode, and the in-band FEC is real |
+| CELT at 48 kHz | ~96 bytes | ~5 bytes | full band, but no SILK and so no FEC |
+| Hybrid at 48 kHz | ~127 bytes | ~89 bytes | the VoIP mode at 48 kHz — the silence costs as much as the speech |
+
+### The in-band error correction
+
+`useinbandfec=1` is in the offer, and the encoder is told to do it: a
+copy of the last frame goes inside this one, and a peer that loses a
+single packet can repair it from the packet after it. The line in the
+SDP is not a wish — it is what the encoder does.
+
+### The lost frame
+
+Opus conceals a lost frame itself. There is no silence code and no
+byte to send: **an empty packet is the signal** that the frame never
+arrived (RFC 6716 §4.4), and the decoder runs its own packet-loss
+concealment on it. The G.711 silence code and the G.722
+"no change" byte are still there for the two codecs that need them.
+
+### The channels
+
+The build sends **one** channel and says so: `sprop-stereo=0`. A peer
+that sends stereo is not a problem — `rusty-opus` decodes a stereo
+stream into mono the way libopus does, averaging the two channels, so
+the decoder is the same one either way.
+
+### The codec itself
+
+`rusty-opus` 1.1.1: a pure-Rust port of libopus, no C, no FFI, and
+**no dependencies of its own**. It is the whole of libopus — SILK,
+CELT, the hybrid mode, the in-band FEC and the packet-loss
+concealment — compiled from Rust.
+
+The encoder is set up for voice (`Application::Voip`), at 24 kbit/s,
+with the in-band FEC on and a packet loss of 5 % assumed. The decoder
+is told the same rate, so the two ends agree on what a frame is.
+
+### What is proved
+
+* **The codec speaks Opus.** The offer names it on 111 with
+  `opus/48000/2` and the parameters RFC 7587 §7 asks for; the answer
+  to an Opus offer is Opus, with the channel count and the parameters.
+* **A frame survives the round trip.** 320 samples of 16 kHz audio go
+  into the encoder, one Opus packet comes out, and 320 samples come
+  back — and the signal is still the signal (the round trip measures
+  better than 15 dB of signal-to-noise at the codec's own delay).
+* **The packet is the size the codec chose.** A frame of speech and a
+  frame of silence are different sizes, and both go on the wire
+  unchanged, in one packet each.
+* **The clock is right.** The Opus timestamp advances by 960 — 20 ms
+  of the 48 kHz clock — and not by the 320 samples the codec was fed.
+* **A lost frame is concealed.** An empty packet is the signal, and
+  the concealment comes back the right number of samples long.
+* **It works end to end.** A session pair over the loopback carries an
+  Opus frame from one to the other, and the peer hears the tone.
+
+### What is *not* in M6.12
+
+* **It cannot be tested against the user's own PBX.** Asterisk 22.8.0
+  has no Opus: `codec_opus` is an external Digium module and it is
+  `defaultenabled=no` in `codecs/codecs.xml`. Until that module is
+  downloaded and built into the PBX, a call to it will still be
+  answered with G.722/PCMA/PCMU — which is what the capture shows.
+  The codec is proved here by its own round trip and over the
+  loopback, not against the PBX.
+* **Opus is last in the offer.** The order is *our* preference and the
+  peer has the last word — an answer that names Opus alone is answered
+  with Opus whatever the order says — but a peer that offers several
+  gets the codec that is known to work against a real PBX. The
+  settings page has buttons that move Opus up for anybody who wants it
+  first.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -4882,6 +5050,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.9** | Every account is a group: the selected account is open, the others are folded to their title with all their fields in them, each account has a form of its own, and every lamp in the panel says the account that watches it | **done** |
 | **M6.10** | The account is made with everything it is: the form for another account carries the domain, the outbound proxy and the two header names, the accounts are numbered, and every lamp is numbered in its own account | **done** |
 | **M6.11** | The lamp is one line: the lamp, the account's number, the extension, the lamp's number and the state — the `from acc … · unknown` line under it is gone | **done** |
+| **M6.12** | Opus: the codec itself (`rusty-opus`, one package and no dependencies of its own), the offer that names it on 111 with `opus/48000/2` and the parameters of RFC 7587 §7, an RTP layer that carries packets of whatever size the codec chose, and a 48 kHz clock whose timestamp advances by 960 | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -4945,7 +5114,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 509 tests, all passing.
+* `cargo test --workspace` — 520 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and

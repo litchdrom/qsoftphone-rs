@@ -151,6 +151,54 @@ fn a_wideband_frame_goes_from_one_session_to_the_other() {
 }
 
 #[test]
+fn an_opus_frame_goes_from_one_session_to_the_other() {
+    // Opus is the codec whose packets are not all the same size, and
+    // whose clock is not the rate of its audio: 320 samples of 16 kHz
+    // audio go in, a packet of whatever length the codec chose comes
+    // out, and 320 samples come back.
+    let (caller, callee) = pair_with(Codec::Opus);
+    assert_eq!(caller.codec(), Codec::Opus);
+    assert_eq!(caller.payload_type(), 111);
+    caller.start_transport();
+    callee.start_transport();
+
+    // A tone, so that a wrong decode is visible: a ramp at 16 kHz is
+    // a 25 Hz tone, and the codec is not interested in that.
+    let pcm: Vec<i16> = (0..320)
+        .map(|i| {
+            let t = i as f32 / 16000.0;
+            (12_000.0 * (2.0 * std::f64::consts::PI * 500.0 * t as f64).sin()) as i16
+        })
+        .collect();
+    let frame = Codec::Opus.encoder().encode(&pcm);
+    assert!(!frame.is_empty(), "the codec produced nothing");
+    assert!(
+        frame.len() < 1275,
+        "the packet is longer than Opus allows: {}",
+        frame.len()
+    );
+    caller
+        .audio_state()
+        .push_outbound(OutboundFrame::speech(frame));
+
+    let received = wait_for_samples(&callee, 320);
+    assert!(
+        received.len() >= 320,
+        "the frame did not arrive: {} samples",
+        received.len()
+    );
+
+    // And the peer heard the tone.
+    let peak = received
+        .iter()
+        .take(320)
+        .map(|sample| sample.saturating_abs())
+        .max()
+        .unwrap_or(0);
+    assert!(peak > 4_000, "the peer heard nothing: peak {peak}");
+}
+
+#[test]
 fn a_muted_microphone_sends_silence() {
     let (caller, callee) = pair();
     caller.set_mic_muted(true);

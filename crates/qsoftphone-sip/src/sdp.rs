@@ -61,6 +61,12 @@ pub struct MediaFormat {
     pub encoding: String,
     /// The clock rate — 8000 for G.711.
     pub clock_rate: u32,
+    /// The number of channels, when the peer said one.
+    ///
+    /// It matters for Opus: RFC 7587 §4.1 fixes it at two — the rtpmap
+    /// is `opus/48000/2` whatever the stream carries — and an answer
+    /// that drops the number says something different from the offer.
+    pub channels: Option<u16>,
 }
 
 /// The media part of an SDP.
@@ -144,16 +150,22 @@ pub fn offer_sdp_with_direction(
 ) -> Vec<u8> {
     let payload_types: Vec<String> = codecs
         .iter()
-        .map(|codec| codec.static_payload_type().to_string())
+        .map(|codec| codec.payload_type().to_string())
         .collect();
     let rtpmaps: String = codecs
         .iter()
-        .map(|codec| {
-            format!(
-                "a=rtpmap:{} {}\r\n",
-                codec.static_payload_type(),
-                codec.rtpmap()
-            )
+        .map(|codec| format!("a=rtpmap:{} {}\r\n", codec.payload_type(), codec.rtpmap()))
+        .collect();
+    // The `a=fmtp` line carries the codec's own parameters. Only Opus
+    // has any: the smallest frame it will take, whether it hides a
+    // copy of the last frame inside the next one, and how many
+    // channels it sends. RFC 7587 §7.
+    let fmtps: String = codecs
+        .iter()
+        .filter_map(|codec| {
+            codec
+                .fmtp()
+                .map(|parameters| format!("a=fmtp:{} {}\r\n", codec.payload_type(), parameters))
         })
         .collect();
 
@@ -165,6 +177,7 @@ pub fn offer_sdp_with_direction(
          t=0 0\r\n\
          m=audio {port} RTP/AVP {payload_types}\r\n\
          {rtpmaps}\
+         {fmtps}\
          a=ptime:20\r\n\
          {direction}\r\n",
         payload_types = payload_types.join(" "),
@@ -186,15 +199,32 @@ pub fn answer_sdp(
     codecs: &[Codec],
 ) -> Vec<u8> {
     let media = match choose_format(offer, codecs) {
-        Some(format) => format!(
-            "m=audio {port} RTP/AVP {pt}\r\n\
-             a=rtpmap:{pt} {encoding}/{clock}\r\n\
-             a=ptime:20\r\n\
-             a=sendrecv\r\n",
-            pt = format.payload_type,
-            encoding = format.encoding,
-            clock = format.clock_rate,
-        ),
+        Some(format) => {
+            // The parameters of the codec we are answering with. The
+            // peer's own format is echoed back — RFC 3264 §6 — but the
+            // parameters are ours: they say how *our* encoder behaves.
+            let fmtp = Codec::from_payload_type(format.payload_type, Some(&format.encoding))
+                .and_then(|codec| codec.fmtp())
+                .map(|parameters| format!("a=fmtp:{} {}\r\n", format.payload_type, parameters))
+                .unwrap_or_default();
+            format!(
+                "m=audio {port} RTP/AVP {pt}\r\n\
+                 a=rtpmap:{pt} {encoding}/{clock}{channels}\r\n\
+                 {fmtp}\
+                 a=ptime:20\r\n\
+                 a=sendrecv\r\n",
+                pt = format.payload_type,
+                encoding = format.encoding,
+                clock = format.clock_rate,
+                // The number of channels is echoed back: an answer that
+                // drops it says something different from the offer, and
+                // RFC 7587 §4.1 fixes Opus at two.
+                channels = format
+                    .channels
+                    .map(|count| format!("/{count}"))
+                    .unwrap_or_default(),
+            )
+        }
         None => "m=audio 0 RTP/AVP 0\r\n".to_string(),
     };
 
@@ -220,7 +250,7 @@ pub fn parse_media(body: &[u8]) -> Option<MediaDescription> {
     let mut media_address: Option<String> = None;
     let mut port: Option<u16> = None;
     let mut payload_types: Vec<u8> = Vec::new();
-    let mut rtpmaps: Vec<(u8, String, u32)> = Vec::new();
+    let mut rtpmaps: Vec<(u8, String, u32, Option<u16>)> = Vec::new();
     let mut in_audio = false;
     let mut seen_media = false;
 
@@ -278,7 +308,11 @@ pub fn parse_media(body: &[u8]) -> Option<MediaDescription> {
                 .next()
                 .and_then(|rate| rate.parse::<u32>().ok())
                 .unwrap_or(DEFAULT_CLOCK_RATE);
-            rtpmaps.push((payload_type, encoding, clock_rate));
+            // The number of channels, when the peer named one. Opus
+            // always does — RFC 7587 §4.1 — and the answer has to
+            // echo it back.
+            let channels = fields.next().and_then(|count| count.parse::<u16>().ok());
+            rtpmaps.push((payload_type, encoding, clock_rate, channels));
         }
     }
 
@@ -289,11 +323,12 @@ pub fn parse_media(body: &[u8]) -> Option<MediaDescription> {
     let formats = payload_types
         .into_iter()
         .map(
-            |payload_type| match rtpmaps.iter().find(|(pt, _, _)| *pt == payload_type) {
-                Some((_, encoding, clock_rate)) => MediaFormat {
+            |payload_type| match rtpmaps.iter().find(|(pt, _, _, _)| *pt == payload_type) {
+                Some((_, encoding, clock_rate, channels)) => MediaFormat {
                     payload_type,
                     encoding: encoding.clone(),
                     clock_rate: *clock_rate,
+                    channels: *channels,
                 },
                 None => {
                     let (encoding, clock_rate) = STATIC_FORMATS
@@ -305,6 +340,7 @@ pub fn parse_media(body: &[u8]) -> Option<MediaDescription> {
                         payload_type,
                         encoding: encoding.to_string(),
                         clock_rate,
+                        channels: None,
                     }
                 }
             },
@@ -503,13 +539,58 @@ a=rtpmap:0 PCMU/8000\r\n";
         assert!(sdp.starts_with("v=0\r\n"), "{sdp}");
         assert!(sdp.contains("o=- 7 7 IN IP4 10.0.0.5\r\n"), "{sdp}");
         assert!(sdp.contains("c=IN IP4 10.0.0.5\r\n"), "{sdp}");
-        assert!(sdp.contains("m=audio 41234 RTP/AVP 0 8 9\r\n"), "{sdp}");
+        assert!(sdp.contains("m=audio 41234 RTP/AVP 0 8 9 111\r\n"), "{sdp}");
         assert!(sdp.contains("a=rtpmap:0 PCMU/8000\r\n"), "{sdp}");
         assert!(sdp.contains("a=rtpmap:8 PCMA/8000\r\n"), "{sdp}");
         assert!(sdp.ends_with("\r\n"), "{sdp}");
         // Every line has to end with CRLF, or some parsers reject the
         // whole body.
         assert!(!sdp.contains("\n\r"), "{sdp}");
+    }
+
+    #[test]
+    fn the_offer_names_opus_the_way_rfc_7587_says() {
+        // Opus is carried on 111 — it has no static payload type — and
+        // the rtpmap is always `opus/48000/2`, whatever the stream
+        // carries (RFC 7587 §4.1).
+        let sdp = String::from_utf8(offer_sdp("10.0.0.5", 41234, 7, &[Codec::Opus])).unwrap();
+        assert!(sdp.contains("m=audio 41234 RTP/AVP 111\r\n"), "{sdp}");
+        assert!(sdp.contains("a=rtpmap:111 opus/48000/2\r\n"), "{sdp}");
+        // And the parameters of the codec are in the offer: the
+        // smallest frame, the in-band error correction and the number
+        // of channels (RFC 7587 §7).
+        assert!(
+            sdp.contains("a=fmtp:111 minptime=10;useinbandfec=1;sprop-stereo=0\r\n"),
+            "{sdp}"
+        );
+    }
+
+    #[test]
+    fn the_answer_to_an_opus_offer_is_opus() {
+        // The peer offers Opus only, and the answer has to name it —
+        // with the peer's own payload type and the parameters of our
+        // own encoder.
+        let offer = "v=0\r\n\
+o=- 1 1 IN IP4 10.0.0.1\r\n\
+s=-\r\n\
+c=IN IP4 10.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 4000 RTP/AVP 111\r\n\
+a=rtpmap:111 opus/48000/2\r\n";
+        let answer = String::from_utf8(answer_sdp(
+            offer.as_bytes(),
+            "10.0.0.5",
+            41234,
+            1,
+            &codecs(),
+        ))
+        .unwrap();
+        assert!(answer.contains("m=audio 41234 RTP/AVP 111\r\n"), "{answer}");
+        assert!(answer.contains("a=rtpmap:111 opus/48000/2\r\n"), "{answer}");
+        assert!(
+            answer.contains("a=fmtp:111 minptime=10;useinbandfec=1;sprop-stereo=0\r\n"),
+            "{answer}"
+        );
     }
 
     #[test]

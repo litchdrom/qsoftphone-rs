@@ -1,4 +1,4 @@
-//! The codecs this build speaks: G.711 and G.722.
+//! The codecs this build speaks: G.711, G.722 and Opus.
 //!
 //! ## G.711 — the codec every SIP telephone speaks
 //!
@@ -40,6 +40,36 @@
 //! decoding the reference stream both reproduce the published SHA-256
 //! digests byte for byte.
 //!
+//! ## Opus — the one that is not a curve
+//!
+//! G.711 and G.722 are **companders**: a sample becomes a code on a
+//! logarithmic curve, and the curve is the whole codec. Opus is not a
+//! curve at all. It is a modern codec (RFC 6716) that looks at a
+//! whole frame of speech, decides whether to code it as speech (SILK)
+//! or as music (CELT), and codes it with a transform coder.
+//!
+//! Three things about it matter to a phone, and all three are
+//! different from the G.711 pair:
+//!
+//! * **It runs at 48 kHz.** The RTP clock is 48 kHz and a 20 ms frame
+//!   is 960 samples — six times as many as G.711's. RFC 7587 §4.1
+//!   fixes the rtpmap at `opus/48000/2` whatever the audio is.
+//! * **Its packets are not a fixed size.** A frame of silence is a
+//!   handful of bytes and a frame of speech is a couple of hundred,
+//!   and the payload is never padded out. What *is* fixed is the
+//!   frame: 20 ms of audio, always.
+//! * **It has no static payload type.** RFC 7587 §4.1 makes it a
+//!   dynamic one, and 111 is the number every implementation settled
+//!   on.
+//!
+//! It is also the only codec here that needs an `a=fmtp` line: the
+//! parameters say how small a frame may be, whether the sender hides
+//! a copy of the last frame inside the next one, and how many
+//! channels it sends.
+//!
+//! The codec itself is `rusty-opus`: a pure-Rust port of libopus — no
+//! C, no FFI, and **no dependencies of its own**.
+//!
 //! ## The tables are computed, not written out
 //!
 //! The classic G.711 implementations carry two 256-entry lookup tables
@@ -51,11 +81,47 @@
 //! quantisation, and a sign bit.
 
 use nanoaudio_g722::{G722BitRate, G722Decoder, G722Encoder};
+use rusty_opus::{Application, OpusDecoder, OpusEncoder};
+
+/// The largest an Opus packet may be.
+///
+/// RFC 6716 §4.3: a packet is at most 1275 bytes, whatever the
+/// bitrate and whatever the frame. The RTP layer has to be ready for
+/// one that big — G.711's 160 bytes is not a bound any more.
+pub const OPUS_MAX_PACKET: usize = 1275;
+
+/// The rate Opus is coded at.
+///
+/// The RTP clock of an Opus stream is **always** 48 kHz — RFC 7587
+/// §4.1 fixes it, and there is no way to change it. What *is* free is
+/// the rate the encoder works at, and the codec's own sample rate is
+/// independent of it: libopus is built to code 8, 12, 16, 24 and
+/// 48 kHz, and the decoder at the other end resamples to whatever it
+/// wants.
+///
+/// This build codes **16 kHz** — wideband speech, in SILK, which is
+/// what the codec was designed for. A frame is 20 ms either way, so
+/// the RTP timestamp advances by 960 ticks of the 48 kHz clock
+/// whatever the codec was fed.
+pub const OPUS_RATE: i32 = 16000;
+
+/// The number of channels Opus is carried with.
+///
+/// The rtpmap says `opus/48000/2` whatever the audio is — RFC 7587
+/// §4.1 fixes the number at two so that every implementation reads
+/// the same line — but the *stream* may be mono, and this build
+/// sends mono: one microphone, one channel.
+///
+/// The decoder does not care: `rusty-opus` decodes a stereo stream
+/// into mono the way libopus does, averaging the two channels.
+pub const OPUS_CHANNELS: usize = 1;
 
 /// The audio codecs this build speaks.
 ///
 /// G.711 is what every SIP peer offers; G.722 is the wideband one,
 /// and it is the only codec here that a PBX has to be told to allow.
+/// Opus is the modern one, and it is the only one whose packets are
+/// not all the same size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Codec {
     /// G.711 µ-law. The American and Japanese standard.
@@ -64,6 +130,8 @@ pub enum Codec {
     Pcma,
     /// G.722 wideband ADPCM. 16 kHz of speech in 64 kbit/s.
     G722,
+    /// Opus. 48 kHz of speech in 6–51 kbit/s (RFC 6716).
+    Opus,
 }
 
 impl Codec {
@@ -73,78 +141,155 @@ impl Codec {
     /// offer, and the two sound the same. G.722 is last because a PBX
     /// has to be told to allow it — an offer that names it is harmless,
     /// but a peer that does not have it ignores it.
-    pub const ALL: [Codec; 3] = [Codec::Pcmu, Codec::Pcma, Codec::G722];
+    ///
+    /// Opus is last of all, and that is a choice rather than an
+    /// accident: the order is **our** preference, and the peer has the
+    /// last word — an answer that names Opus alone is answered with
+    /// Opus whatever the order says. Keeping the codecs that have been
+    /// tested against a real PBX at the front means a peer that offers
+    /// several gets the one that is known to work, and the settings
+    /// page has buttons that move Opus up for anybody who wants it
+    /// first.
+    pub const ALL: [Codec; 4] = [Codec::Pcmu, Codec::Pcma, Codec::G722, Codec::Opus];
 
-    /// The name the SDP carries — `PCMU`, `PCMA` or `G722`.
+    /// The name the SDP carries — `PCMU`, `PCMA`, `G722` or `opus`.
+    ///
+    /// Opus is spelled in lower case because that is how RFC 7587
+    /// §4.1 spells it, and the SDP name is what a peer is matched
+    /// against.
     pub const fn name(self) -> &'static str {
         match self {
             Codec::Pcmu => "PCMU",
             Codec::Pcma => "PCMA",
             Codec::G722 => "G722",
+            Codec::Opus => "opus",
         }
     }
 
-    /// The static payload type of the codec — 0, 8 or 9.
+    /// The payload type of the codec — 0, 8, 9 or 111.
     ///
-    /// RFC 3551 fixes these. A peer is free to put the same codec on a
-    /// dynamic number instead, and then *its* number is the one the
-    /// answer has to echo.
-    pub const fn static_payload_type(self) -> u8 {
+    /// The first three are fixed by RFC 3551. Opus has no static
+    /// payload type: RFC 7587 §4.1 makes it a dynamic one, and 111
+    /// is the number every implementation settled on.
+    ///
+    /// A peer is free to put the same codec on a dynamic number
+    /// instead, and then *its* number is the one the answer has to
+    /// echo.
+    pub const fn payload_type(self) -> u8 {
         match self {
             Codec::Pcmu => 0,
             Codec::Pcma => 8,
             Codec::G722 => 9,
+            Codec::Opus => 111,
         }
     }
 
     /// The rate of the PCM the codec works on.
     ///
     /// G.711 is 8 kHz. G.722 is 16 kHz — that is the whole point of
-    /// it: the speech is wideband.
+    /// it: the speech is wideband. Opus is 16 kHz as well, and that is
+    /// **not** the RTP clock: RFC 7587 §4.1 puts an Opus stream on a
+    /// 48 kHz clock whatever the codec is fed, and the codec is fed
+    /// 16 kHz wideband speech — see [`OPUS_RATE`].
     pub const fn sample_rate(self) -> u32 {
         match self {
             Codec::Pcmu | Codec::Pcma => 8000,
-            Codec::G722 => 16000,
+            Codec::G722 | Codec::Opus => 16000,
         }
     }
 
     /// The RTP clock rate of the codec.
     ///
-    /// 8000 Hz for all three, and that is not a mistake: RFC 3551
-    /// §4.5.2 keeps G.722 on the 8 kHz clock of the original
+    /// 8000 Hz for G.711 and G.722, and that is not a mistake: RFC
+    /// 3551 §4.5.2 keeps G.722 on the 8 kHz clock of the original
     /// recommendation, so a G.722 packet advances the timestamp by 160
     /// every 20 ms exactly like a G.711 one.
+    ///
+    /// Opus is the exception: RFC 7587 §4.1 puts it on a 48 kHz clock,
+    /// so its timestamp advances by 960 every 20 ms.
     pub const fn rtp_clock_rate(self) -> u32 {
-        8000
+        match self {
+            Codec::Pcmu | Codec::Pcma | Codec::G722 => 8000,
+            Codec::Opus => 48000,
+        }
+    }
+
+    /// The number of RTP clock ticks in one 20 ms frame.
+    ///
+    /// The clock counts samples *of the clock*, not of the audio, and
+    /// the two are not the same for G.722: its audio is 16 kHz and
+    /// its clock is 8 kHz, so a frame is 320 samples of audio but 160
+    /// ticks of clock.
+    ///
+    /// A frame is 20 ms of whatever the codec works on, so this is
+    /// the clock rate divided by fifty.
+    pub const fn rtp_timestamp_step(self) -> u32 {
+        self.rtp_clock_rate() / 50
     }
 
     /// The number of PCM samples in one 20 ms frame.
     ///
-    /// 160 at 8 kHz, and 320 at 16 kHz — a frame is always 20 ms of
-    /// audio, whatever the rate.
+    /// 160 at 8 kHz, 320 at 16 kHz — a frame is always 20 ms of
+    /// audio, whatever the rate. Opus is coded at 16 kHz, so its frame
+    /// is 320 samples too, even though its RTP clock is 48 kHz and
+    /// the timestamp advances by 960.
     pub const fn frame_samples(self) -> usize {
         match self {
             Codec::Pcmu | Codec::Pcma => 160,
-            Codec::G722 => 320,
+            Codec::G722 | Codec::Opus => 320,
         }
     }
 
-    /// The number of payload bytes in one 20 ms frame.
+    /// The number of payload bytes in one frame.
     ///
-    /// 160 for all three: G.711 is one byte per sample at 8 kHz, and
-    /// G.722 is one byte per 8 kHz sample-pair at 16 kHz.
+    /// 160 for G.711 and G.722: G.711 is one byte per sample at 8 kHz,
+    /// and G.722 is one byte per 8 kHz sample-pair at 16 kHz.
+    ///
+    /// Opus has no fixed size — its packets are as long as the signal
+    /// needs, which is the whole point of the codec — so this is the
+    /// **largest** an Opus packet may be (RFC 6716 §4.3).
     pub const fn frame_bytes(self) -> usize {
-        160
+        match self {
+            Codec::Pcmu | Codec::Pcma | Codec::G722 => 160,
+            Codec::Opus => OPUS_MAX_PACKET,
+        }
     }
 
     /// The `a=rtpmap` of the codec.
     ///
     /// G.722 says 8000 here, not 16000 — see [`Codec::rtp_clock_rate`].
+    ///
+    /// Opus says 48000 and **2**: RFC 7587 §4.1 fixes the number of
+    /// channels at two whatever the stream carries, so that every
+    /// implementation reads the same line.
     pub const fn rtpmap(self) -> &'static str {
         match self {
             Codec::Pcmu => "PCMU/8000",
             Codec::Pcma => "PCMA/8000",
             Codec::G722 => "G722/8000",
+            Codec::Opus => "opus/48000/2",
+        }
+    }
+
+    /// The `a=fmtp` parameters of the codec, if it has any.
+    ///
+    /// Only Opus needs them (RFC 7587 §7):
+    ///
+    /// * `minptime=10` — the smallest frame we will take. Opus can
+    ///   code 2.5 ms, 5 ms, 10 ms, 20 ms and more, and a peer that
+    ///   sends 20 ms frames is the normal case; saying 10 ms means a
+    ///   peer that wants to be quick is allowed to be.
+    /// * `useinbandfec=1` — we hide a copy of the previous frame
+    ///   inside the next one, so that the loss of a single packet can
+    ///   be repaired by the one after it. The encoder is told to do
+    ///   it, so the line is not a lie.
+    /// * `sprop-stereo=0` — we send **one** channel. RFC 7587 §7.2
+    ///   says the parameter describes the sender's own stream, and
+    ///   the default when it is absent is mono as well.
+    pub const fn fmtp(self) -> Option<&'static str> {
+        match self {
+            Codec::Opus => Some("minptime=10;useinbandfec=1;sprop-stereo=0"),
+            _ => None,
         }
     }
 
@@ -154,6 +299,7 @@ impl Codec {
             "PCMU" | "ULAW" | "MU-LAW" | "MULAW" => Some(Codec::Pcmu),
             "PCMA" | "ALAW" | "A-LAW" => Some(Codec::Pcma),
             "G722" | "G.722" => Some(Codec::G722),
+            "OPUS" => Some(Codec::Opus),
             _ => None,
         }
     }
@@ -163,7 +309,8 @@ impl Codec {
     /// The name from the `a=rtpmap` line wins when there is one: a
     /// peer may put G.711 on a dynamic number, and the number alone
     /// then says nothing. Without a name the static table of RFC 3551
-    /// is used.
+    /// is used — and 111 is tried for Opus, which has no static
+    /// payload type of its own but is always carried on 111.
     pub fn from_payload_type(payload_type: u8, name: Option<&str>) -> Option<Codec> {
         if let Some(name) = name {
             return Codec::from_name(name);
@@ -172,6 +319,7 @@ impl Codec {
             0 => Some(Codec::Pcmu),
             8 => Some(Codec::Pcma),
             9 => Some(Codec::G722),
+            111 => Some(Codec::Opus),
             _ => None,
         }
     }
@@ -193,6 +341,7 @@ impl Codec {
             Codec::Pcmu => 0,
             Codec::Pcma => 1,
             Codec::G722 => 2,
+            Codec::Opus => 3,
         }
     }
 
@@ -201,6 +350,7 @@ impl Codec {
         match code {
             1 => Codec::Pcma,
             2 => Codec::G722,
+            3 => Codec::Opus,
             _ => Codec::Pcmu,
         }
     }
@@ -213,14 +363,24 @@ impl Codec {
 /// signal it has seen, and so does the decoder at the other end. An
 /// encoder that is not in the same state as its peer produces noise,
 /// so both are objects with a state and not plain functions.
-#[derive(Debug)]
 pub struct Encoder {
     codec: Codec,
     inner: EncoderInner,
 }
 
+/// The encoder, printed as the codec it speaks.
+///
+/// The Opus encoder inside does not implement `Debug` — it is a large
+/// object of working memory, and printing it would say nothing.
+impl std::fmt::Debug for Encoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Encoder")
+            .field("codec", &self.codec)
+            .finish()
+    }
+}
+
 /// What the encoder is made of.
-#[derive(Debug)]
 enum EncoderInner {
     /// G.711: the codec itself is the encoder.
     G711(Codec),
@@ -229,6 +389,11 @@ enum EncoderInner {
     /// It is boxed: the ADPCM state is a good deal bigger than a
     /// codec, and the encoder is held for the whole call.
     G722(Box<G722Encoder>),
+    /// Opus: the transform coder.
+    ///
+    /// It is boxed for the same reason: the encoder's working memory
+    /// is far bigger than a codec, and it is held for the whole call.
+    Opus(Box<OpusEncoder>),
 }
 
 impl Encoder {
@@ -236,6 +401,7 @@ impl Encoder {
     pub fn new(codec: Codec) -> Self {
         let inner = match codec {
             Codec::G722 => EncoderInner::G722(Box::new(G722Encoder::new())),
+            Codec::Opus => EncoderInner::Opus(Box::new(opus_encoder())),
             other => EncoderInner::G711(other),
         };
         Self { codec, inner }
@@ -249,10 +415,13 @@ impl Encoder {
     /// Encode one frame of PCM.
     ///
     /// The samples are at the codec's own rate — 8 kHz for G.711, 16 kHz
-    /// for G.722 — and a frame is 20 ms of them. A frame that is not
-    /// the right length is encoded as far as it goes: G.722 needs the
-    /// samples in pairs, and an odd one is left over.
+    /// for G.722, 48 kHz for Opus — and a frame is 20 ms of them. A
+    /// frame that is not the right length is encoded as far as it
+    /// goes: G.722 needs the samples in pairs, and an odd one is left
+    /// over; Opus pads a short frame with silence and cuts a long one
+    /// short, so that it always codes 20 ms.
     pub fn encode(&mut self, pcm: &[i16]) -> Vec<u8> {
+        let frame = self.codec.frame_samples();
         match &mut self.inner {
             EncoderInner::G711(codec) => pcm
                 .iter()
@@ -265,6 +434,7 @@ impl Encoder {
                 }
                 out
             }
+            EncoderInner::Opus(encoder) => encode_opus(frame, encoder, pcm),
         }
     }
 
@@ -282,20 +452,30 @@ impl Encoder {
 /// A decoder for one codec.
 ///
 /// The mirror of [`Encoder`], and stateful for the same reason.
-#[derive(Debug)]
 pub struct Decoder {
     codec: Codec,
     inner: DecoderInner,
 }
 
+/// The decoder, printed as the codec it speaks.
+impl std::fmt::Debug for Decoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Decoder")
+            .field("codec", &self.codec)
+            .finish()
+    }
+}
+
 /// What the decoder is made of.
-#[derive(Debug)]
 enum DecoderInner {
     /// G.711: the codec itself is the decoder.
     G711(Codec),
     /// G.722: the ADPCM decoder, boxed for the same reason as the
     /// encoder.
     G722(Box<G722Decoder>),
+    /// Opus: the transform decoder, boxed for the same reason as the
+    /// encoder.
+    Opus(Box<OpusDecoder>),
 }
 
 impl Decoder {
@@ -303,6 +483,10 @@ impl Decoder {
     pub fn new(codec: Codec) -> Self {
         let inner = match codec {
             Codec::G722 => DecoderInner::G722(Box::new(G722Decoder::new(G722BitRate::Rate64000))),
+            Codec::Opus => DecoderInner::Opus(Box::new(
+                OpusDecoder::new(OPUS_RATE, OPUS_CHANNELS)
+                    .expect("48 kHz and one channel are valid Opus arguments"),
+            )),
             other => DecoderInner::G711(other),
         };
         Self { codec, inner }
@@ -315,6 +499,7 @@ impl Decoder {
 
     /// Decode a payload into PCM at the codec's rate.
     pub fn decode(&mut self, payload: &[u8]) -> Vec<i16> {
+        let frame = self.codec.frame_samples();
         match &mut self.inner {
             DecoderInner::G711(codec) => payload
                 .iter()
@@ -329,6 +514,7 @@ impl Decoder {
                 }
                 out
             }
+            DecoderInner::Opus(decoder) => decode_opus(frame, decoder, payload),
         }
     }
 
@@ -345,22 +531,149 @@ impl Decoder {
     /// For G.722 there is no fixed code, and the two obvious choices
     /// are both traps — see [`G722_CONCEALMENT_BYTE`] for what the
     /// codec's own tables say about them.
+    ///
+    /// For Opus there is no code at all: **an empty packet is the
+    /// signal** that the frame never arrived (RFC 6716 §4.4), and the
+    /// decoder runs its own packet-loss concealment on it.
     pub fn conceal(&mut self) -> Vec<i16> {
-        let frame = match &self.inner {
+        let frame = self.codec.frame_samples();
+
+        // The codecs that conceal with a code: the bytes the decoder is
+        // given in place of the frame that never arrived.
+        let bytes: Option<Vec<u8>> = match &self.inner {
             DecoderInner::G711(codec) => {
                 let byte = match codec {
                     Codec::Pcmu => 0xFF,
                     Codec::Pcma => 0xD5,
-                    Codec::G722 => unreachable!("G.722 is not a G.711 codec"),
+                    _ => unreachable!("G.722 is not a G.711 codec"),
                 };
-                vec![byte; self.codec.frame_bytes()]
+                Some(vec![byte; self.codec.frame_bytes()])
             }
-            DecoderInner::G722(_) => {
-                vec![G722_CONCEALMENT_BYTE; self.codec.frame_bytes()]
-            }
+            DecoderInner::G722(_) => Some(vec![G722_CONCEALMENT_BYTE; self.codec.frame_bytes()]),
+            DecoderInner::Opus(_) => None,
         };
-        self.decode(&frame)
+        if let Some(bytes) = bytes {
+            return self.decode(&bytes);
+        }
+
+        // Opus has no code: an **empty packet** is the signal that the
+        // frame never arrived (RFC 6716 §4.4), and the decoder runs its
+        // own packet-loss concealment on it.
+        let mut out = vec![0f32; frame];
+        match &mut self.inner {
+            DecoderInner::Opus(decoder) => match decoder.decode(&[], frame, &mut out) {
+                Ok(length) => floats_to_pcm(&out[..length.min(out.len())]),
+                Err(error) => {
+                    tracing::warn!(%error, "Opus could not conceal a frame");
+                    vec![0i16; frame]
+                }
+            },
+            _ => unreachable!("only Opus conceals itself"),
+        }
     }
+}
+
+/// Encode one frame of PCM with Opus.
+///
+/// Opus takes floats in -1.0 to 1.0 and gives back a packet whose
+/// size **it** chooses — so this is the one place in the codec where
+/// the output is not a fixed number of bytes. A frame of silence comes
+/// out as a handful of bytes and a frame of speech as a couple of
+/// hundred.
+///
+/// It is a function of its own rather than a method, because the
+/// encoder is borrowed out of the struct and the struct may not be
+/// read while that borrow lasts.
+fn encode_opus(frame: usize, encoder: &mut OpusEncoder, pcm: &[i16]) -> Vec<u8> {
+    let mut samples = Vec::with_capacity(frame);
+    for index in 0..frame {
+        let sample = pcm.get(index).copied().unwrap_or(0);
+        samples.push(sample as f32 / 32768.0);
+    }
+
+    let mut out = vec![0u8; OPUS_MAX_PACKET];
+    match encoder.encode(&samples, frame, &mut out) {
+        Ok(length) => {
+            out.truncate(length);
+            out
+        }
+        Err(error) => {
+            // The only thing that makes the encoder refuse a frame is
+            // a frame size it does not accept, and the frame size here
+            // is a constant — so this cannot happen. If it ever does,
+            // the frame is lost: the RTP clock moves on and the peer
+            // conceals the hole.
+            tracing::warn!(%error, "the Opus encoder refused a frame");
+            Vec::new()
+        }
+    }
+}
+
+/// Decode one Opus packet.
+///
+/// Two things are different from the G.711 pair, and both are the
+/// codec's own doing:
+///
+/// * Opus decodes to **floats**, so they are turned into the 16-bit
+///   samples the rest of the build uses.
+/// * The number of samples that come out is the number the *packet*
+///   carried — a peer that sends 10 ms frames gives 480 samples where
+///   960 were asked for. The frame that comes back is therefore not
+///   always the frame that was asked for, and the playout takes what
+///   it is given.
+///
+/// A peer that sends **stereo** is not a problem: `rusty-opus` decodes
+/// a stereo stream into mono the way libopus does, averaging the two
+/// channels.
+fn decode_opus(frame: usize, decoder: &mut OpusDecoder, payload: &[u8]) -> Vec<i16> {
+    let mut out = vec![0f32; frame];
+    match decoder.decode(payload, frame, &mut out) {
+        Ok(length) => floats_to_pcm(&out[..length.min(out.len())]),
+        Err(error) => {
+            tracing::warn!(%error, "an Opus packet could not be decoded");
+            // A packet that cannot be decoded is a frame that never
+            // arrived: the audio stays in step with silence rather
+            // than with nothing at all.
+            vec![0i16; frame]
+        }
+    }
+}
+
+/// Turn Opus' floats into the 16-bit samples the rest of the build
+/// uses.
+///
+/// Opus works in -1.0 to 1.0 and everything else in this build works
+/// in 16-bit integers, so the scale is 32768 — and the value is
+/// clamped, because a float of 1.0000001 would otherwise wrap round
+/// to a loud click.
+fn floats_to_pcm(samples: &[f32]) -> Vec<i16> {
+    samples
+        .iter()
+        .map(|&sample| (sample * 32768.0).round().clamp(-32768.0, 32767.0) as i16)
+        .collect()
+}
+
+/// A fresh Opus encoder, set up for speech.
+///
+/// The codec's application mode says "voice", which is what a call
+/// is: it steers the encoder towards SILK, which codes speech better
+/// than anything else at this rate. At 16 kHz it codes the speech
+/// band and leaves the rest of the telephone band alone.
+///
+/// The bitrate is 24 kbit/s. G.711 and G.722 each spend 64 kbit/s on
+/// the same speech, so this is a third of what the codecs beside it
+/// cost.
+///
+/// The in-band forward error correction is on because the SDP says it
+/// is: a copy of the last frame goes inside this one, and a peer
+/// that loses a single packet can repair it from the packet after it.
+fn opus_encoder() -> OpusEncoder {
+    let mut encoder = OpusEncoder::new(OPUS_RATE, OPUS_CHANNELS, Application::Voip)
+        .expect("16 kHz and one channel are valid Opus arguments");
+    encoder.bitrate_bps = 24_000;
+    encoder.use_inband_fec = true;
+    encoder.packet_loss_perc = 5;
+    encoder
 }
 
 /// The byte a G.722 decoder is given for a frame that never arrived.
@@ -510,12 +823,13 @@ impl Codec {
     /// Encode one 16-bit sample as G.711.
     ///
     /// G.722 has no per-sample encoding — it is ADPCM, and it needs the
-    /// state — so this is only for G.711.
+    /// state — so this is only for G.711. Opus has none either: it
+    /// codes a whole frame at a time.
     fn encode_sample(self, sample: i16) -> u8 {
         match self {
             Codec::Pcmu => to_ulaw(sample),
             Codec::Pcma => to_alaw(sample),
-            Codec::G722 => unreachable!("G.722 is encoded a frame at a time"),
+            _ => unreachable!("only G.711 is encoded a sample at a time"),
         }
     }
 
@@ -524,7 +838,7 @@ impl Codec {
         match self {
             Codec::Pcmu => from_ulaw(byte),
             Codec::Pcma => from_alaw(byte),
-            Codec::G722 => unreachable!("G.722 is decoded a frame at a time"),
+            _ => unreachable!("only G.711 is decoded a sample at a time"),
         }
     }
 }
@@ -547,15 +861,52 @@ mod tests {
         assert_eq!(Codec::Pcmu.name(), "PCMU");
         assert_eq!(Codec::Pcma.name(), "PCMA");
         assert_eq!(Codec::G722.name(), "G722");
-        assert_eq!(Codec::Pcmu.static_payload_type(), 0);
-        assert_eq!(Codec::Pcma.static_payload_type(), 8);
-        assert_eq!(Codec::G722.static_payload_type(), 9);
+        // Opus is spelled in lower case: that is how RFC 7587 §4.1
+        // spells it, and the SDP name is what a peer is matched
+        // against.
+        assert_eq!(Codec::Opus.name(), "opus");
+        assert_eq!(Codec::Pcmu.payload_type(), 0);
+        assert_eq!(Codec::Pcma.payload_type(), 8);
+        assert_eq!(Codec::G722.payload_type(), 9);
+        // Opus has no static payload type — 111 is the number every
+        // implementation settled on.
+        assert_eq!(Codec::Opus.payload_type(), 111);
         assert_eq!(Codec::Pcmu.rtp_clock_rate(), 8000);
         assert_eq!(Codec::Pcma.rtp_clock_rate(), 8000);
         // G.722 keeps the 8 kHz clock of the original recommendation.
         assert_eq!(Codec::G722.rtp_clock_rate(), 8000);
+        // Opus does not: RFC 7587 §4.1 puts it on 48 kHz.
+        assert_eq!(Codec::Opus.rtp_clock_rate(), 48000);
         assert_eq!(Codec::Pcmu.rtpmap(), "PCMU/8000");
         assert_eq!(Codec::G722.rtpmap(), "G722/8000");
+        // And the rtpmap of Opus always says two channels, whatever
+        // the stream carries.
+        assert_eq!(Codec::Opus.rtpmap(), "opus/48000/2");
+    }
+
+    #[test]
+    fn the_timestamp_step_counts_the_clock_and_not_the_audio() {
+        // G.722's audio is 16 kHz and its clock is 8 kHz, so a frame
+        // is 320 samples of audio but 160 ticks of clock.
+        assert_eq!(Codec::Pcmu.rtp_timestamp_step(), 160);
+        assert_eq!(Codec::Pcma.rtp_timestamp_step(), 160);
+        assert_eq!(Codec::G722.rtp_timestamp_step(), 160);
+        // Opus runs its clock at 48 kHz.
+        assert_eq!(Codec::Opus.rtp_timestamp_step(), 960);
+    }
+
+    #[test]
+    fn only_opus_has_parameters() {
+        // The G.711 pair has nothing to say in an `a=fmtp` line.
+        assert_eq!(Codec::Pcmu.fmtp(), None);
+        assert_eq!(Codec::Pcma.fmtp(), None);
+        assert_eq!(Codec::G722.fmtp(), None);
+        // Opus has three: the smallest frame, the in-band error
+        // correction, and the number of channels.
+        let parameters = Codec::Opus.fmtp().expect("Opus has parameters");
+        assert!(parameters.contains("minptime=10"), "{parameters}");
+        assert!(parameters.contains("useinbandfec=1"), "{parameters}");
+        assert!(parameters.contains("sprop-stereo=0"), "{parameters}");
     }
 
     #[test]
@@ -564,13 +915,18 @@ mod tests {
         assert_eq!(Codec::Pcma.sample_rate(), 8000);
         // G.722 is wideband: 16 kHz of speech.
         assert_eq!(Codec::G722.sample_rate(), 16000);
-
-        // A frame is 20 ms of audio, whatever the rate.
-        assert_eq!(Codec::Pcmu.frame_samples(), 160);
-        assert_eq!(Codec::G722.frame_samples(), 320);
-        // And the payload is 160 bytes either way.
+        // Opus is coded at 16 kHz, so its frame is 320 samples — even
+        // though its RTP clock is 48 kHz and the timestamp advances by
+        // 960.
+        assert_eq!(Codec::Opus.sample_rate(), 16000);
+        assert_eq!(Codec::Opus.frame_samples(), 320);
+        // And the payload of the two that have a fixed size is 160
+        // bytes.
         assert_eq!(Codec::Pcmu.frame_bytes(), 160);
         assert_eq!(Codec::G722.frame_bytes(), 160);
+        // Opus does not: its packets are as long as the signal needs,
+        // and this is the largest one may be.
+        assert_eq!(Codec::Opus.frame_bytes(), 1275);
     }
 
     #[test]
@@ -578,7 +934,9 @@ mod tests {
         assert_eq!(Codec::from_name("PCMA"), Some(Codec::Pcma));
         assert_eq!(Codec::from_name("pcmu"), Some(Codec::Pcmu));
         assert_eq!(Codec::from_name(" G722 "), Some(Codec::G722));
-        assert_eq!(Codec::from_name("opus"), None);
+        assert_eq!(Codec::from_name("opus"), Some(Codec::Opus));
+        assert_eq!(Codec::from_name("OPUS"), Some(Codec::Opus));
+        assert_eq!(Codec::from_name("speex"), None);
     }
 
     #[test]
@@ -592,6 +950,12 @@ mod tests {
         assert_eq!(Codec::from_payload_type(0, None), Some(Codec::Pcmu));
         assert_eq!(Codec::from_payload_type(8, None), Some(Codec::Pcma));
         assert_eq!(Codec::from_payload_type(9, None), Some(Codec::G722));
+        // Opus is carried on 111.
+        assert_eq!(Codec::from_payload_type(111, None), Some(Codec::Opus));
+        assert_eq!(
+            Codec::from_payload_type(111, Some("opus")),
+            Some(Codec::Opus)
+        );
         assert_eq!(Codec::from_payload_type(101, None), None);
     }
 
@@ -846,6 +1210,137 @@ mod tests {
         assert_eq!(decoded.len(), 320);
         for sample in decoded {
             assert!(sample.abs() < 64, "silence decoded to {sample}");
+        }
+    }
+
+    /// A second of a 500 Hz tone at 16 kHz — the rate Opus is coded at.
+    fn opus_tone() -> Vec<i16> {
+        let rate = 16000.0f32;
+        (0..rate as i32)
+            .map(|i| {
+                let t = i as f32 / rate;
+                (12_000.0 * (2.0 * std::f64::consts::PI * 500.0 * t as f64).sin()) as i16
+            })
+            .collect()
+    }
+
+    #[test]
+    fn opus_a_frame_round_trips() {
+        // 320 samples of 16 kHz audio in — 20 ms of it — one Opus packet
+        // out, and 320 samples back.
+        let pcm = opus_tone();
+        let mut encoder = Codec::Opus.encoder();
+        let mut decoder = Codec::Opus.decoder();
+
+        let encoded = encoder.encode(&pcm[..320]);
+        assert!(
+            !encoded.is_empty(),
+            "the Opus encoder produced nothing at all"
+        );
+        assert!(
+            encoded.len() <= OPUS_MAX_PACKET,
+            "the Opus packet is longer than the codec allows: {}",
+            encoded.len()
+        );
+
+        let decoded = decoder.decode(&encoded);
+        assert_eq!(decoded.len(), 320);
+    }
+
+    #[test]
+    fn opus_keeps_the_speech_it_was_given() {
+        // The codec is lossy, but it has to be *a* tone and not noise.
+        //
+        // The comparison is made over the whole signal and not frame by
+        // frame, and it is made at the codec's own delay: the codec
+        // hands the signal back about a millisecond and a half ahead
+        // of where it went in — the resampler inside it runs on a
+        // different grid — and a comparison at the wrong offset would
+        // measure the phase and not the codec. So the offset is looked
+        // for, and the best one is taken.
+        let pcm = opus_tone();
+        let mut encoder = Codec::Opus.encoder();
+        let mut decoder = Codec::Opus.decoder();
+
+        let mut decoded = Vec::new();
+        for chunk in pcm.chunks(320) {
+            let encoded = encoder.encode(chunk);
+            decoded.extend(decoder.decode(&encoded));
+        }
+        assert_eq!(decoded.len(), pcm.len());
+
+        let mut best = (0usize, f64::NEG_INFINITY);
+        for lead in 0..64usize {
+            let mut signal = 0f64;
+            let mut noise = 0f64;
+            for (before, after) in pcm[lead..].iter().zip(decoded.iter()) {
+                let before = *before as f64;
+                let after = *after as f64;
+                signal += before * before;
+                noise += (before - after) * (before - after);
+            }
+            let snr = 10.0 * (signal / noise).log10();
+            if snr > best.1 {
+                best = (lead, snr);
+            }
+        }
+
+        assert!(
+            best.1 > 15.0,
+            "the round trip is too lossy: {:.1} dB",
+            best.1
+        );
+    }
+
+    #[test]
+    fn opus_silence_is_silent_and_short() {
+        // Opus codes silence in a handful of bytes — that is what a
+        // codec that sizes its packets by the signal can do, and it is
+        // the reason the RTP layer cannot assume 160 bytes any more.
+        let mut encoder = Codec::Opus.encoder();
+        let mut decoder = Codec::Opus.decoder();
+
+        let frame = encoder.encode_silence();
+        assert!(
+            frame.len() < 40,
+            "silence took {} bytes — the codec is not doing its job",
+            frame.len()
+        );
+
+        let decoded = decoder.decode(&frame);
+        assert_eq!(decoded.len(), 320);
+        for sample in decoded {
+            assert!(sample.saturating_abs() < 512, "silence decoded to {sample}");
+        }
+    }
+
+    #[test]
+    fn opus_the_packet_is_not_a_fixed_size() {
+        // The whole point of Opus: a frame of speech is much longer
+        // than a frame of silence.
+        let pcm = opus_tone();
+        let mut encoder = Codec::Opus.encoder();
+        let silence = encoder.encode_silence();
+        let speech = encoder.encode(&pcm[..320]);
+        assert!(
+            speech.len() > silence.len(),
+            "speech took {} bytes and silence {} — the sizes are the same",
+            speech.len(),
+            silence.len()
+        );
+    }
+    #[test]
+    fn opus_a_lost_frame_is_concealed() {
+        // Opus conceals a lost frame itself: an empty packet is the
+        // signal that the frame never arrived.
+        let mut decoder = Codec::Opus.decoder();
+        let concealed = decoder.conceal();
+        assert_eq!(concealed.len(), 320);
+        for sample in concealed {
+            assert!(
+                sample.saturating_abs() < 512,
+                "the concealment was {sample}"
+            );
         }
     }
 

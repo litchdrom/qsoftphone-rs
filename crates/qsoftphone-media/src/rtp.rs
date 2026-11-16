@@ -22,10 +22,13 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use rtc::rtp::Packet;
-use rtc::rtp::codec::g7xx::G711Payloader;
+use rtc::rtp::codec::g7xx::G7xxPayloader;
+use rtc::rtp::codec::opus::OpusPayloader;
 use rtc::rtp::packetizer::{Packetizer, new_packetizer};
 use rtc::rtp::sequence::new_random_sequencer;
 use rtc::shared::marshal::{Marshal, Unmarshal};
+
+use crate::codec::Codec;
 
 /// The size of an RTP header without any extension.
 pub const HEADER_LEN: usize = 12;
@@ -36,7 +39,9 @@ pub const FRAME_SAMPLES: usize = 160;
 /// The MTU: the header plus one whole frame.
 ///
 /// G.711 never fragments — a frame is at most 160 bytes — so this is
-/// also the size of every packet we send.
+/// also the size of every packet we send. Opus does not have a fixed
+/// frame size, and its packets are allowed to be 1275 bytes long, so
+/// its MTU is bigger; see [`RtpSender::new`].
 pub const MTU: usize = HEADER_LEN + FRAME_SAMPLES;
 
 /// A bound RTP socket.
@@ -79,7 +84,7 @@ impl RtpSocket {
     }
 }
 
-/// The outbound half of the session: G.711 frames into RTP packets.
+/// The outbound half of the session: encoded frames into RTP packets.
 pub struct RtpSender {
     socket: Arc<UdpSocket>,
     packetizer: Box<dyn Packetizer>,
@@ -99,22 +104,50 @@ pub struct RtpSender {
     /// frame after a silence starts a talkspurt, and that is where the
     /// marker belongs.
     silent: bool,
+    /// The number of RTP clock ticks in one frame.
+    ///
+    /// The clock counts samples of the *clock*, not of the audio, and
+    /// the two are not the same for every codec: G.722's audio is
+    /// 16 kHz and its clock is 8 kHz, so a frame is 320 samples of
+    /// audio but 160 ticks of clock. Opus runs its clock at 48 kHz, so
+    /// a frame is 960 ticks.
+    timestamp_step: u32,
 }
 
 impl RtpSender {
-    /// A sender for a stream with the given payload type.
-    pub fn new(socket: Arc<UdpSocket>, payload_type: u8, ssrc: u32) -> Self {
+    /// A sender for a stream with the given codec.
+    ///
+    /// The codec decides three things, and all three used to be
+    /// constants:
+    ///
+    /// * the **payloader** — G.711 and G.722 frames are 160 bytes and
+    ///   are never fragmented; an Opus packet is as long as the signal
+    ///   needs and is never fragmented either, but it is *not* 160
+    ///   bytes;
+    /// * the **clock rate** — 8 kHz for the G.711 pair (G.722
+    ///   included, RFC 3551 §4.5.2) and 48 kHz for Opus;
+    /// * the **MTU** — 172 bytes for the G.711 pair and 1287 for Opus,
+    ///   whose packets may be 1275 bytes long (RFC 6716 §4.3).
+    pub fn new(socket: Arc<UdpSocket>, codec: Codec, payload_type: u8, ssrc: u32) -> Self {
+        let payloader: Box<dyn rtc::rtp::packetizer::Payloader> = match codec {
+            // `OpusPayloader` puts one whole Opus frame in one packet
+            // and never fragments it: RFC 7587 §4.2 says a packet
+            // carries one frame and one frame only.
+            Codec::Opus => Box::new(OpusPayloader),
+            // `G7xxPayloader` is the G.711/G.722 payloader — one
+            // payloader for both, and neither of them is ever
+            // fragmented.
+            _ => Box::new(G7xxPayloader),
+        };
+
         let packetizer = new_packetizer(
             Instant::now(),
-            MTU,
+            HEADER_LEN + codec.frame_bytes(),
             payload_type,
             ssrc,
-            // `G711Payloader` is a type alias for the G.711/G.722
-            // payloader. It is a unit struct, so it is built with
-            // `default()` rather than as a value.
-            Box::new(G711Payloader::default()),
+            payloader,
             Box::new(new_random_sequencer()),
-            8000,
+            codec.rtp_clock_rate(),
         );
         Self {
             socket,
@@ -123,6 +156,7 @@ impl RtpSender {
             ssrc,
             sent: false,
             silent: false,
+            timestamp_step: codec.rtp_timestamp_step(),
         }
     }
 
@@ -140,10 +174,11 @@ impl RtpSender {
         self.ssrc
     }
 
-    /// Send one G.711 frame.
+    /// Send one encoded frame.
     ///
-    /// A frame is 160 bytes — 20 ms at 8 kHz. The packetizer turns it
-    /// into exactly one packet, with the sequence number and the
+    /// A G.711 frame is 160 bytes — 20 ms at 8 kHz — and an Opus
+    /// packet is however long the codec made it. The packetizer turns
+    /// it into exactly one packet, with the sequence number and the
     /// timestamp advanced.
     ///
     /// `silent` says whether the frame is silence, and the **marker
@@ -182,7 +217,7 @@ impl RtpSender {
             .packetize(
                 Instant::now(),
                 &Bytes::copy_from_slice(frame),
-                FRAME_SAMPLES as u32,
+                self.timestamp_step,
             )
             .map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -283,13 +318,64 @@ mod tests {
     }
 
     #[test]
+    fn an_opus_packet_is_one_packet_of_the_size_the_codec_chose() {
+        // Opus is the codec whose frames are not all the same length,
+        // and the RTP layer has to carry them as they are: one packet,
+        // no padding, no fragmentation (RFC 7587 §4.2).
+        let socket = RtpSocket::bind().expect("bind");
+        let shared = socket.shared();
+        let peer = UdpSocket::bind(("127.0.0.1", 0)).expect("bind peer");
+        let peer_address = peer.local_addr().expect("peer address");
+
+        let mut sender = RtpSender::new(shared, Codec::Opus, 111, 0xABCDEF);
+        sender.set_remote(peer_address);
+
+        // A frame of speech and a frame of silence: the two are not
+        // the same size, and the packets are not either.
+        let mut encoder = crate::codec::Codec::Opus.encoder();
+        let speech = encoder.encode(&vec![1_000i16; 320]);
+        let silence = encoder.encode_silence();
+        assert_ne!(
+            speech.len(),
+            silence.len(),
+            "the two frames came out the same size — the codec is not sizing them"
+        );
+
+        let mut buffer = [0u8; 1500];
+        let mut payloads = Vec::new();
+        let mut timestamps = Vec::new();
+        for frame in [&speech, &silence] {
+            sender.send_frame(frame, false).expect("send");
+            peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("timeout");
+            let (length, _) = peer.recv_from(&mut buffer).expect("receive");
+            let mut cursor = Bytes::copy_from_slice(&buffer[..length]);
+            let packet = Packet::unmarshal(&mut cursor).expect("unmarshal");
+            assert_eq!(packet.header.payload_type, 111);
+            payloads.push(packet.payload.len());
+            timestamps.push(packet.header.timestamp);
+        }
+
+        assert_eq!(payloads[0], speech.len(), "the packet was not the frame");
+        assert_eq!(payloads[1], silence.len(), "the packet was not the frame");
+        // And the clock moved by 960 — 20 ms of the 48 kHz clock that
+        // RFC 7587 §4.1 fixes for Opus, and not by the 320 samples the
+        // codec was fed.
+        assert_eq!(
+            timestamps[1],
+            timestamps[0].wrapping_add(960),
+            "the Opus timestamp did not advance by 960"
+        );
+    }
+
+    #[test]
     fn a_frame_becomes_one_packet() {
         let socket = RtpSocket::bind().expect("bind");
         let shared = socket.shared();
         let peer = UdpSocket::bind(("127.0.0.1", 0)).expect("bind peer");
         let peer_address = peer.local_addr().expect("peer address");
 
-        let mut sender = RtpSender::new(shared, 8, 0xDEAD_BEEF);
+        let mut sender = RtpSender::new(shared, Codec::Pcma, 8, 0xDEAD_BEEF);
         sender.set_remote(peer_address);
 
         let frame = vec![0xD5u8; FRAME_SAMPLES];
@@ -317,7 +403,7 @@ mod tests {
         let peer = UdpSocket::bind(("127.0.0.1", 0)).expect("bind peer");
         let peer_address = peer.local_addr().expect("peer address");
 
-        let mut sender = RtpSender::new(shared, 0, 1);
+        let mut sender = RtpSender::new(shared, Codec::Pcmu, 0, 1);
         sender.set_remote(peer_address);
 
         let mut buffer = [0u8; 1500];
@@ -346,7 +432,7 @@ mod tests {
     #[test]
     fn nothing_is_sent_before_the_peer_is_known() {
         let socket = RtpSocket::bind().expect("bind");
-        let mut sender = RtpSender::new(socket.shared(), 0, 1);
+        let mut sender = RtpSender::new(socket.shared(), Codec::Pcmu, 0, 1);
         // No remote set: the frame goes nowhere, and nothing fails.
         sender
             .send_frame(&[0u8; FRAME_SAMPLES], false)
@@ -363,7 +449,7 @@ mod tests {
         let peer = UdpSocket::bind(("127.0.0.1", 0)).expect("bind peer");
         let peer_address = peer.local_addr().expect("peer address");
 
-        let mut sender = RtpSender::new(shared, 8, 0x0BADF00D);
+        let mut sender = RtpSender::new(shared, Codec::Pcma, 8, 0x0BADF00D);
         sender.set_remote(peer_address);
 
         let mut buffer = [0u8; 1500];
@@ -432,7 +518,7 @@ mod tests {
         // The peer answers us: it sends a packet to the port we are
         // listening on.
         let peer = UdpSocket::bind(("127.0.0.1", 0)).expect("bind peer");
-        let mut sender = RtpSender::new(shared.clone(), 8, 7);
+        let mut sender = RtpSender::new(shared.clone(), Codec::Pcma, 8, 7);
         sender.set_remote(loopback(socket.port()));
         sender
             .send_frame(&[0xD5u8; FRAME_SAMPLES], false)
