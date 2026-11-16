@@ -25,10 +25,10 @@ does **not** touch the pitch to chase the peer's clock, which is what
 made it wobble. The sound card's callback no longer takes a lock, and
 unregistering in the middle of a call ends the call and closes the
 device instead of leaving it to the next one. Every call now says what
-its media did. The history is a **table** — `dir | Number | Duration |
-Time | code | status`, with the legend above it — and its timestamps
-carry the seconds, so a call that lasted twenty seconds no longer reads
-as if it started and ended at the same instant. The status line goes
+its media did. The history is a **table** — `dir | Number | Account |
+Duration | Time | code | status`, with the legend above it — and its
+timestamps carry the seconds, so a call that lasted twenty seconds no
+longer reads as if it started and ended at the same instant. The status line goes
 back to "Ready." when the call is over. The dialpad is in the **middle**
 of the call page, and it does both jobs: it dials the number when the app
 is idle and it sends the DTMF tones during a call. And a call with **no
@@ -2467,8 +2467,8 @@ So this build now does the same:
 * the table is drawn by hand, with the cells placed at rects the code
   computes — not at rects egui sizes by their contents;
 * the columns have **fixed widths** (`COL_DIR`, `COL_NUMBER`,
-  `COL_DURATION`, `COL_TIME`, `COL_CODE`, `COL_STATUS`), so a long URI
-  cannot widen the table;
+  `COL_ACCOUNT`, `COL_DURATION`, `COL_TIME`, `COL_CODE`, `COL_STATUS`), so
+  a long URI cannot widen the table;
 * the details are drawn **inside the row loop**, under the row they
   belong to.
 
@@ -2482,6 +2482,9 @@ at 1920 points wide:
 
 The number in the row is at 270, exactly under the "Number" header — not
 at 259, which is where the content-sized cell put it before.
+
+(That measurement is of M4.10's table. [M6.15](#m615--the-history-says-which-account-the-call-was-on)
+put an **Account** column between "Number" and "Duration".)
 
 ### The second bug: the table was wider than the window
 
@@ -5374,6 +5377,80 @@ unchanged — 593 entries, 318 package names for Windows.
 
 ---
 
+## M6.15 — The history says which account the call was on
+
+*"Also used account should be presented in the history."*
+
+### The column
+
+The history table had no account column, and it needed one: **two accounts
+of the same person are two accounts**, and a call the user cannot place is
+a call they cannot account for. Which extension rang is half the story of
+a call; the other half is whose line it came in on.
+
+```
+dir  Number    Account   Duration  Time   code  status
+ ←   6661      Office    0:42      03:12  200   OK
+ →   6666      Home      —         04:01  486   Busy
+```
+
+The account is named the way the accounts list names it — the label, or
+the extension when there is no label — and it sits right after the number,
+because the number and the account are the two things a row is about.
+
+### An account that is gone
+
+The user removes an account, and the calls that were on it are still in
+the history. A dash is the truth there: the call is still in the history
+and the account it was on is not there to be named.
+
+### The details say it too
+
+The expanded row carries the account as well, under the URI and the
+dialled number:
+
+```
+6661 — 16 Nov 2026, 03:12:41
+URI: sip:6661@193.178.169.164
+Dialled: 104
+Account: Office
+Started: 16 Nov 2026, 03:12:41
+Ended: 16 Nov 2026, 03:13:23
+```
+
+### The data was already there
+
+The `calls` table has had an `account_id` column since M3 — it is the
+account's UUID, and the C++ keeps pjsip's integer account id in the same
+place. Nothing was stored wrongly and nothing had to be migrated: the
+history only had to **show** what it already had.
+
+The name is resolved against the accounts the app has, at the moment the
+row is drawn. A record whose account is not among them is a dash.
+
+### What is proved
+
+* **The table has an Account column**, and it is next to the number.
+* **The row names the account it was on**, in that column — the test
+  checks the *place* as well as the name, because the name is in the
+  accounts list too.
+* **An account that is gone is a dash**, and the details say so.
+
+### The dependency cost: nothing
+
+No new package, and nothing new in the storage: the column that holds the
+account was there since M3.
+
+### What is *not* in M6.15
+
+* **The history is not filtered by account.** The account is said, not
+  offered as a filter — the search box and the direction chips are the
+  filters there are.
+* **The old rows are not renamed.** A call from before the accounts had
+  names is a call with an id in it, and the id is not a name.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -5434,6 +5511,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.12** | Opus: the codec itself (`rusty-opus`, one package and no dependencies of its own), the offer that names it on 111 with `opus/48000/2` and the parameters of RFC 7587 §7, an RTP layer that carries packets of whatever size the codec chose, and a 48 kHz clock whose timestamp advances by 960 | **done** |
 | **M6.13** | The account's status: a button per account that says **Ready**, **Online** or **Pause** and lets the user pick another one, and the account's **action** — dial a code (DTMF if a call is up, a call if there is not), run a script, run an HTTP query, or name a plugin that is not there yet | **done** |
 | **M6.14** | The statuses are the user's: a **global** list in the main settings with a status of their own added inline, a **colour** and a **hook** on each of them, the hook on the **status** rather than on the account, the status picked in the **accounts list**, and an HTTP hook with a **method** and a **body** | **done** |
+| **M6.15** | The history says which **account** the call was on: a column in the history table, and the account in the details of the row | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -5497,7 +5575,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 576 tests, all passing.
+* `cargo test --workspace` — 578 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and

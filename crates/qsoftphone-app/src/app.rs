@@ -1488,6 +1488,23 @@ impl QSoftphoneApp {
             .unwrap_or_else(|| self.config.default_status())
     }
 
+    /// The name of the account with this id.
+    ///
+    /// The history says which account a call was on, because two
+    /// accounts of the same person are two accounts, and a call the
+    /// user cannot place is a call they cannot account for.
+    ///
+    /// An account that is gone — the user removed it — is a dash: the
+    /// call is still in the history, and the account it was on is not
+    /// there to be named.
+    fn account_name_of(&self, account_id: &str) -> String {
+        self.accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .map(account_name)
+            .unwrap_or_else(|| "—".to_string())
+    }
+
     /// Add a status of the user's own.
     ///
     /// It starts with no name and an id that says nothing: the id is
@@ -3538,6 +3555,7 @@ impl QSoftphoneApp {
             let wanted = [
                 COL_DIR,
                 COL_NUMBER,
+                COL_ACCOUNT,
                 COL_DURATION,
                 COL_TIME,
                 COL_CODE,
@@ -3558,6 +3576,7 @@ impl QSoftphoneApp {
                 wanted[3] * scale,
                 wanted[4] * scale,
                 wanted[5] * scale,
+                wanted[6] * scale,
             ];
 
             let gap = COL_GAP;
@@ -3565,10 +3584,11 @@ impl QSoftphoneApp {
             for (title, width) in [
                 ("dir", widths[0]),
                 ("Number", widths[1]),
-                ("Duration", widths[2]),
-                ("Time", widths[3]),
-                ("code", widths[4]),
-                ("status", widths[5]),
+                ("Account", widths[2]),
+                ("Duration", widths[3]),
+                ("Time", widths[4]),
+                ("code", widths[5]),
+                ("status", widths[6]),
             ] {
                 let rect = egui::Rect::from_min_size(
                     egui::pos2(x, origin.y),
@@ -3643,12 +3663,34 @@ impl QSoftphoneApp {
                     });
                 });
 
-                // How long it lasted.
+                // Which account the call was on.
+                //
+                // Two accounts of the same person are two accounts, and
+                // a call the user cannot place is a call they cannot
+                // account for: the history says which one it was.
                 let rect = egui::Rect::from_min_size(
                     egui::pos2(x, origin.y),
                     egui::vec2(widths[2], height),
                 );
                 x += widths[2] + gap;
+                let account = self.account_name_of(&record.account_id);
+                table_cell(ui, rect, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&account)
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        )
+                        .truncate(),
+                    );
+                });
+
+                // How long it lasted.
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(x, origin.y),
+                    egui::vec2(widths[3], height),
+                );
+                x += widths[3] + gap;
                 table_cell(ui, rect, |ui| {
                     ui.label(
                         egui::RichText::new(format_duration(record.duration_sec))
@@ -3660,9 +3702,9 @@ impl QSoftphoneApp {
                 // When it happened.
                 let rect = egui::Rect::from_min_size(
                     egui::pos2(x, origin.y),
-                    egui::vec2(widths[3], height),
+                    egui::vec2(widths[4], height),
                 );
-                x += widths[3] + gap;
+                x += widths[4] + gap;
                 table_cell(ui, rect, |ui| {
                     ui.label(
                         egui::RichText::new(clock.time(record.started_at))
@@ -3674,9 +3716,9 @@ impl QSoftphoneApp {
                 // The SIP status code.
                 let rect = egui::Rect::from_min_size(
                     egui::pos2(x, origin.y),
-                    egui::vec2(widths[4], height),
+                    egui::vec2(widths[5], height),
                 );
-                x += widths[4] + gap;
+                x += widths[5] + gap;
                 table_cell(ui, rect, |ui| {
                     if record.sip_code != 0 {
                         ui.label(
@@ -3692,9 +3734,9 @@ impl QSoftphoneApp {
                 // And how it ended.
                 let rect = egui::Rect::from_min_size(
                     egui::pos2(x, origin.y),
-                    egui::vec2(widths[5], height),
+                    egui::vec2(widths[6], height),
                 );
-                x += widths[5] + gap;
+                x += widths[6] + gap;
                 table_cell(ui, rect, |ui| {
                     ui.label(
                         egui::RichText::new(result.label())
@@ -3765,6 +3807,9 @@ impl QSoftphoneApp {
                                 egui::RichText::new(format!("Dialled: {}", record.dialed_number))
                                     .small(),
                             );
+                        }
+                        if !record.account_id.is_empty() {
+                            ui.label(egui::RichText::new(format!("Account: {account}")).small());
                         }
                         ui.label(
                             egui::RichText::new(format!(
@@ -5443,6 +5488,7 @@ fn echo_report_text(report: &qsoftphone_media::EchoReport) -> String {
 /// details go **under the row they belong to**.
 const COL_DIR: f32 = 24.0;
 const COL_NUMBER: f32 = 100.0;
+const COL_ACCOUNT: f32 = 76.0;
 const COL_DURATION: f32 = 68.0;
 const COL_TIME: f32 = 60.0;
 const COL_CODE: f32 = 44.0;
@@ -6017,6 +6063,32 @@ mod tests {
                 egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
             ))
         })
+    }
+
+    /// Every rectangle a piece of text is on.
+    ///
+    /// A word can be in two places at once — the name of an account is
+    /// in the accounts list and in the history row — and a test that
+    /// wants the one in the history has to be able to tell them apart.
+    fn texts_at(output: &egui::FullOutput, text: &str) -> Vec<egui::Rect> {
+        let Some(update) = output.platform_output.accesskit_update.as_ref() else {
+            return Vec::new();
+        };
+        update
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| {
+                let found = node.value() == Some(text) || node.label() == Some(text);
+                if !found {
+                    return None;
+                }
+                let bounds = node.bounds()?;
+                Some(egui::Rect::from_min_max(
+                    egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                    egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
+                ))
+            })
+            .collect()
     }
 
     /// Where a piece of text that **begins with** this is on the page.
@@ -7634,7 +7706,9 @@ mod tests {
         let output = frame(&mut app, &ctx);
 
         let mut headers = Vec::new();
-        for title in ["dir", "Number", "Duration", "Time", "code", "status"] {
+        for title in [
+            "dir", "Number", "Account", "Duration", "Time", "code", "status",
+        ] {
             let rect = text_at(&output, title)
                 .unwrap_or_else(|| panic!("the table has no {title:?} column"));
             headers.push(rect);
@@ -7655,7 +7729,7 @@ mod tests {
         }
 
         // And the row is under the header, in the column it belongs
-        // to: the number is between "dir" and "Duration", and below
+        // to: the number is between "dir" and "Account", and below
         // the header.
         let number = text_at(&output, "6661").expect("the row has no number");
         assert!(
@@ -7665,6 +7739,99 @@ mod tests {
         assert!(
             number.min.x >= headers[1].min.x && number.max.x <= headers[2].min.x,
             "the number is not in the Number column: {number:?}"
+        );
+    }
+
+    /// The history says which account the call was on.
+    ///
+    /// Two accounts of the same person are two accounts, and a call
+    /// the user cannot place is a call they cannot account for.
+    #[tokio::test]
+    async fn the_history_says_which_account_the_call_was_on() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        let mut record = CallRecord::from_incoming(
+            "acct-ui-1",
+            "call-in",
+            "sip:6661@sip.example.com",
+            "104",
+            "",
+            1_000,
+            2_000,
+            200,
+            "Normal",
+            true,
+        );
+        record.id = 1;
+        app.history_rows = vec![record];
+        app.view = View::History;
+
+        let output = frame(&mut app, &ctx);
+
+        // The column is there, and it is next to the number.
+        //
+        // "Account" is on the page twice — the page switcher has one
+        // and the table has one — so the column is the one that is on
+        // the header row with the number.
+        let number = text_at(&output, "Number").expect("the table has no Number column");
+        let account = texts_at(&output, "Account")
+            .into_iter()
+            .find(|rect| (rect.min.y - number.min.y).abs() < 2.0)
+            .expect("the table has no Account column");
+        assert!(
+            account.min.x > number.min.x,
+            "the Account column is not after the Number column: {account:?} against {number:?}"
+        );
+
+        // And the row names the account in it.
+        //
+        // The name is in the accounts list too, so it is the **place**
+        // that is checked: the cell has to be in the Account column,
+        // and not in the panel on the left.
+        let cells = texts_at(&output, "Office");
+        assert!(
+            cells.iter().any(|cell| {
+                cell.min.x >= account.min.x - 2.0 && cell.max.x <= account.max.x + 2.0
+            }),
+            "the row does not name the account in the Account column: {cells:?} against {account:?}"
+        );
+    }
+
+    /// A call of an account that is gone says so.
+    ///
+    /// The user removed the account, and the call is still in the
+    /// history: a dash is the truth, and a name that is not there
+    /// any more would not be.
+    #[tokio::test]
+    async fn a_call_of_an_account_that_is_gone_says_so() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        let mut record = CallRecord::from_incoming(
+            "acct-gone",
+            "call-in",
+            "sip:6661@sip.example.com",
+            "104",
+            "",
+            1_000,
+            2_000,
+            200,
+            "Normal",
+            true,
+        );
+        record.id = 1;
+        app.history_rows = vec![record];
+        app.history_expanded = Some(1);
+        app.view = View::History;
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Account: —"),
+            "the details do not say that the account is gone:\n{text}"
         );
     }
 
@@ -7871,7 +8038,9 @@ mod tests {
         app.view = View::History;
         let output = frame(&mut app, &ctx);
 
-        for title in ["dir", "Number", "Duration", "Time", "code", "status"] {
+        for title in [
+            "dir", "Number", "Account", "Duration", "Time", "code", "status",
+        ] {
             assert!(
                 text_at(&output, title).is_some(),
                 "the empty table has no {title:?} column"
