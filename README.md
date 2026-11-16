@@ -154,6 +154,7 @@ qsoftphone-rs/
     └── qsoftphone-app/            the binary
         ├── main.rs                startup order, --smoke
         ├── app.rs                 the egui shell
+        ├── action.rs              what a status change does: a script, a query
         ├── history.rs             the call history, read on the runtime
         └── picker.rs              the native file dialog, on a thread of its own
 ```
@@ -177,6 +178,7 @@ Pinned in the workspace `Cargo.toml`, locked in `Cargo.lock`.
 | `cpal` | 0.18.2 | microphone capture and speaker playback |
 | `nanoaudio-g722` | 0.1.1 | the G.722 wideband codec |
 | `rusty-opus` | 1.1.1 | the Opus codec (M6.12) — pure Rust, no dependencies of its own |
+| `ureq` | 3.5.2 | the HTTP client for the account's status action (M6.13) |
 | `egui` / `eframe` | 0.37.0 | the UI (default wgpu backend) |
 | `rusqlite` | 0.41 | storage, `bundled` — SQLite is compiled in |
 | `tokio` | 1.54.1 | the async runtime the SIP stack runs on |
@@ -188,9 +190,9 @@ Pinned in the workspace `Cargo.toml`, locked in `Cargo.lock`.
 The brief asks for a resolved tree under ~250 crates, assuming
 rsipstack would be the bulk at 134.
 
-**Measured, the real number is 312 package names** for the Windows target
-(392 for Linux, which adds X11/Wayland/ALSA). Four of those are this
-workspace's own crates, so 308 and 388 are third-party packages. The gap
+**Measured, the real number is 318 package names** for the Windows target
+(398 for Linux, which adds X11/Wayland/ALSA). Four of those are this
+workspace's own crates, so 314 and 394 are third-party packages. The gap
 is not bloat — it is two subtrees the brief's estimate did not account
 for:
 
@@ -275,6 +277,20 @@ The alternatives were looked at before this one was chosen:
 
 `rusty-opus` 1.1.1 declares `rust-version = "1.85"`, which is exactly
 this workspace's floor, so it raises nothing.
+
+**M6.13 added six packages: `ureq`, the HTTP client.**
+The lock file grew by exactly six entries — 587 → 593 — and the
+per-target tree by six package names: Windows 312 → 318, Linux 392 →
+398. The six are `ureq` itself, `ureq-proto`, `http`, `httparse`,
+`utf8-zero` and `webpki-roots`.
+
+The TLS underneath is `rustls`, which was **already in the tree** for
+rsipstack — so what is new is the client and the root certificates it
+trusts, and not a second TLS stack. The client is pure Rust, blocking
+and small, and it is blocking on purpose: the action runs on a thread
+of its own, so nothing waits for it, and a blocking client is simpler
+than an async one. It declares `rust-version = "1.85"`, which is this
+workspace's floor.
 
 **The version is 0.17 and not 0.18, on purpose.** `rfd` 0.18
 (published 2026-11-07) declares `rust-version = "1.92"`. Taking it
@@ -370,6 +386,12 @@ Deliberate differences from the C++:
   of the parameter are the tagged form (§5.6's example is kept in the
   core and tested, but a PBX matches a dialog by all three of its
   identifiers — see [M5](#m5--transfer)).
+* **The account's status button is new.** The C++ has no "Ready /
+  Online / Pause" per account and no script runner; the whole feature
+  was asked for in M6.13, and the C++'s own seam for it is §3's
+  (`CallEvent` JSON and `AccountProfile.crm_preset_id`) — which is why
+  the plugin kind is stored and reported as not-yet rather than
+  pretended at.
 
 ### One conflict in the brief, resolved in favour of the C++
 
@@ -4993,6 +5015,161 @@ is told the same rate, so the two ends agree on what a frame is.
 
 ---
 
+## M6.13 — The button that says whether the account is ready
+
+*"Softphone should have call_enter button with select Ready Online Pause with per acoount selection and additional settings: 1) dial some code 2) run a script (screen capture for example) 3) run some http query 4) plugin selected (bitrix creatio and so on in the future)"*
+
+### The button
+
+Every account has a **status**, and the status is one of three words:
+
+| Status | What it means |
+|---|---|
+| **Ready** | the extension is free and takes calls |
+| **Online** | the extension is on the line |
+| **Pause** | the extension is not taking calls |
+
+The status is the **account's own**: it is stored with the account, and
+two accounts on the same server can be in different states — that is
+the ordinary case, not an exception.
+
+The button is in the account's **title** on the account page, and it
+says what the status is and lets the user pick another one. It is in
+the title and not in the body because the body folds away: a status
+that is only visible when the group is open is a status nobody can
+see. The left panel shows the same state as a **lamp** next to every
+account, so all of them can be read at a glance.
+
+```
+1  ● Office                    ● Ready
+```
+
+### The action
+
+The status is a switch, and the **action** is what the switch is wired
+to. Each account has one, and it is set in the **STATUS** group of the
+account's editor:
+
+| Kind | What happens when the status is set |
+|---|---|
+| **Dial a code** | the code is sent as **DTMF** if a call is up on the account, and **called** if there is none |
+| **Run a script** | the command runs, as it would be typed in a console |
+| **Run an HTTP query** | the URL is fetched with `GET` |
+| **Use a plugin** | nothing yet — §8 of the brief puts the plugin host out of scope |
+
+The point of the action is that the **state lives outside the
+softphone**. A user who is ready tells the PBX so with a feature code
+(`*51`), and a user who is online tells a CRM so with an HTTP query.
+The softphone's own button is the switch, and the action is the wire
+from it to the thing that actually keeps the state.
+
+### The code: DTMF if a call is up, a call if there is not
+
+The code is the one that has to work in both places, because the user
+does not know which of the two they are in when they press the button:
+
+* a call **is up** on the account — the code goes out as DTMF on that
+  call, digit by digit, and the peer hears it;
+* there is **no call** up — the code is called, on that account.
+
+### The script and the query do not wait for the interface
+
+A script that takes ten seconds and a server that does not answer are
+both things the user must not be kept waiting for, and §3 of the brief
+says the interface thread never waits for anything. So both run on a
+thread of their own, and what they say arrives on a channel and is
+read at the top of the frame:
+
+```
+Office: the command ran.
+Office: the query answered 200.
+```
+
+The script goes through the system's own shell — `cmd /C` on Windows,
+`sh -c` elsewhere — so that a path with a space in it, a redirect or a
+pipeline works the way it does in a console. A screen capture is
+usually a command with arguments and a path in it, and splitting those
+by hand would be a worse parser than the one the user already has.
+
+### The plugin is stored, and says it is not there yet
+
+The kind is there, the name is stored, and the button says what it
+says:
+
+```
+The plugin bitrix is not there yet — the plugin host is out of scope.
+```
+
+§8 of the brief puts the plugin host out of scope, and the C++'s
+plugin seam is §3's (`CallEvent` JSON and
+`AccountProfile.crm_preset_id`). A plugin that pretends to work is
+worse than one that says it is not there yet — so this is what it
+does.
+
+### Where it is stored
+
+Two columns in the `accounts` table:
+
+| Column | What it holds |
+|---|---|
+| `status` | `ready`, `online` or `pause` |
+| `status_action` | the action, as JSON — a kind and a value |
+
+An account that is already in the table gets `ready` when the schema
+is brought up to date: that is the state a phone is in when nobody has
+said otherwise. An action that cannot be read is a warning and not a
+failure — an account whose status is lost is a phone that is "Ready"
+when the user has it "Paused".
+
+### What is proved
+
+* **The status is the account's own, and it is stored.** Setting it
+  saves it, and it comes back out of the store.
+* **The button says the status.** The account page carries the button,
+  and it says "Online" when the account is online.
+* **The action is saved with the account.** The editor's form holds the
+  kind and the value, and the value survives the round trip.
+* **The code is dialled when there is no call up**, and it is the
+  account's own code that is dialled.
+* **A script runs, and says what it did** — on a thread of its own,
+  with the report coming back on the channel.
+* **A plugin says it is not there yet**, rather than pretending.
+
+### The dependency cost: six packages
+
+`ureq` is the HTTP client, and it is the only new dependency:
+
+| Package | Why it is there |
+|---|---|
+| `ureq` | the client itself |
+| `ureq-proto` | its protocol layer |
+| `http` | the HTTP types |
+| `httparse` | the parser |
+| `utf8-zero` | a zero-copy string helper it uses |
+| `webpki-roots` | the root certificates for TLS |
+
+The lock file grew by exactly those six — 587 → 593 entries — and the
+per-target tree by six package names: Windows 312 → 318, Linux 392 →
+398. The TLS is `rustls`, which was **already in the tree** for
+rsipstack, so what is new is the client and the root certificates.
+
+`ureq` is pure Rust, blocking, and small — and it is blocking on
+purpose: the action runs on a thread of its own, so nothing waits for
+it, and a blocking client is simpler than an async one. It declares
+`rust-version = "1.85"`, which is this workspace's floor.
+
+### What is *not* in M6.13
+
+* **The status does not change what the softphone does.** A paused
+  account is still dialled and its lamps still say what they say: the
+  state lives in the PBX, and the action is what tells it.
+* **The plugin is not run.** It is stored and it says so.
+* **The script is not sandboxed.** It runs as the user typed it, with
+  the user's own rights — which is what "run a script" means, and why
+  the setting is per-account and not something the app does to itself.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -5051,6 +5228,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.10** | The account is made with everything it is: the form for another account carries the domain, the outbound proxy and the two header names, the accounts are numbered, and every lamp is numbered in its own account | **done** |
 | **M6.11** | The lamp is one line: the lamp, the account's number, the extension, the lamp's number and the state — the `from acc … · unknown` line under it is gone | **done** |
 | **M6.12** | Opus: the codec itself (`rusty-opus`, one package and no dependencies of its own), the offer that names it on 111 with `opus/48000/2` and the parameters of RFC 7587 §7, an RTP layer that carries packets of whatever size the codec chose, and a 48 kHz clock whose timestamp advances by 960 | **done** |
+| **M6.13** | The account's status: a button per account that says **Ready**, **Online** or **Pause** and lets the user pick another one, and the account's **action** — dial a code (DTMF if a call is up, a call if there is not), run a script, run an HTTP query, or name a plugin that is not there yet | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -5114,7 +5292,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 520 tests, all passing.
+* `cargo test --workspace` — 544 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and

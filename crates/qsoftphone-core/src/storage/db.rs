@@ -70,6 +70,8 @@ impl Db {
                     blf_extensions       TEXT    NOT NULL DEFAULT '[]',
                     crm_preset_id        TEXT    NOT NULL DEFAULT '',
                     ringtone_file        TEXT    NOT NULL DEFAULT '',
+                    status               TEXT    NOT NULL DEFAULT 'ready',
+                    status_action        TEXT    NOT NULL DEFAULT '',
                     created_at           INTEGER NOT NULL DEFAULT 0,
                     updated_at           INTEGER NOT NULL DEFAULT 0
                 );
@@ -135,6 +137,16 @@ impl Db {
             // The extensions whose Busy Lamp Field an account watches.
             // A list of extension numbers, stored as JSON.
             ("accounts", "blf_extensions", "TEXT NOT NULL DEFAULT '[]'"),
+            // The status the account shows — "ready", "online" or
+            // "pause". An account that is already in the table gets
+            // "ready": that is the state a phone is in when nobody has
+            // said otherwise.
+            ("accounts", "status", "TEXT NOT NULL DEFAULT 'ready'"),
+            // What happens when the status is set: a code to dial, a
+            // script to run, an HTTP query to make or a plugin to hand
+            // it to. Stored as JSON, like the headers above. Empty means
+            // "nothing happens".
+            ("accounts", "status_action", "TEXT NOT NULL DEFAULT ''"),
         ];
         self.with_conn(|conn| {
             for (table, column, ty) in additions {

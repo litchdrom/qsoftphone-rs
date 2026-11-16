@@ -9,6 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::status::{AccountStatus, StatusAction};
+
 /// A captured SIP header set: header name to value.
 ///
 /// A `BTreeMap` rather than a `HashMap` so that iteration order is
@@ -115,6 +117,19 @@ pub struct Account {
     /// accounts can be told apart by the ring that sounds for them —
     /// which is the whole point of having a per-account ringtone.
     pub ringtone_file: String,
+    /// The status this account shows.
+    ///
+    /// **Ready**, **Online** or **Pause** — see
+    /// [`crate::model::status::AccountStatus`]. The status is the
+    /// account's own, and it is what the account's button in the left
+    /// panel shows.
+    pub status: AccountStatus,
+    /// What happens when the status is set.
+    ///
+    /// A code to dial, a script to run, an HTTP query to make, or a
+    /// plugin to hand it to — see
+    /// [`crate::model::status::StatusAction`].
+    pub status_action: StatusAction,
     /// Epoch milliseconds.
     pub created_at: i64,
     /// Epoch milliseconds.

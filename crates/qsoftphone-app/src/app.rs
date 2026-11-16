@@ -20,6 +20,7 @@ use qsoftphone_core::model::history::{
     CallRecord, CallResult, Direction as HistoryDirection, LocalTime, classify_result,
     format_duration, history_direction,
 };
+use qsoftphone_core::model::status::{AccountStatus, StatusAction};
 use qsoftphone_core::paths::AppPaths;
 use qsoftphone_core::sip::custom_headers::is_valid_name;
 use qsoftphone_core::sip::refer::TransferProgress;
@@ -30,6 +31,7 @@ use qsoftphone_sip::{
     CallBus, CallManager, RegistrationManager, RegistrationState, SessionRegistry,
 };
 
+use crate::action::{self, ActionReport};
 use crate::history::{HistoryService, HistoryUpdate};
 use crate::picker::{Picked, Picker, Target};
 
@@ -166,6 +168,14 @@ pub struct QSoftphoneApp {
     media_updates: Receiver<MediaUpdate>,
     /// The way back to the runtime that does the work.
     media_updates_tx: Sender<MediaUpdate>,
+    /// What the background actions have to say.
+    ///
+    /// A script and an HTTP query run on a thread of their own (§3):
+    /// the interface thread never waits for anything, so what they say
+    /// arrives here and is read at the top of the frame.
+    action_updates: Receiver<ActionReport>,
+    /// The way back to the thread that runs the action.
+    action_updates_tx: Sender<ActionReport>,
     /// The sounds the softphone makes on its own: the ringtone and the
     /// ringback.
     ///
@@ -473,6 +483,14 @@ struct Draft {
     ///
     /// A pair: the extension to watch, and the number to dial for it.
     blf_extensions: Vec<BlfEntry>,
+    /// The status the account shows: "ready", "online" or "pause".
+    status: String,
+    /// What happens when the status is set: "", "dial", "script",
+    /// "http" or "plugin".
+    status_action_kind: String,
+    /// The value of the action: the code, the command, the URL or the
+    /// plugin's name.
+    status_action_value: String,
 }
 
 impl Draft {
@@ -495,6 +513,9 @@ impl Draft {
         account.ringtone_file = self.ringtone_file.trim().to_string();
         account.custom_headers = Self::clean_headers(&self.custom_headers);
         account.blf_extensions = Self::clean_entries(&self.blf_extensions);
+        account.status = AccountStatus::from_name(&self.status).unwrap_or_default();
+        account.status_action =
+            StatusAction::of(&self.status_action_kind, &self.status_action_value);
         account
     }
 
@@ -513,6 +534,9 @@ impl Draft {
             ringtone_file: account.ringtone_file.clone(),
             custom_headers: account.custom_headers.clone(),
             blf_extensions: account.blf_extensions.clone(),
+            status: account.status.name().to_ascii_lowercase(),
+            status_action_kind: account.status_action.kind().to_string(),
+            status_action_value: account.status_action.value().to_string(),
         }
     }
 
@@ -583,6 +607,7 @@ impl QSoftphoneApp {
         calls.set_media_config(media_config_of(&config));
         let blf = qsoftphone_sip::BlfManager::new(sessions.clone(), runtime.clone());
         let (media_updates_tx, media_updates) = std::sync::mpsc::channel();
+        let (action_updates_tx, action_updates) = std::sync::mpsc::channel();
         let mut app = Self {
             paths,
             db,
@@ -627,6 +652,8 @@ impl QSoftphoneApp {
             echo_levels: None,
             media_updates,
             media_updates_tx,
+            action_updates,
+            action_updates_tx,
             sound: qsoftphone_media::SoundPlayer::new(),
             ringing: None,
             redirect: RedirectState::default(),
@@ -1329,8 +1356,109 @@ impl QSoftphoneApp {
         })
     }
 
-    /// Load the selected account into the editor.
+    /// Set an account's status, and do what the status means.
     ///
+    /// The status is the account's own and it is stored with it: two
+    /// accounts on the same server can be in different states, and that
+    /// is the ordinary case.
+    ///
+    /// Setting it runs the account's **action** — the button is the
+    /// switch, and the action is what the switch is wired to. The
+    /// action runs every time a state is picked, even the state the
+    /// account is already in: a user who wants to tell the PBX twice
+    /// presses the button twice.
+    fn set_account_status(&mut self, account_id: &str, status: AccountStatus) {
+        let Some(index) = self.accounts.iter().position(|a| a.id == account_id) else {
+            return;
+        };
+        let mut account = self.accounts[index].clone();
+        account.status = status;
+
+        // The status is saved first: it is what the user set, and it is
+        // theirs whatever the action does.
+        match AccountStore::new(&self.db).upsert(&account) {
+            Ok(saved) => {
+                self.accounts[index] = saved.clone();
+                // The editor shows the status too, so the form does not
+                // go back to the old one.
+                if let Some(draft) = self.edit_accounts.get_mut(&account.id) {
+                    draft.status = status.name().to_ascii_lowercase();
+                }
+                self.status = format!("{} is {}.", account.label, status.name());
+            }
+            Err(e) => {
+                self.status = format!("The status was not saved: {e}");
+                return;
+            }
+        }
+
+        self.run_status_action(&self.accounts[index].clone());
+    }
+
+    /// Do what the account's action says.
+    ///
+    /// Four kinds, and two of them are the app's own business:
+    ///
+    /// * **dial a code** — DTMF if a call is up on the account, a call
+    ///   to the code otherwise;
+    /// * **a script** and **an HTTP query** — they run on a thread of
+    ///   their own, because the interface thread never waits for
+    ///   anything (§3);
+    /// * **a plugin** — stored and shown, and not run: §8 of the brief
+    ///   puts the plugin host out of scope, and a plugin that pretends
+    ///   to work is worse than one that says it is not there yet.
+    fn run_status_action(&mut self, account: &Account) {
+        match &account.status_action {
+            StatusAction::None => {}
+            StatusAction::Dial(code) => {
+                let code = code.trim();
+                if code.is_empty() {
+                    return;
+                }
+                // A call that is up on this account: the code goes out
+                // as DTMF on it.
+                let up = self
+                    .calls()
+                    .into_iter()
+                    .find(|call| call.account_id == account.id && !call.ended);
+                match up {
+                    Some(call) => {
+                        for digit in code.chars() {
+                            let digit = digit.to_string();
+                            if let Err(e) =
+                                self.calls
+                                    .send_dtmf(&call.account_id, &call.call_id, &digit)
+                            {
+                                self.status =
+                                    format!("Could not send {digit} to {}: {e}", call.peer);
+                                return;
+                            }
+                        }
+                        self.status = format!("Sent {code} to {}.", call.peer);
+                    }
+                    None => {
+                        // No call is up: the code is called.
+                        let _ = self.place_call_on(account, code);
+                    }
+                }
+            }
+            StatusAction::Script(_) | StatusAction::Http(_) => {
+                action::spawn(
+                    &account.status_action,
+                    &account.label,
+                    self.action_updates_tx.clone(),
+                );
+                self.status = format!("Running the action for {}.", account.label);
+            }
+            StatusAction::Plugin(name) => {
+                self.status = format!(
+                    "The plugin {name} is not there yet — the plugin host is out of scope."
+                );
+            }
+        }
+    }
+
+    /// Load the selected account into the editor.    ///
     /// The draft is loaded **once**: a form left half-typed in one
     /// account is still there when the user comes back to it, and it
     /// is never written to another account.
@@ -2035,6 +2163,20 @@ impl QSoftphoneApp {
         self.status = "The echo test did not finish.".to_string();
     }
 
+    /// Drain what the background actions have to say.
+    ///
+    /// A script and an HTTP query run on a thread of their own (§3),
+    /// and what they say arrives here. The user is told what happened,
+    /// in a sentence, on the status line.
+    fn drain_actions(&mut self) {
+        while let Ok(report) = self.action_updates.try_recv() {
+            match report.result {
+                Ok(message) => self.status = format!("{}: {message}", report.account),
+                Err(error) => self.status = format!("{}: {error}", report.account),
+            }
+        }
+    }
+
     /// Drain what the background media work has to say.
     fn drain_media(&mut self) {
         while let Ok(update) = self.media_updates.try_recv() {
@@ -2335,6 +2477,7 @@ impl QSoftphoneApp {
         self.drain_calls();
         self.drain_history();
         self.drain_media();
+        self.drain_actions();
         self.drain_picker();
 
         // The header. One line: who we are and whether we are
@@ -2421,12 +2564,19 @@ impl QSoftphoneApp {
                         // loud. It is the same number as the one in
                         // the title of the account's group.
                         let text = format!("{}  {text}", index + 1);
-                        if ui
-                            .selectable_value(&mut self.selected, Some(index), text)
-                            .clicked()
-                        {
-                            pending_select = Some(index);
-                        }
+                        let selected = self.selected == Some(index);
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(selected, text).clicked() {
+                                pending_select = Some(index);
+                            }
+                            // The account's status, as a lamp.
+                            //
+                            // The list says where every account is at a
+                            // glance, and the button that changes it is
+                            // in the account's own title on the account
+                            // page.
+                            ui.colored_label(status_colour(account.status), "●");
+                        });
                     }
                 });
 
@@ -3672,6 +3822,7 @@ impl QSoftphoneApp {
         let title = account_name(account);
 
         let mut title_clicked = false;
+        let mut picked_status: Option<AccountStatus> = None;
         let mut header = state.show_header(ui, |ui| {
             // The account's own number, the same one the list in the
             // left panel gives it.
@@ -3698,7 +3849,28 @@ impl QSoftphoneApp {
                 ui.weak(format!("{} @ {}", account.user, account.registrar));
             }
             ui.weak(&summary);
+            // The status, and the button that changes it.
+            //
+            // It is in the title and not in the body, because the body
+            // is folded away: a status that is only visible when the
+            // group is open is a status nobody can see.
+            ui.menu_button(status_label(account.status), |ui| {
+                for status in AccountStatus::ALL {
+                    if ui
+                        .selectable_label(status == account.status, status.name())
+                        .clicked()
+                    {
+                        picked_status = Some(status);
+                    }
+                }
+            });
         });
+
+        // The state the user picked is set, and the account's action
+        // runs with it.
+        if let Some(status) = picked_status {
+            self.set_account_status(&account.id, status);
+        }
 
         // The title picks the account, and the account's group opens
         // with it.
@@ -3785,6 +3957,11 @@ impl QSoftphoneApp {
         // away until it is asked for, and each belongs to the account
         // above it.
         ui.separator();
+        egui::CollapsingHeader::new(egui::RichText::new("STATUS").strong().size(11.0))
+            .id_salt(("status", &account.id))
+            .show(ui, |ui| self.draw_status(ui, account));
+
+        ui.separator();
         egui::CollapsingHeader::new(egui::RichText::new("RING TONE").strong().size(11.0))
             .id_salt(("ring_tone", &account.id))
             .show(ui, |ui| self.draw_ringtone(ui, account));
@@ -3825,6 +4002,42 @@ impl QSoftphoneApp {
                 }
             });
         });
+    }
+
+    /// The account's status, and what it does.
+    ///
+    /// The status itself is a button in the account's title — it is
+    /// there whether the group is open or not. This is where the
+    /// **action** is: what happens when the status is set.
+    ///
+    /// The point of the action is that the state lives outside the
+    /// softphone: a user who is ready tells the PBX so with a feature
+    /// code, and a user who is online tells a CRM so with an HTTP
+    /// query.
+    fn draw_status(&mut self, ui: &mut egui::Ui, account: &Account) {
+        ui.horizontal(|ui| {
+            ui.label("Status");
+            ui.label(status_label(account.status));
+            ui.weak("— the button in the title changes it.");
+        });
+
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("When the status changes").strong());
+        {
+            let draft = self.draft_of(account);
+            egui::ComboBox::from_id_salt(("status_action", &account.id))
+                .selected_text(action_kind_label(&draft.status_action_kind))
+                .show_ui(ui, |ui| {
+                    for (kind, label) in ACTION_KINDS {
+                        ui.selectable_value(&mut draft.status_action_kind, kind.to_string(), label);
+                    }
+                });
+            // What the kind means, and the value it takes.
+            ui.weak(action_hint(&draft.status_action_kind));
+            if !draft.status_action_kind.is_empty() {
+                ui.text_edit_singleline(&mut draft.status_action_value);
+            }
+        }
     }
 
     /// The WAV file this account rings with.
@@ -5113,6 +5326,67 @@ fn account_name(account: &Account) -> String {
     account.id.clone()
 }
 
+/// The kinds of action an account can have, and what they are called.
+///
+/// The first one is "nothing": an account whose status is only a label
+/// is the ordinary case, and it is the one that has to be easy to say.
+const ACTION_KINDS: [(&str, &str); 5] = [
+    ("", "Nothing"),
+    ("dial", "Dial a code"),
+    ("script", "Run a script"),
+    ("http", "Run an HTTP query"),
+    ("plugin", "Use a plugin"),
+];
+
+/// The name of a kind of action, for the combo box.
+fn action_kind_label(kind: &str) -> &'static str {
+    ACTION_KINDS
+        .iter()
+        .find(|(value, _)| *value == kind)
+        .map(|(_, label)| *label)
+        .unwrap_or("Nothing")
+}
+
+/// What a kind of action does, in a sentence.
+///
+/// The sentence is under the field, because a field with no name is a
+/// field the user does not know what to put in it.
+fn action_hint(kind: &str) -> &'static str {
+    match kind {
+        "dial" => {
+            "The code is sent as DTMF if a call is up on this account, and called if there is none."
+        }
+        "script" => {
+            "The command runs as it would be typed in a console — a screen capture, for example."
+        }
+        "http" => "The URL is fetched with GET, on a thread of its own.",
+        "plugin" => "The plugin is stored and shown, and not run: the plugin host is out of scope.",
+        _ => "Nothing happens when the status changes.",
+    }
+}
+
+/// The status of an account, as the button shows it.
+///
+/// The lamp is the same shape as the lamps in the left panel: a dot and
+/// a word, in the colour of the state.
+fn status_label(status: AccountStatus) -> egui::RichText {
+    egui::RichText::new(format!("● {}", status.name()))
+        .color(status_colour(status))
+        .strong()
+}
+
+/// The colour of a status.
+///
+/// The same three as the lamps of the Busy Lamp Field: green for free,
+/// amber for busy, grey for not there.
+fn status_colour(status: AccountStatus) -> egui::Color32 {
+    match status {
+        AccountStatus::Ready => egui::Color32::from_rgb(0x4c, 0xc0, 0x6a),
+        AccountStatus::Online => egui::Color32::from_rgb(0xd8, 0xa6, 0x30),
+        AccountStatus::Pause => egui::Color32::GRAY,
+    }
+}
+
 /// The media settings, read out of the settings file.
 ///
 /// The settings file keeps the codecs as names — it is a plain JSON
@@ -5444,6 +5718,170 @@ mod tests {
             .unwrap_or_else(|| panic!("the page has no {title} block:\n{}", screen_text(&output)));
         click_at(app, ctx, header);
         settle(app, ctx);
+    }
+
+    /// The account's status, and the button that changes it.
+    ///
+    /// The button is in the account's **title**, so it is there whether
+    /// the group is open or not: a status that is only visible when the
+    /// group is open is a status nobody can see.
+    #[tokio::test]
+    async fn the_account_page_carries_the_status_button() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        app.view = View::Account;
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+
+        assert!(
+            text.contains("Ready"),
+            "the account's status is not on the page:\n{text}"
+        );
+        assert!(
+            text.contains("STATUS"),
+            "the status settings are not on the page:\n{text}"
+        );
+    }
+
+    /// The status is the account's own, and it is stored with it.
+    #[tokio::test]
+    async fn setting_the_status_saves_it() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let account_id = app.accounts[0].id.clone();
+
+        app.set_account_status(&account_id, AccountStatus::Pause);
+
+        // It is in the store.
+        let stored = AccountStore::new(&app.db)
+            .get(&account_id)
+            .expect("the account is read")
+            .expect("the account is there");
+        assert_eq!(stored.status, AccountStatus::Pause);
+
+        // And in the app's own list, so the lamp in the left panel says
+        // it without the page being opened.
+        assert_eq!(app.accounts[0].status, AccountStatus::Pause);
+    }
+
+    /// The button says what the account's status is.
+    #[tokio::test]
+    async fn the_button_says_the_status() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let account_id = app.accounts[0].id.clone();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        app.view = View::Account;
+        app.set_account_status(&account_id, AccountStatus::Online);
+
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Online"),
+            "the button does not say the account's status:\n{text}"
+        );
+    }
+
+    /// The action is saved with the account, and it is the action the
+    /// editor holds.
+    #[tokio::test]
+    async fn the_action_is_saved_with_the_account() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let account_id = app.accounts[0].id.clone();
+
+        // The form holds the action.
+        let account = app.accounts[0].clone();
+        let draft = app.draft_of(&account);
+        draft.status_action_kind = "dial".to_string();
+        draft.status_action_value = "*51".to_string();
+        app.save_account(&account_id);
+
+        let stored = AccountStore::new(&app.db)
+            .get(&account_id)
+            .expect("the account is read")
+            .expect("the account is there");
+        assert_eq!(stored.status_action, StatusAction::Dial("*51".to_string()));
+    }
+
+    /// A call that is up on the account takes the code as DTMF; a call
+    /// that is not there is dialled.
+    #[tokio::test]
+    async fn the_code_is_dialled_when_there_is_no_call() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let account_id = app.accounts[0].id.clone();
+
+        let mut account = app.accounts[0].clone();
+        account.status_action = StatusAction::Dial("*51".to_string());
+        AccountStore::new(&app.db)
+            .upsert(&account)
+            .expect("the account is saved");
+        app.reload();
+
+        app.set_account_status(&account_id, AccountStatus::Ready);
+
+        // There is no call up, so the code is called: the dialer holds
+        // what was dialled.
+        assert_eq!(app.dial_number, "*51");
+    }
+
+    /// A script runs on a thread of its own, and what it says comes
+    /// back on the channel.
+    #[tokio::test]
+    async fn a_script_action_runs_and_says_what_it_did() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let account_id = app.accounts[0].id.clone();
+
+        let mut account = app.accounts[0].clone();
+        account.status_action = StatusAction::Script(if cfg!(target_os = "windows") {
+            "cmd /C exit 0".to_string()
+        } else {
+            "true".to_string()
+        });
+        AccountStore::new(&app.db)
+            .upsert(&account)
+            .expect("the account is saved");
+        app.reload();
+
+        app.set_account_status(&account_id, AccountStatus::Online);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            app.drain_actions();
+            if app.status.contains("the command ran") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            app.status.contains("the command ran"),
+            "the script did not report back: {}",
+            app.status
+        );
+    }
+
+    /// The plugin is stored and shown, and not run: §8 of the brief
+    /// puts the plugin host out of scope.
+    #[tokio::test]
+    async fn the_plugin_action_says_it_is_not_there_yet() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let account_id = app.accounts[0].id.clone();
+
+        let mut account = app.accounts[0].clone();
+        account.status_action = StatusAction::Plugin("bitrix".to_string());
+        AccountStore::new(&app.db)
+            .upsert(&account)
+            .expect("the account is saved");
+        app.reload();
+
+        app.set_account_status(&account_id, AccountStatus::Online);
+
+        assert!(
+            app.status.contains("not there yet"),
+            "the plugin was not reported as missing: {}",
+            app.status
+        );
     }
 
     #[tokio::test]

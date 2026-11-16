@@ -3,3 +3,4 @@
 pub mod account;
 pub mod call_event;
 pub mod history;
+pub mod status;

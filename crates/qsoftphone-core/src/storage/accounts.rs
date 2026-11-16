@@ -9,7 +9,18 @@ use rusqlite::{Row, params};
 
 use crate::error::Result;
 use crate::model::account::{Account, BlfEntry, now_ms};
+use crate::model::status::{AccountStatus, StatusAction};
 use crate::storage::db::Db;
+
+/// The columns of the `accounts` table, in the order they are read.
+///
+/// The order is the order of the `SELECT` and of the row reader, and
+/// both have to agree: a column read from the wrong place is an
+/// account's password in its label.
+const COLUMNS: &str = "id, label, registrar, user, password, transport, domain,
+                        outbound_proxy, caller_id_header, dialed_number_header,
+                        capture_headers, custom_headers, blf_extensions, crm_preset_id,
+                        ringtone_file, status, status_action, created_at, updated_at";
 
 /// CRUD over the `accounts` table.
 pub struct AccountStore<'a> {
@@ -24,14 +35,10 @@ impl<'a> AccountStore<'a> {
     /// Every account, ordered by label.
     pub fn list(&self) -> Result<Vec<Account>> {
         self.db.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, label, registrar, user, password, transport, domain,
-                        outbound_proxy, caller_id_header, dialed_number_header,
-                        capture_headers, custom_headers, blf_extensions, crm_preset_id,
-                        ringtone_file, created_at, updated_at
-                 FROM accounts
-                 ORDER BY label COLLATE NOCASE, id",
-            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {COLUMNS} FROM accounts
+                 ORDER BY label COLLATE NOCASE, id"
+            ))?;
             let rows = stmt.query_map([], row_to_account)?;
             let mut out = Vec::new();
             for row in rows {
@@ -44,13 +51,8 @@ impl<'a> AccountStore<'a> {
     /// One account by id.
     pub fn get(&self, id: &str) -> Result<Option<Account>> {
         self.db.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, label, registrar, user, password, transport, domain,
-                        outbound_proxy, caller_id_header, dialed_number_header,
-                        capture_headers, custom_headers, blf_extensions, crm_preset_id,
-                        ringtone_file, created_at, updated_at
-                 FROM accounts WHERE id = ?1",
-            )?;
+            let mut stmt =
+                conn.prepare(&format!("SELECT {COLUMNS} FROM accounts WHERE id = ?1"))?;
             let mut rows = stmt.query(params![id])?;
             match rows.next()? {
                 Some(row) => Ok(Some(row_to_account(row)?)),
@@ -76,6 +78,9 @@ impl<'a> AccountStore<'a> {
         let capture = serde_json::to_string(&account.capture_headers)?;
         let custom = serde_json::to_string(&account.custom_headers)?;
         let blf = serde_json::to_string(&account.blf_extensions)?;
+        // The action is JSON too: it is a kind and a value, and the
+        // value may be a command with quotes in it.
+        let action = serde_json::to_string(&account.status_action)?;
 
         self.db.with_conn(|conn| {
             conn.execute(
@@ -83,8 +88,8 @@ impl<'a> AccountStore<'a> {
                     (id, label, registrar, user, password, transport, domain,
                      outbound_proxy, caller_id_header, dialed_number_header,
                      capture_headers, custom_headers, blf_extensions, crm_preset_id,
-                     ringtone_file, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                     ringtone_file, status, status_action, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                  ON CONFLICT(id) DO UPDATE SET
                     label                = excluded.label,
                     registrar            = excluded.registrar,
@@ -100,6 +105,8 @@ impl<'a> AccountStore<'a> {
                     blf_extensions       = excluded.blf_extensions,
                     crm_preset_id        = excluded.crm_preset_id,
                     ringtone_file        = excluded.ringtone_file,
+                    status               = excluded.status,
+                    status_action        = excluded.status_action,
                     updated_at           = excluded.updated_at",
                 params![
                     account.id,
@@ -117,6 +124,8 @@ impl<'a> AccountStore<'a> {
                     blf,
                     account.crm_preset_id,
                     account.ringtone_file,
+                    account.status.name().to_ascii_lowercase(),
+                    action,
                     account.created_at,
                     account.updated_at,
                 ],
@@ -209,6 +218,41 @@ fn row_to_account(row: &Row<'_>) -> rusqlite::Result<Account> {
             }
         },
     };
+    // The status the account shows.
+    //
+    // A column that cannot be read is an account whose status is
+    // lost — and a lost status is a phone that is "Ready" when the user
+    // has it "Paused" — so an unknown word is the default and a
+    // warning, not a failure.
+    let status: String = row.get(15)?;
+    let status = match AccountStatus::from_name(&status) {
+        Some(status) => status,
+        None => {
+            tracing::warn!(
+                account_id = %id,
+                "account has an unknown status; treating it as ready"
+            );
+            AccountStatus::default()
+        }
+    };
+    // What happens when the status is set. An empty column is the
+    // ordinary case: an account with no action.
+    let action: String = row.get(16)?;
+    let status_action = if action.trim().is_empty() {
+        StatusAction::None
+    } else {
+        match serde_json::from_str::<StatusAction>(&action) {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(
+                    account_id = %id,
+                    error = %e,
+                    "account has a malformed status_action; treating it as none"
+                );
+                StatusAction::None
+            }
+        }
+    };
     Ok(Account {
         id,
         label: row.get(1)?,
@@ -225,8 +269,10 @@ fn row_to_account(row: &Row<'_>) -> rusqlite::Result<Account> {
         blf_extensions,
         crm_preset_id: row.get(13)?,
         ringtone_file: row.get(14)?,
-        created_at: row.get(15)?,
-        updated_at: row.get(16)?,
+        status,
+        status_action,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
     })
 }
 
@@ -418,6 +464,60 @@ mod tests {
 
         let fetched = store.get(&account.id).unwrap().unwrap();
         assert!(fetched.blf_extensions.is_empty());
+    }
+
+    #[test]
+    fn the_status_and_its_action_survive_a_round_trip() {
+        // The status is the account's own, and the action is what
+        // happens when it is set: both are stored with the account.
+        let db = Db::open_in_memory().unwrap();
+        let store = AccountStore::new(&db);
+
+        let mut account = Account::new("Office", "example.com", "104", "", "udp");
+        account.status = AccountStatus::Pause;
+        account.status_action = StatusAction::Dial("*60".to_string());
+        store.upsert(&account).unwrap();
+
+        let fetched = store.get(&account.id).unwrap().unwrap();
+        assert_eq!(fetched.status, AccountStatus::Pause);
+        assert_eq!(fetched.status_action, StatusAction::Dial("*60".to_string()));
+
+        // And it is there for every account in the list, too.
+        let listed = store.list().unwrap();
+        assert_eq!(listed[0].status, AccountStatus::Pause);
+    }
+
+    #[test]
+    fn an_account_with_no_status_is_ready() {
+        let db = Db::open_in_memory().unwrap();
+        let store = AccountStore::new(&db);
+
+        let account = Account::new("Office", "example.com", "104", "", "udp");
+        store.upsert(&account).unwrap();
+
+        let fetched = store.get(&account.id).unwrap().unwrap();
+        assert_eq!(fetched.status, AccountStatus::Ready);
+        assert_eq!(fetched.status_action, StatusAction::None);
+    }
+
+    #[test]
+    fn every_kind_of_action_survives_a_round_trip() {
+        let db = Db::open_in_memory().unwrap();
+        let store = AccountStore::new(&db);
+
+        for action in [
+            StatusAction::Dial("*51".to_string()),
+            StatusAction::Script("capture.exe --screen".to_string()),
+            StatusAction::Http("https://crm.example.com/api/ready".to_string()),
+            StatusAction::Plugin("bitrix".to_string()),
+        ] {
+            let mut account = Account::new("Office", "example.com", "104", "", "udp");
+            account.status_action = action.clone();
+            store.upsert(&account).unwrap();
+
+            let fetched = store.get(&account.id).unwrap().unwrap();
+            assert_eq!(fetched.status_action, action);
+        }
     }
 
     #[test]

@@ -24,6 +24,18 @@ tokio.workspace = true
 eframe.workspace = true
 egui.workspace = true
 
+# The HTTP client for the per-account status action (M6.13): an account
+# can be told to run an HTTP query when its status changes.
+#
+# `ureq` is small, pure Rust and blocking — and the action runs on a
+# thread of its own, because the interface thread never waits for
+# anything (§3). It is version 3 and declares the same floor as this
+# workspace (1.85). The TLS it brings is `rustls`, which is already in
+# the tree for rsipstack.
+#
+# The dependency budget is in the README.
+ureq = "3"
+
 # The media plane, pinned from the start so the dependency budget is
 # measured with the whole stack. The app does not touch it until M4 —
 # `rtc` drives the RTP/SRTP session and `cpal` the sound card.

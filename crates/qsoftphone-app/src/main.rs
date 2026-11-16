@@ -12,6 +12,7 @@
 //! `--smoke` runs steps 1-4 and exits, which is what CI and the
 //! "does it start and exit cleanly" check use.
 
+mod action;
 mod app;
 mod history;
 mod picker;
