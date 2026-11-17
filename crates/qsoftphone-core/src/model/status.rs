@@ -10,7 +10,7 @@
 //!
 //! But the list is the **user's**. The settings page has a STATUSES
 //! section, and the user adds a status of their own — "In a meeting",
-//! "Lunch", "Do not disturb" — with a colour and a hook of its own.
+//! "Lunch", "Do not disturb" — with a colour and hooks of its own.
 //!
 //! The list is **global**: every account uses the same statuses. A
 //! state of the user is a state of the user, not a state of one
@@ -20,9 +20,15 @@
 //!
 //! ## What a status does
 //!
-//! Each status carries its own **hook** — what happens when the status
-//! is set. There are four kinds, and they are the four a user asked
-//! for:
+//! Each status carries **two hooks** — what happens when the status is
+//! **set**, and what happens when it is **left**:
+//!
+//! | Hook | When it runs |
+//! |---|---|
+//! | **on enter** | when the status is set on the account |
+//! | **on leave** | when the account moves away from it — and when the app closes while the account is in it |
+//!
+//! A hook is one of four kinds, and they are the four a user asked for:
 //!
 //! | Kind | What it does |
 //! |---|---|
@@ -42,6 +48,26 @@
 //! numbers are two lines in the settings, not two lines in every
 //! account.
 //!
+//! The two hooks are what makes a **screen capture** work: the capture
+//! starts when the agent becomes ready and stops when they stop being
+//! ready. The start is the **enter** hook of "Ready" and the stop is
+//! the **leave** hook of the same status.
+//!
+//! ## When the enter hook runs
+//!
+//! * **Every time it is set** — the default. The hook runs each time
+//!   the status is picked, *even the one the account is already in*: a
+//!   user who wants to tell the PBX twice presses the button twice.
+//! * **Only when it becomes active** — the hook runs when the state
+//!   changes *into* the status, and when the app starts with the
+//!   account already in it. This is what a recorder wants: the capture
+//!   starts when the agent becomes ready, not every time the button is
+//!   pressed, and not at every start of the app.
+//!
+//! The leave hook always runs on a **change**: an account that stays
+//! in its status has not left it, and one that leaves it at the closing
+//! of the app has.
+//!
 //! ## The id
 //!
 //! A status has an **id** as well as a name, and the id is what the
@@ -49,7 +75,7 @@
 //! "Pause" to "Не беспокоить" has renamed the same status, and the
 //! accounts that are in it are still in it.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// The id of the status an account is in when nobody has said
 /// otherwise.
@@ -127,6 +153,11 @@ impl HttpMethod {
 }
 
 /// What a status does when it is set.
+///
+/// The typed thing is what the app runs; the strings are what the
+/// settings file holds, because a file that says `"kind": "script"`
+/// says what it means and a file that says `{"Script": "..."}` does
+/// not.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StatusAction {
@@ -274,14 +305,138 @@ impl StatusAction {
     }
 }
 
-/// One status the user can put an account into.
+/// One hook of a status: what it does, and where.
 ///
 /// The fields are plain strings on purpose: this is a line in a JSON
 /// file that a user may edit by hand, and a file that says
-/// `"actionKind": "http"` says what it means. The typed
-/// [`StatusAction`] is built from them when the hook runs.
+/// `"kind": "http"` says what it means. The typed [`StatusAction`] is
+/// built from the strings when the hook runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
+pub struct StatusHook {
+    /// What happens: `""`, `dial`, `script`, `http` or `plugin`.
+    pub kind: String,
+    /// The code, the command or the URL.
+    pub value: String,
+    /// The HTTP method, when the kind is `http`.
+    pub method: String,
+    /// The body the HTTP query sends.
+    pub body: String,
+}
+
+impl Default for StatusHook {
+    fn default() -> Self {
+        Self {
+            kind: String::new(),
+            value: String::new(),
+            method: HttpMethod::default().name().to_string(),
+            body: String::new(),
+        }
+    }
+}
+
+impl StatusHook {
+    /// A hook that does nothing.
+    pub fn none() -> StatusHook {
+        StatusHook::default()
+    }
+
+    /// The hook that does this action.
+    pub fn of(action: &StatusAction) -> StatusHook {
+        StatusHook {
+            kind: action.kind().to_string(),
+            value: action.value().to_string(),
+            method: action.method().name().to_string(),
+            body: action.body().to_string(),
+        }
+    }
+
+    /// The action of this hook, as the typed thing it is.
+    ///
+    /// A kind with nothing in it is **no action**: running it would
+    /// dial nothing, and fetch nothing.
+    pub fn action(&self) -> StatusAction {
+        StatusAction::of_full(&self.kind, &self.value, &self.method, &self.body)
+    }
+
+    /// Whether the hook would do anything.
+    ///
+    /// It mirrors what [`StatusAction::of_full`] makes of the same
+    /// strings: a kind that is not one of the four, or a value with
+    /// nothing in it, is a hook that does nothing.
+    pub fn is_empty(&self) -> bool {
+        if self.value.trim().is_empty() {
+            return true;
+        }
+        !matches!(
+            self.kind.trim().to_ascii_lowercase().as_str(),
+            "dial" | "script" | "http" | "plugin"
+        )
+    }
+
+    /// Whether the hook does something.
+    pub fn is_some(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+/// When the **enter** hook of a status runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnterTrigger {
+    /// Every time the status is set, even the one the account is
+    /// already in.
+    ///
+    /// This is the default, and it is what M6.13 did: a user who wants
+    /// to tell the PBX twice presses the button twice.
+    #[default]
+    Set,
+    /// Only when the state becomes active — a change into the status,
+    /// and the start of the app with the account already in it.
+    ///
+    /// This is what a screen capture wants: the recording starts when
+    /// the agent becomes ready, and not every time the button is
+    /// pressed.
+    Enter,
+}
+
+impl EnterTrigger {
+    /// Both triggers, in the order they are offered.
+    pub const ALL: [EnterTrigger; 2] = [EnterTrigger::Set, EnterTrigger::Enter];
+
+    /// The word the trigger is written with.
+    pub const fn name(self) -> &'static str {
+        match self {
+            EnterTrigger::Set => "set",
+            EnterTrigger::Enter => "enter",
+        }
+    }
+
+    /// What the trigger is called in the settings.
+    pub const fn label(self) -> &'static str {
+        match self {
+            EnterTrigger::Set => "Every time it is set",
+            EnterTrigger::Enter => "Only when it becomes active",
+        }
+    }
+
+    /// The trigger with that name, whatever the case.
+    pub fn from_name(name: &str) -> Option<EnterTrigger> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "set" => Some(EnterTrigger::Set),
+            "enter" => Some(EnterTrigger::Enter),
+            _ => None,
+        }
+    }
+}
+
+/// One status the user can put an account into.
+///
+/// The fields are plain strings on purpose: this is a line in a JSON
+/// file that a user may edit by hand. The typed [`StatusAction`]s are
+/// built from the hooks when they run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StatusDefinition {
     /// The stable id: `ready`, `online`, `pause`, or one of the
     /// user's own.
@@ -290,15 +445,81 @@ pub struct StatusDefinition {
     pub name: String,
     /// The colour of the lamp: `#4cc06a`.
     pub colour: String,
-    /// What happens when the status is set: `""`, `dial`, `script`,
-    /// `http` or `plugin`.
-    pub action_kind: String,
-    /// The code, the command or the URL.
-    pub action_value: String,
-    /// The HTTP method, when the kind is `http`.
-    pub action_method: String,
-    /// The body the HTTP query sends.
-    pub action_body: String,
+    /// What happens when the status is set.
+    pub on_enter: StatusHook,
+    /// When the enter hook runs.
+    pub enter_trigger: EnterTrigger,
+    /// What happens when the status is left.
+    pub on_leave: StatusHook,
+}
+
+/// The status as it is read out of the settings file.
+///
+/// It carries the shape of **M6.14** as well: the hook was one flat
+/// set of fields then, and a file written by that build must still
+/// open. The old fields are folded into `on_enter` when they are
+/// there and `on_enter` is not.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct StatusDefinitionFile {
+    id: String,
+    name: String,
+    colour: String,
+    on_enter: StatusHook,
+    enter_trigger: EnterTrigger,
+    on_leave: StatusHook,
+    // The shape of M6.14.
+    action_kind: String,
+    action_value: String,
+    action_method: String,
+    action_body: String,
+}
+
+impl Default for StatusDefinitionFile {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            colour: DEFAULT_COLOUR.to_string(),
+            on_enter: StatusHook::default(),
+            enter_trigger: EnterTrigger::default(),
+            on_leave: StatusHook::default(),
+            action_kind: String::new(),
+            action_value: String::new(),
+            action_method: HttpMethod::default().name().to_string(),
+            action_body: String::new(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StatusDefinition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let file = StatusDefinitionFile::deserialize(deserializer)?;
+        let mut on_enter = file.on_enter;
+        if on_enter.is_empty() {
+            // The shape of M6.14: one hook, in four flat fields.
+            let legacy = StatusHook {
+                kind: file.action_kind,
+                value: file.action_value,
+                method: file.action_method,
+                body: file.action_body,
+            };
+            if !legacy.is_empty() {
+                on_enter = legacy;
+            }
+        }
+        Ok(StatusDefinition {
+            id: file.id,
+            name: file.name,
+            colour: file.colour,
+            on_enter,
+            enter_trigger: file.enter_trigger,
+            on_leave: file.on_leave,
+        })
+    }
 }
 
 impl Default for StatusDefinition {
@@ -307,10 +528,9 @@ impl Default for StatusDefinition {
             id: String::new(),
             name: String::new(),
             colour: DEFAULT_COLOUR.to_string(),
-            action_kind: String::new(),
-            action_value: String::new(),
-            action_method: HttpMethod::default().name().to_string(),
-            action_body: String::new(),
+            on_enter: StatusHook::default(),
+            enter_trigger: EnterTrigger::default(),
+            on_leave: StatusHook::default(),
         }
     }
 }
@@ -320,7 +540,7 @@ impl StatusDefinition {
     ///
     /// They are the three a PBX knows, and they are the start of the
     /// user's list rather than the whole of it: every one of them can
-    /// be renamed, recoloured and given a hook of its own.
+    /// be renamed, recoloured and given hooks of its own.
     pub fn built_ins() -> Vec<StatusDefinition> {
         vec![
             StatusDefinition {
@@ -392,14 +612,24 @@ impl StatusDefinition {
         matches!(self.id.as_str(), "ready" | "online" | "pause")
     }
 
-    /// The hook, as the typed thing it is.
-    pub fn action(&self) -> StatusAction {
-        StatusAction::of_full(
-            &self.action_kind,
-            &self.action_value,
-            &self.action_method,
-            &self.action_body,
-        )
+    /// What the status does when it is **set**.
+    pub fn enter_action(&self) -> StatusAction {
+        self.on_enter.action()
+    }
+
+    /// What the status does when it is **left**.
+    pub fn leave_action(&self) -> StatusAction {
+        self.on_leave.action()
+    }
+
+    /// Whether the status has anything to do when it is set.
+    pub fn has_enter_hook(&self) -> bool {
+        self.on_enter.is_some()
+    }
+
+    /// Whether the status has anything to do when it is left.
+    pub fn has_leave_hook(&self) -> bool {
+        self.on_leave.is_some()
     }
 
     /// The colour as red, green and blue.
@@ -599,16 +829,6 @@ mod tests {
     }
 
     #[test]
-    fn a_status_builds_its_own_hook() {
-        // The status carries the hook, and the hook is what runs when
-        // the status is set.
-        let mut status = StatusDefinition::built_ins().remove(1);
-        status.action_kind = "dial".to_string();
-        status.action_value = "666".to_string();
-        assert_eq!(status.action(), StatusAction::Dial("666".to_string()));
-    }
-
-    #[test]
     fn the_action_survives_a_json_round_trip() {
         // The action is what the plugin seam will carry.
         for action in [
@@ -656,12 +876,149 @@ mod tests {
     }
 
     #[test]
+    fn a_hook_is_a_kind_and_a_value() {
+        let hook = StatusHook::of(&StatusAction::Script("capture.exe".to_string()));
+        assert_eq!(hook.kind, "script");
+        assert_eq!(hook.value, "capture.exe");
+        assert_eq!(
+            hook.action(),
+            StatusAction::Script("capture.exe".to_string())
+        );
+        assert!(hook.is_some());
+    }
+
+    #[test]
+    fn a_hook_with_nothing_in_it_does_nothing() {
+        // A half-finished hook is not a hook: running it would dial
+        // nothing, and fetch nothing.
+        assert!(StatusHook::none().is_empty());
+        assert!(StatusHook::default().is_empty());
+
+        let mut hook = StatusHook::none();
+        hook.kind = "script".to_string();
+        assert!(hook.is_empty(), "a kind with no value does nothing");
+
+        hook.value = "capture.exe".to_string();
+        assert!(hook.is_some());
+
+        // And a kind that is not one of the four is nothing too.
+        hook.kind = "teleport".to_string();
+        assert!(hook.is_empty());
+    }
+
+    #[test]
+    fn a_hook_keeps_its_method_and_its_body() {
+        let hook = StatusHook::of(&StatusAction::Http {
+            method: HttpMethod::Patch,
+            url: "https://crm.example.com/api/state".to_string(),
+            body: "{\"state\":\"online\"}".to_string(),
+        });
+        assert_eq!(hook.method, "PATCH");
+        assert_eq!(hook.body, "{\"state\":\"online\"}");
+        assert_eq!(hook.action().method(), HttpMethod::Patch);
+    }
+
+    #[test]
+    fn the_triggers_have_their_names() {
+        assert_eq!(EnterTrigger::Set.name(), "set");
+        assert_eq!(EnterTrigger::Enter.name(), "enter");
+        assert_eq!(EnterTrigger::default(), EnterTrigger::Set);
+        assert_eq!(EnterTrigger::ALL.len(), 2);
+        assert_eq!(EnterTrigger::from_name("enter"), Some(EnterTrigger::Enter));
+        assert_eq!(EnterTrigger::from_name(" SET "), Some(EnterTrigger::Set));
+        assert_eq!(EnterTrigger::from_name("sometimes"), None);
+    }
+
+    #[test]
+    fn a_status_builds_its_two_hooks() {
+        // The status carries a hook for setting it and a hook for
+        // leaving it, and they are two different things.
+        let mut status = StatusDefinition::built_ins().remove(1);
+        status.on_enter = StatusHook::of(&StatusAction::Dial("666".to_string()));
+        status.on_leave = StatusHook::of(&StatusAction::Script("stop.exe".to_string()));
+        assert_eq!(status.enter_action(), StatusAction::Dial("666".to_string()));
+        assert_eq!(
+            status.leave_action(),
+            StatusAction::Script("stop.exe".to_string())
+        );
+        assert!(status.has_enter_hook());
+        assert!(status.has_leave_hook());
+    }
+
+    #[test]
     fn a_status_survives_a_json_round_trip() {
-        for status in StatusDefinition::built_ins() {
-            let json = serde_json::to_string(&status).expect("the status serialises");
-            let back: StatusDefinition =
-                serde_json::from_str(&json).expect("the status reads back");
-            assert_eq!(back, status);
-        }
+        let mut status = StatusDefinition::built_ins().remove(0);
+        status.on_enter = StatusHook::of(&StatusAction::Script("start.exe".to_string()));
+        status.enter_trigger = EnterTrigger::Enter;
+        status.on_leave = StatusHook::of(&StatusAction::Script("stop.exe".to_string()));
+
+        let json = serde_json::to_string(&status).expect("the status serialises");
+        assert!(
+            json.contains("\"onEnter\""),
+            "the new shape is not what is written:\n{json}"
+        );
+        assert!(json.contains("\"enterTrigger\":\"enter\""));
+        assert!(json.contains("\"onLeave\""));
+
+        let back: StatusDefinition = serde_json::from_str(&json).expect("the status reads back");
+        assert_eq!(back, status);
+    }
+
+    #[test]
+    fn the_shape_of_m614_still_reads() {
+        // The hook was one flat set of fields then. A file written by
+        // that build must still open, and the hook it holds must be
+        // the hook that is set.
+        let json = r##"{
+            "id": "ready",
+            "name": "Ready",
+            "colour": "#4cc06a",
+            "actionKind": "dial",
+            "actionValue": "666",
+            "actionMethod": "GET",
+            "actionBody": ""
+        }"##;
+        let status: StatusDefinition = serde_json::from_str(json).expect("the old status reads");
+        assert_eq!(status.id, "ready");
+        assert_eq!(status.enter_action(), StatusAction::Dial("666".to_string()));
+        assert_eq!(
+            status.enter_trigger,
+            EnterTrigger::Set,
+            "the old hook ran every time the status was set, and it still does"
+        );
+        assert!(
+            status.leave_action() == StatusAction::None,
+            "the old shape had no leave hook, and it has none"
+        );
+    }
+
+    #[test]
+    fn the_new_shape_wins_over_the_old_one() {
+        // A file that has both is a file the user edited by hand: the
+        // new shape is the one that was written last, and it is the
+        // one that is read.
+        let json = r#"{
+            "id": "ready",
+            "actionKind": "dial",
+            "actionValue": "666",
+            "onEnter": {"kind": "script", "value": "start.exe"}
+        }"#;
+        let status: StatusDefinition = serde_json::from_str(json).expect("the status reads");
+        assert_eq!(
+            status.enter_action(),
+            StatusAction::Script("start.exe".to_string())
+        );
+    }
+
+    #[test]
+    fn a_status_without_the_new_fields_is_still_a_status() {
+        // A file that says nothing about the hooks is a status that
+        // does nothing, and it must not fail to open.
+        let json = r#"{"id":"ready","name":"Ready"}"#;
+        let status: StatusDefinition = serde_json::from_str(json).expect("the status reads");
+        assert!(!status.has_enter_hook());
+        assert!(!status.has_leave_hook());
+        assert_eq!(status.enter_trigger, EnterTrigger::Set);
+        assert_eq!(status.colour, DEFAULT_COLOUR);
     }
 }

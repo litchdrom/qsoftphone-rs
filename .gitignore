@@ -14,3 +14,7 @@ logs/
 # Packet captures (see .gitignore in the C++ sibling repo)
 *.pcap
 *.pcapng
+
+# The state of the screen capture (see scripts/README.md)
+*.pid
+scripts/recordings/

@@ -256,8 +256,11 @@ impl AppConfig {
             if self.statuses[index].colour.trim().is_empty() {
                 self.statuses[index].colour = DEFAULT_COLOUR.to_string();
             }
-            if self.statuses[index].action_method.trim().is_empty() {
-                self.statuses[index].action_method = "GET".to_string();
+            if self.statuses[index].on_enter.method.trim().is_empty() {
+                self.statuses[index].on_enter.method = "GET".to_string();
+            }
+            if self.statuses[index].on_leave.method.trim().is_empty() {
+                self.statuses[index].on_leave.method = "GET".to_string();
             }
         }
         // The built-ins are put back, and their names and colours are
@@ -301,7 +304,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::status::StatusAction;
+    use crate::model::status::{StatusAction, StatusHook};
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -402,8 +405,8 @@ mod tests {
             id: "in a meeting".to_string(),
             name: "In a meeting".to_string(),
             colour: "#ff0000".to_string(),
-            action_kind: "dial".to_string(),
-            action_value: "666".to_string(),
+            on_enter: StatusHook::of(&StatusAction::Dial("666".to_string())),
+            on_leave: StatusHook::of(&StatusAction::Script("stop.exe".to_string())),
             ..Default::default()
         });
         config.save(&path).unwrap();
@@ -413,11 +416,16 @@ mod tests {
         let meeting = loaded.status("in a meeting").expect("the status is there");
         assert_eq!(meeting.name, "In a meeting");
         assert_eq!(meeting.colour, "#ff0000");
-        assert_eq!(meeting.action_value, "666");
+        assert_eq!(meeting.on_enter.value, "666");
         assert_eq!(
-            meeting.action(),
+            meeting.enter_action(),
             StatusAction::Dial("666".to_string()),
             "the hook is built from what the status carries"
+        );
+        assert_eq!(
+            meeting.leave_action(),
+            StatusAction::Script("stop.exe".to_string()),
+            "and the leave hook is carried too"
         );
 
         let _ = std::fs::remove_file(&path);

@@ -20,7 +20,9 @@ use qsoftphone_core::model::history::{
     CallRecord, CallResult, Direction as HistoryDirection, LocalTime, classify_result,
     format_duration, history_direction,
 };
-use qsoftphone_core::model::status::{HttpMethod, StatusAction, StatusDefinition};
+use qsoftphone_core::model::status::{
+    EnterTrigger, HttpMethod, StatusAction, StatusDefinition, StatusHook,
+};
 use qsoftphone_core::paths::AppPaths;
 use qsoftphone_core::sip::custom_headers::is_valid_name;
 use qsoftphone_core::sip::refer::TransferProgress;
@@ -660,6 +662,10 @@ impl QSoftphoneApp {
         // The hooks that used to be on the account are on the status
         // now, and the ones that are already there are moved.
         app.migrate_legacy_hooks();
+        // A status that is waiting to become active starts by itself:
+        // the capture of an agent who is already ready starts with the
+        // app.
+        app.arm_startup_hooks();
         app
     }
 
@@ -711,13 +717,15 @@ impl QSoftphoneApp {
             else {
                 continue;
             };
-            if status.action().is_some() {
+            if status.on_enter.is_some() {
                 continue;
             }
-            status.action_kind = action.kind().to_string();
-            status.action_value = action.value().to_string();
-            status.action_method = action.method().name().to_string();
-            status.action_body = action.body().to_string();
+            // The old hook ran every time the status was set, and it
+            // still does: a user who told the PBX twice pressed the
+            // button twice, and a call must not be placed at the start
+            // of the app.
+            status.on_enter = StatusHook::of(&action);
+            status.enter_trigger = EnterTrigger::Set;
             moved.push(account_id);
         }
         if moved.is_empty() {
@@ -1430,11 +1438,15 @@ impl QSoftphoneApp {
     /// statuses are the same for every account: a state of the user is
     /// a state of the user, not a state of one account.
     ///
-    /// Setting it runs the status's **hook** — the button is the
-    /// switch, and the hook is what the switch is wired to. The hook
-    /// runs every time a state is picked, even the state the account
-    /// is already in: a user who wants to tell the PBX twice presses
-    /// the button twice.
+    /// Setting it runs the status's **hooks** — the button is the
+    /// switch, and the hooks are what the switch is wired to:
+    ///
+    /// * the status the account was in is **left**, and its leave hook
+    ///   runs — a capture that was started when the agent became ready
+    ///   is stopped here;
+    /// * the new status is **entered**, and its enter hook runs — the
+    ///   trigger says when: every time the status is set, or only when
+    ///   it becomes active.
     fn set_account_status(&mut self, account_id: &str, status_id: &str) {
         let Some(index) = self.accounts.iter().position(|a| a.id == account_id) else {
             return;
@@ -1451,6 +1463,13 @@ impl QSoftphoneApp {
                 self.config.default_status()
             }
         };
+        // The status the account was in, and whether this is a
+        // change: an account that is set the status it is already in
+        // has not left it, and has not entered it either.
+        let previous_id = self.accounts[index].status.trim().to_string();
+        let previous = self.config.status(&previous_id).cloned();
+        let changed = previous_id != definition.id;
+
         let mut account = self.accounts[index].clone();
         account.status = definition.id.clone();
 
@@ -1472,7 +1491,23 @@ impl QSoftphoneApp {
             }
         }
 
-        self.run_status_action(&self.accounts[index].clone(), &definition);
+        let account = self.accounts[index].clone();
+
+        // The status it was in is left.
+        if changed {
+            if let Some(previous) = previous {
+                self.run_leave_action(&account, &previous);
+            }
+        }
+
+        // And the new one is entered.
+        let enters = match definition.enter_trigger {
+            EnterTrigger::Set => true,
+            EnterTrigger::Enter => changed,
+        };
+        if enters {
+            self.run_status_action(&account, &definition);
+        }
     }
 
     /// The status with this id.
@@ -1541,7 +1576,19 @@ impl QSoftphoneApp {
             "The status is gone — the accounts that were in it are in the default one.".to_string();
     }
 
-    /// Do what the status's hook says.
+    /// Do what the status's **enter** hook says.
+    fn run_status_action(&mut self, account: &Account, definition: &StatusDefinition) {
+        let action = definition.enter_action();
+        self.run_hook(account, &action, "the action", false);
+    }
+
+    /// Do what the status's **leave** hook says.
+    fn run_leave_action(&mut self, account: &Account, definition: &StatusDefinition) {
+        let action = definition.leave_action();
+        self.run_hook(account, &action, "the leave action", false);
+    }
+
+    /// Do what a hook says.
     ///
     /// Four kinds, and two of them are the app's own business:
     ///
@@ -1553,9 +1600,13 @@ impl QSoftphoneApp {
     /// * **a plugin** — stored and shown, and not run: §8 of the brief
     ///   puts the plugin host out of scope, and a plugin that pretends
     ///   to work is worse than one that says it is not there yet.
-    fn run_status_action(&mut self, account: &Account, definition: &StatusDefinition) {
-        let action = definition.action();
-        match &action {
+    ///
+    /// `wait` is for the closing of the app: a script that stops a
+    /// screen capture has to have finished before the process goes,
+    /// and a hook that hangs must not keep the window from closing —
+    /// so it is waited for, but only for a short while.
+    fn run_hook(&mut self, account: &Account, action: &StatusAction, what: &str, wait: bool) {
+        match action {
             StatusAction::None => {}
             StatusAction::Dial(code) => {
                 let code = code.trim();
@@ -1589,15 +1640,70 @@ impl QSoftphoneApp {
                     }
                 }
             }
-            StatusAction::Script(_) | StatusAction::Http { .. } => {
-                action::spawn(&action, &account.label, self.action_updates_tx.clone());
-                self.status = format!("Running the action for {}.", account.label);
+            StatusAction::Script(_) => {
+                if wait {
+                    action::spawn_and_wait(action, action::LEAVE_DEADLINE);
+                } else {
+                    action::spawn(action, &account.label, self.action_updates_tx.clone());
+                }
+                self.status = format!("Running {what} for {}.", account.label);
+            }
+            StatusAction::Http { .. } => {
+                action::spawn(action, &account.label, self.action_updates_tx.clone());
+                self.status = format!("Running {what} for {}.", account.label);
             }
             StatusAction::Plugin(name) => {
                 self.status = format!(
                     "The plugin {name} is not there yet — the plugin host is out of scope."
                 );
             }
+        }
+    }
+
+    /// Do what the leave hooks say when the app closes.
+    ///
+    /// An account that is in a status when the app closes has left it:
+    /// the capture that was started when the agent became ready has to
+    /// stop, and it has to stop **before** the process goes. The
+    /// script is therefore waited for — but only for a short while, so
+    /// a hook that hangs cannot keep the window from closing.
+    fn leave_everything(&mut self) {
+        let accounts = self.accounts.clone();
+        for account in accounts {
+            let Some(definition) = self.config.status(&account.status).cloned() else {
+                continue;
+            };
+            if !definition.has_leave_hook() {
+                continue;
+            }
+            let action = definition.leave_action();
+            self.run_hook(&account, &action, "the leave action", true);
+        }
+    }
+
+    /// Run the enter hooks that are waiting for the app to start.
+    ///
+    /// A status whose trigger is **only when it becomes active** is
+    /// active when the app opens with the account already in it: the
+    /// capture starts by itself, and the agent does not have to press
+    /// anything.
+    ///
+    /// The hook of a status whose trigger is **every time it is set**
+    /// does not run here: that is the old behaviour, and it is what
+    /// keeps the app from placing a call every time it is opened.
+    fn arm_startup_hooks(&mut self) {
+        let accounts = self.accounts.clone();
+        for account in accounts {
+            let Some(definition) = self.config.status(&account.status).cloned() else {
+                continue;
+            };
+            if definition.enter_trigger != EnterTrigger::Enter {
+                continue;
+            }
+            if !definition.has_enter_hook() {
+                continue;
+            }
+            self.run_status_action(&account, &definition);
         }
     }
 
@@ -4313,62 +4419,35 @@ impl QSoftphoneApp {
                 }
             });
 
-            // The hook: what happens when the status is set.
-            ui.horizontal(|ui| {
-                ui.weak("When set");
-                let label = action_kind_label(&draft.action_kind);
-                egui::ComboBox::from_id_salt(("status_kind", index))
-                    .selected_text(label)
-                    .show_ui(ui, |ui| {
-                        for (kind, kind_label) in ACTION_KINDS {
-                            ui.selectable_value(
-                                &mut draft.action_kind,
-                                kind.to_string(),
-                                kind_label,
-                            );
-                        }
-                    });
-                if !draft.action_kind.is_empty() {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut draft.action_value)
-                            .id_source(("status_value", index))
-                            .desired_width(200.0)
-                            .hint_text(action_value_hint(&draft.action_kind)),
-                    );
-                }
-                // The method and the body of an HTTP query.
-                //
-                // A GET is what a status that only *reports* needs, and
-                // a CRM that is told to change something wants a
-                // PATCH: the method is part of what the hook does, and
-                // the body is what it says.
-                if draft.action_kind == "http" {
-                    let method = HttpMethod::from_name(&draft.action_method).unwrap_or_default();
-                    egui::ComboBox::from_id_salt(("status_method", index))
-                        .selected_text(method.name())
+            // The two hooks: what happens when the status is set, and
+            // what happens when it is left.
+            //
+            // "Ready" starts a screen capture when the agent becomes
+            // ready and stops it when they stop being ready, and the
+            // two hooks are what say so.
+            let enter_salt = format!("{index}-enter");
+            let leave_salt = format!("{index}-leave");
+            draw_hook(ui, &mut draft.on_enter, &enter_salt, "When set");
+            draw_hook(ui, &mut draft.on_leave, &leave_salt, "When left");
+
+            // When the enter hook runs: every time the status is set,
+            // or only when the state becomes active.
+            if !draft.on_enter.kind.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.weak("Trigger");
+                    egui::ComboBox::from_id_salt(("status_trigger", index))
+                        .selected_text(draft.enter_trigger.label())
                         .show_ui(ui, |ui| {
-                            for method in HttpMethod::ALL {
+                            for trigger in EnterTrigger::ALL {
                                 ui.selectable_value(
-                                    &mut draft.action_method,
-                                    method.name().to_string(),
-                                    method.name(),
+                                    &mut draft.enter_trigger,
+                                    trigger,
+                                    trigger.label(),
                                 );
                             }
                         });
-                    if method.carries_body() {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut draft.action_body)
-                                .id_source(("status_body", index))
-                                .desired_width(180.0)
-                                .hint_text("{\"state\":\"online\"}"),
-                        );
-                    }
-                }
-            });
-            // What the kind means, under the field: a field with no
-            // name is a field the user does not know what to put in it.
-            if !draft.action_kind.is_empty() {
-                ui.weak(action_hint(&draft.action_kind));
+                });
+                ui.weak(trigger_hint(draft.enter_trigger));
             }
 
             if draft != original {
@@ -5648,6 +5727,15 @@ impl eframe::App for QSoftphoneApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.draw(ui);
     }
+
+    /// Do what the leave hooks say when the app closes.
+    ///
+    /// An account that is in a status when the window goes has left it:
+    /// the capture that was started when the agent became ready is
+    /// stopped here, and it is stopped **before** the process does.
+    fn on_exit(&mut self) {
+        self.leave_everything();
+    }
 }
 
 /// How often the app looks at itself when nothing else is happening.
@@ -5719,6 +5807,64 @@ const ACTION_KINDS: [(&str, &str); 5] = [
     ("plugin", "Use a plugin"),
 ];
 
+/// Draw one hook of a status: what it does, and where.
+///
+/// The two hooks of a status are the same widget with a different word
+/// in front of them, and the word is what tells the user which one is
+/// which.
+fn draw_hook(ui: &mut egui::Ui, hook: &mut StatusHook, salt: &str, label: &str) {
+    ui.horizontal(|ui| {
+        ui.weak(label);
+        egui::ComboBox::from_id_salt(("hook_kind", salt))
+            .selected_text(action_kind_label(&hook.kind))
+            .show_ui(ui, |ui| {
+                for (kind, kind_label) in ACTION_KINDS {
+                    ui.selectable_value(&mut hook.kind, kind.to_string(), kind_label);
+                }
+            });
+        if !hook.kind.is_empty() {
+            ui.add(
+                egui::TextEdit::singleline(&mut hook.value)
+                    .id_source(("hook_value", salt))
+                    .desired_width(200.0)
+                    .hint_text(action_value_hint(&hook.kind)),
+            );
+        }
+        // The method and the body of an HTTP query.
+        //
+        // A GET is what a status that only *reports* needs, and a CRM
+        // that is told to change something wants a PATCH: the method
+        // is part of what the hook does, and the body is what it says.
+        if hook.kind == "http" {
+            let method = HttpMethod::from_name(&hook.method).unwrap_or_default();
+            egui::ComboBox::from_id_salt(("hook_method", salt))
+                .selected_text(method.name())
+                .show_ui(ui, |ui| {
+                    for method in HttpMethod::ALL {
+                        ui.selectable_value(
+                            &mut hook.method,
+                            method.name().to_string(),
+                            method.name(),
+                        );
+                    }
+                });
+            if method.carries_body() {
+                ui.add(
+                    egui::TextEdit::singleline(&mut hook.body)
+                        .id_source(("hook_body", salt))
+                        .desired_width(180.0)
+                        .hint_text("{\"state\":\"online\"}"),
+                );
+            }
+        }
+    });
+    // What the kind means, under the field: a field with no name is a
+    // field the user does not know what to put in it.
+    if !hook.kind.is_empty() {
+        ui.weak(action_hint(&hook.kind));
+    }
+}
+
 /// The name of a kind of action, for the combo box.
 fn action_kind_label(kind: &str) -> &'static str {
     ACTION_KINDS
@@ -5754,6 +5900,22 @@ fn action_value_hint(kind: &str) -> &'static str {
         "http" => "https://crm.example.com/api/state",
         "plugin" => "bitrix",
         _ => "",
+    }
+}
+
+/// What the trigger means, in a sentence.
+///
+/// The sentence is under the field, because a field with no name is a
+/// field the user does not know what to put in it.
+fn trigger_hint(trigger: EnterTrigger) -> &'static str {
+    match trigger {
+        EnterTrigger::Set => {
+            "The hook runs every time the status is set — even the one the account is already in."
+        }
+        EnterTrigger::Enter => {
+            "The hook runs when the state becomes active, and when the app opens with the \
+             account already in it."
+        }
     }
 }
 
@@ -6231,11 +6393,34 @@ mod tests {
             .iter_mut()
             .find(|status| status.id == id)
             .expect("the status is one of the built-ins");
-        definition.action_kind = action.kind().to_string();
-        definition.action_value = action.value().to_string();
-        definition.action_method = action.method().name().to_string();
-        definition.action_body = action.body().to_string();
+        definition.on_enter = StatusHook::of(&action);
         id.to_string()
+    }
+
+    /// Give a status a hook that runs when the status is **left**.
+    ///
+    /// The other half of the pair: "Ready starts the capture" and
+    /// "Ready stops the capture" are two hooks of the same status.
+    fn status_with_leave_hook(app: &mut QSoftphoneApp, id: &str, action: StatusAction) -> String {
+        let definition = app
+            .config
+            .statuses
+            .iter_mut()
+            .find(|status| status.id == id)
+            .expect("the status is one of the built-ins");
+        definition.on_leave = StatusHook::of(&action);
+        id.to_string()
+    }
+
+    /// Say when the enter hook of a status runs.
+    fn status_trigger(app: &mut QSoftphoneApp, id: &str, trigger: EnterTrigger) {
+        let definition = app
+            .config
+            .statuses
+            .iter_mut()
+            .find(|status| status.id == id)
+            .expect("the status is one of the built-ins");
+        definition.enter_trigger = trigger;
     }
 
     /// The accounts list is where the status is picked.
@@ -6358,8 +6543,8 @@ mod tests {
         let path = app.paths.config_file();
         let loaded = AppConfig::load(&path).expect("the settings file reads back");
         let online = loaded.status("online").expect("the status is there");
-        assert_eq!(online.action_kind, "dial");
-        assert_eq!(online.action_value, "666");
+        assert_eq!(online.on_enter.kind, "dial");
+        assert_eq!(online.on_enter.value, "666");
     }
 
     /// An HTTP hook keeps its method and its body.
@@ -6381,10 +6566,10 @@ mod tests {
         let path = app.paths.config_file();
         let loaded = AppConfig::load(&path).expect("the settings file reads back");
         let online = loaded.status("online").expect("the status is there");
-        assert_eq!(online.action_kind, "http");
-        assert_eq!(online.action_method, "PATCH");
-        assert_eq!(online.action_value, "https://crm.example.com/api/state");
-        assert_eq!(online.action_body, "{\"state\":\"online\"}");
+        assert_eq!(online.on_enter.kind, "http");
+        assert_eq!(online.on_enter.method, "PATCH");
+        assert_eq!(online.on_enter.value, "https://crm.example.com/api/state");
+        assert_eq!(online.on_enter.body, "{\"state\":\"online\"}");
     }
 
     /// The hook of an account of an older build is not lost: it moves
@@ -6420,8 +6605,13 @@ mod tests {
 
         // The hook is on the status now.
         let pause = app.config.status("pause").expect("the status is there");
-        assert_eq!(pause.action_kind, "dial");
-        assert_eq!(pause.action_value, "666");
+        assert_eq!(pause.on_enter.kind, "dial");
+        assert_eq!(pause.on_enter.value, "666");
+        assert_eq!(
+            pause.enter_trigger,
+            EnterTrigger::Set,
+            "the old hook ran every time the status was set, and it still does"
+        );
 
         // And the account has let it go.
         assert!(
@@ -6454,8 +6644,7 @@ mod tests {
             .iter_mut()
             .find(|status| status.id == "pause")
             .expect("the status is there");
-        pause.action_kind = "dial".to_string();
-        pause.action_value = "555".to_string();
+        pause.on_enter = StatusHook::of(&StatusAction::Dial("555".to_string()));
 
         let paths = AppPaths::under(std::env::temp_dir().join("qsoftphone-app-ui-test-migrate-2"));
         let sessions = SessionRegistry::new();
@@ -6472,7 +6661,7 @@ mod tests {
 
         let pause = app.config.status("pause").expect("the status is there");
         assert_eq!(
-            pause.action_value, "555",
+            pause.on_enter.value, "555",
             "the hook of the status was overwritten"
         );
     }
@@ -6643,6 +6832,231 @@ mod tests {
             app.status.contains("not there yet"),
             "the plugin was not reported as missing: {}",
             app.status
+        );
+    }
+
+    /// The leave hook runs when the account leaves the status.
+    ///
+    /// This is what stops a screen capture: the capture was started
+    /// when the agent became ready, and it is stopped when they stop
+    /// being ready.
+    #[tokio::test]
+    async fn the_leave_hook_runs_when_the_status_changes() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let account_id = app.accounts[0].id.clone();
+
+        // "Ready stops the capture" — a code that is called, so that
+        // the test can see that it ran.
+        status_with_leave_hook(&mut app, "ready", StatusAction::Dial("333".to_string()));
+
+        // The account is in Ready and it is put into Pause: Ready is
+        // left, and its leave hook runs.
+        app.set_account_status(&account_id, "pause");
+
+        assert_eq!(
+            app.dial_number, "333",
+            "the leave hook of the status did not run"
+        );
+    }
+
+    /// An account that stays in its status has not left it.
+    #[tokio::test]
+    async fn the_leave_hook_does_not_run_without_a_change() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let account_id = app.accounts[0].id.clone();
+
+        status_with_leave_hook(&mut app, "ready", StatusAction::Dial("333".to_string()));
+
+        // The account is already in Ready.
+        app.set_account_status(&account_id, "ready");
+
+        assert_eq!(
+            app.dial_number, "",
+            "the leave hook ran although the status did not change"
+        );
+    }
+
+    /// The enter hook with the trigger **only when it becomes active**
+    /// runs on a change into the status — and not when the status is
+    /// set again.
+    #[tokio::test]
+    async fn the_enter_hook_runs_only_when_the_status_becomes_active() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let account_id = app.accounts[0].id.clone();
+
+        status_with_hook(&mut app, "ready", StatusAction::Dial("111".to_string()));
+        status_trigger(&mut app, "ready", EnterTrigger::Enter);
+
+        // The account is already in Ready: setting it again is not a
+        // change, and nothing runs.
+        app.set_account_status(&account_id, "ready");
+        assert_eq!(app.dial_number, "", "the hook ran without a change");
+
+        // It goes away and comes back: now it is a change.
+        app.set_account_status(&account_id, "pause");
+        app.set_account_status(&account_id, "ready");
+        assert_eq!(app.dial_number, "111", "the hook did not run on the change");
+    }
+
+    /// The enter hook with the trigger **every time it is set** runs
+    /// each time — even the status the account is already in.
+    ///
+    /// This is the old behaviour of M6.13: a user who wants to tell
+    /// the PBX twice presses the button twice.
+    #[tokio::test]
+    async fn the_enter_hook_runs_every_time_the_status_is_set() {
+        let (mut app, _bus) =
+            build_app_in_own_folder("trigger-set", tokio::runtime::Handle::current());
+        let account_id = app.accounts[0].id.clone();
+
+        // A script that leaves a mark, so that the test can count the
+        // runs and not only see the last one.
+        let folder = app.paths.data_dir().to_path_buf();
+        std::fs::create_dir_all(&folder).expect("the folder is there");
+        let marks = folder.join("marks.txt");
+        let command = if cfg!(target_os = "windows") {
+            format!("echo hit>>\"{}\"", marks.display())
+        } else {
+            format!("echo hit >> '{}'", marks.display())
+        };
+        status_with_hook(&mut app, "ready", StatusAction::Script(command.clone()));
+        status_trigger(&mut app, "ready", EnterTrigger::Set);
+
+        app.set_account_status(&account_id, "ready");
+        app.set_account_status(&account_id, "ready");
+
+        // The scripts run on threads of their own, so the marks are
+        // waited for.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut hits = 0;
+        while std::time::Instant::now() < deadline {
+            hits = std::fs::read_to_string(&marks)
+                .map(|text| text.lines().count())
+                .unwrap_or(0);
+            if hits >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(
+            hits, 2,
+            "the hook did not run every time the status was set: {}",
+            app.status
+        );
+    }
+
+    /// The app opens with the account already in a status whose
+    /// trigger is **only when it becomes active**: the hook runs by
+    /// itself, and the agent does not have to press anything.
+    ///
+    /// This is what makes the capture of a ready agent start with the
+    /// app.
+    #[tokio::test]
+    async fn the_enter_hook_runs_when_the_app_starts() {
+        let db = Db::open_in_memory().expect("db");
+        let store = AccountStore::new(&db);
+        let mut account = Account::new("Office", "sip.example.com:5060", "104", "pw", "udp");
+        account.id = "acct-ui-1".to_string();
+        account.status = "ready".to_string();
+        store.upsert(&account).expect("the account is saved");
+
+        // "Ready dials 111 when it becomes active."
+        let mut config = AppConfig::default();
+        let ready = config
+            .statuses
+            .iter_mut()
+            .find(|status| status.id == "ready")
+            .expect("the status is there");
+        ready.on_enter = StatusHook::of(&StatusAction::Dial("111".to_string()));
+        ready.enter_trigger = EnterTrigger::Enter;
+
+        let paths = AppPaths::under(std::env::temp_dir().join("qsoftphone-app-ui-test-startup"));
+        let sessions = SessionRegistry::new();
+        let (bus, receiver) = CallBus::new();
+        let app = QSoftphoneApp::new(
+            paths,
+            db,
+            config,
+            tokio::runtime::Handle::current(),
+            sessions,
+            bus,
+            receiver,
+        );
+
+        assert_eq!(
+            app.dial_number, "111",
+            "the hook did not run at the start of the app"
+        );
+    }
+
+    /// The leave hook runs when the app closes: a capture that was
+    /// started when the agent became ready is stopped before the
+    /// process goes.
+    #[tokio::test]
+    async fn the_leave_hook_runs_when_the_app_closes() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let account_id = app.accounts[0].id.clone();
+
+        status_with_leave_hook(&mut app, "ready", StatusAction::Dial("333".to_string()));
+        app.set_account_status(&account_id, "ready");
+
+        // The window goes.
+        app.leave_everything();
+
+        assert_eq!(
+            app.dial_number, "333",
+            "the leave hook did not run at the closing of the app"
+        );
+    }
+
+    /// The settings page has a row for each hook: what happens when
+    /// the status is set, and what happens when it is left.
+    #[tokio::test]
+    async fn the_settings_page_has_both_hooks() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        app.view = View::Settings;
+        let output = frame(&mut app, &ctx);
+
+        // The statuses are at the bottom of the page, and what is
+        // below the fold is not painted — but it is in the tree that
+        // a screen reader gets, and that is where it is looked for.
+        assert!(
+            text_at(&output, "When set").is_some(),
+            "the settings page does not say what happens when the status is set:\n{}",
+            screen_text(&output)
+        );
+        assert!(
+            text_at(&output, "When left").is_some(),
+            "the settings page does not say what happens when the status is left:\n{}",
+            screen_text(&output)
+        );
+    }
+
+    /// A settings file of M6.14 — the hook in four flat fields — still
+    /// opens, and the hook it holds is the hook of the status.
+    #[tokio::test]
+    async fn the_settings_file_of_an_older_build_still_opens() {
+        let paths = AppPaths::under(std::env::temp_dir().join("qsoftphone-app-ui-test-old-shape"));
+        std::fs::create_dir_all(paths.config_dir()).expect("the folder is there");
+        let file = paths.config_file();
+        std::fs::write(
+            &file,
+            r#"{"version":1,"statuses":[
+                 {"id":"ready","name":"Ready","actionKind":"dial","actionValue":"666"}
+               ]}"#,
+        )
+        .expect("the file is written");
+
+        let config = AppConfig::load(&file).expect("the settings file reads");
+        let ready = config.status("ready").expect("the status is there");
+        assert_eq!(ready.enter_action(), StatusAction::Dial("666".to_string()));
+        assert_eq!(ready.enter_trigger, EnterTrigger::Set);
+        assert!(
+            !ready.has_leave_hook(),
+            "the old shape had no leave hook, and it has none"
         );
     }
 

@@ -32,8 +32,17 @@
 
 use std::process::Command;
 use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 use qsoftphone_core::model::status::{HttpMethod, StatusAction};
+
+/// How long the closing of the app waits for a script.
+///
+/// A script that stops a screen capture has to have finished before
+/// the process goes — otherwise the capture is left running with
+/// nobody watching it. A hook that hangs must not keep the window from
+/// closing either, so the wait has an end.
+pub const LEAVE_DEADLINE: Duration = Duration::from_secs(2);
 
 /// What an action says when it is done.
 #[derive(Debug, Clone)]
@@ -81,6 +90,29 @@ pub fn spawn(action: &StatusAction, account: &str, sender: Sender<ActionReport>)
     }
 }
 
+/// Run an action on a thread of its own and wait for it, up to a
+/// deadline.
+///
+/// This is what the app does when it is closing: the hook that stops
+/// a screen capture has to have run before the process goes, and a
+/// hook that hangs must not keep the window from closing — so the
+/// wait has an end.
+///
+/// The report is not sent anywhere: the app is on its way out, and
+/// there is no status line left to say it on.
+pub fn spawn_and_wait(action: &StatusAction, deadline: Duration) {
+    // Only the two kinds that take time are waited for: the others
+    // are the app's own business and are done before this is called.
+    if !matches!(action, StatusAction::Script(_) | StatusAction::Http { .. }) {
+        return;
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    spawn(action, "", sender);
+    // The thread sends its report when it is done, and the channel is
+    // what says it is done.
+    let _ = receiver.recv_timeout(deadline);
+}
+
 /// Run a command, the way the user typed it.
 ///
 /// The command goes through the system's own shell, so that a path
@@ -94,20 +126,11 @@ fn run_script(command: &str) -> Result<String, String> {
         return Err("there is no command to run.".to_string());
     }
 
-    let mut process = if cfg!(target_os = "windows") {
-        Command::new("cmd")
-            .args(["/C", command])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-    } else {
-        Command::new("sh")
-            .args(["-c", command])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-    }
-    .map_err(|e| format!("the command could not be started: {e}"))?;
+    let mut process = shell(command)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("the command could not be started: {e}"))?;
 
     let status = process
         .wait()
@@ -120,6 +143,31 @@ fn run_script(command: &str) -> Result<String, String> {
             None => "the command was stopped before it finished.".to_string(),
         })
     }
+}
+
+/// The shell that runs the command, with the command in it.
+///
+/// On Windows the command is handed to `cmd` as **one line**, with the
+/// quotes the user wrote in it left alone: the path of a script with
+/// a space in it — `powershell -File "C:\Program Files\…"` — has to
+/// survive, and the ordinary way of passing an argument would put a
+/// backslash in front of every quote and make of the path another
+/// name.
+#[cfg(windows)]
+fn shell(command: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+
+    let mut builder = Command::new("cmd");
+    builder.raw_arg("/C").raw_arg(command);
+    builder
+}
+
+/// The shell that runs the command, with the command in it.
+#[cfg(not(windows))]
+fn shell(command: &str) -> Command {
+    let mut builder = Command::new("sh");
+    builder.arg("-c").arg(command);
+    builder
 }
 
 /// Fetch a URL, with the method the user chose.
@@ -246,6 +294,35 @@ mod tests {
     fn an_empty_command_is_not_run() {
         let result = run_script("   ");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_quoted_path_in_the_command_survives() {
+        // The path of a file with a space in it has to survive: a
+        // screen capture is a command that names a file, and the file
+        // is often under "Program Files" or "My Documents".
+        //
+        // The command goes to the shell as one line, so the quotes the
+        // user wrote in it are the shell's own.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let folder = std::env::temp_dir().join(format!("qsoftphone action {stamp}"));
+        std::fs::create_dir_all(&folder).expect("the folder is there");
+        let marker = folder.join("marker.txt");
+
+        let command = if cfg!(target_os = "windows") {
+            format!("echo done>\"{}\"", marker.display())
+        } else {
+            format!("echo done > '{}'", marker.display())
+        };
+        let result = run_script(&command);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            marker.exists(),
+            "the command did not reach the file: {command}"
+        );
     }
 
     #[test]

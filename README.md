@@ -69,7 +69,11 @@ whenever the far end answers with a `180 Ringing` that carries no SDP, so
 there is nothing to hear. A call that is still ringing can be
 **redirected**: the incoming-call screen answers the `INVITE` with a `302
 Moved Temporarily` and a `Contact` naming the target, so the call is
-forwarded without ever being answered. See
+forwarded without ever being answered. And a status now carries **two**
+hooks — what happens when the agent **becomes** ready and what happens
+when they **stop** being ready — so a screen capture starts by itself
+when the status changes, stops when it changes back, and is stopped
+when the app closes. See
 [Milestones](#milestones).
 
 Two of the things that were wrong with it are right now: the **ringtone
@@ -125,6 +129,11 @@ disk is worth more than the seconds it saves.
 qsoftphone-rs/
 ├── Cargo.toml                     workspace + the pinned dependency set
 ├── Cargo.lock                     committed; the exact resolved tree
+├── scripts/                       the user's own commands: the screen capture
+│   ├── start-recording.ps1        starts the capture, unless it is running
+│   ├── stop-recording.ps1         stops the capture, if it is running
+│   ├── recording-status.ps1       says whether the capture is running
+│   └── README.md                  how to wire them to a status
 └── crates/
     ├── qsoftphone-core/           no window, no sound card, no network
     │   ├── config.rs              the JSON settings file
@@ -5451,6 +5460,165 @@ account was there since M3.
 
 ---
 
+## M6.16 — The capture starts when the agent is ready
+
+*"Let's add screen capture script cmd to some status. Statuses: 'ready' —
+attach script: `script start ffmpeg blah start`, `script end ffmpeg stop`.
+With some simple control if script is running, like run file in the
+directory (please suggest variants)."*
+
+### Two hooks on every status
+
+M6.14 gave every status **one** hook: what happens when the status is
+set. A capture needs **two** — what happens when the agent *becomes*
+ready, and what happens when they stop being ready:
+
+| Hook | When it runs |
+|---|---|
+| **When set** | the status is set on the account |
+| **When left** | the account moves away from it — and the app closes while the account is in it |
+
+So "Ready" carries the start of the capture in **When set** and the end
+of it in **When left**:
+
+```text
+Ready
+  When set  → Run a script → powershell -NoProfile -ExecutionPolicy Bypass -File "…\scripts\start-recording.ps1"
+  When left → Run a script → powershell -NoProfile -ExecutionPolicy Bypass -File "…\scripts\stop-recording.ps1"
+```
+
+The **leave** hook is what makes the capture end by itself. It runs when
+the account moves to another status, and when the app is closed with the
+account still in the status — a capture that is left running with nobody
+watching it is a capture nobody wanted. The app waits for that script
+(§3 is about the interface thread, and the closing of the window is the
+one place where there is no frame after it), but only for two seconds: a
+hook that hangs must not keep the window from closing.
+
+### The trigger: every time, or only when it becomes active
+
+The enter hook has a trigger of its own, because "the status is set" and
+"the state became active" are two different moments:
+
+| Trigger | The hook runs |
+|---|---|
+| **Every time it is set** (the default) | each time the status is picked — *including* the one the account is already in |
+| **Only when it becomes active** | on a change into the status, and when the app opens with the account already in it |
+
+The first one is what M6.13 did: a user who wants to tell the PBX twice
+presses the button twice. The second one is what a capture wants: the
+recording starts when the agent becomes ready, not every time the button
+is pressed, and not at every start of the app.
+
+The trigger belongs to the **enter** hook only. The leave hook always
+runs on a change — an account that stays in its status has not left it.
+
+### The scripts
+
+`scripts/` holds three PowerShell scripts and a README of its own:
+
+| Script | What it does |
+|---|---|
+| `start-recording.ps1` | starts the capture, unless it is already running |
+| `stop-recording.ps1` | stops the capture, if it is running |
+| `recording-status.ps1` | says whether the capture is running (exit code 0 = running) |
+
+They are the user's own command, and the app's hook is the seam to them —
+the app does not know what a capture is. The scripts are **ASCII-only**
+on purpose: Windows PowerShell 5.1 reads a `.ps1` with no byte-order
+mark as the system's own code page, and anything above ASCII comes out
+as gibberish.
+
+### The ways to say "it is running"
+
+The user asked for a simple marker — a file in the directory — and there
+are five ways to do it. The one the scripts use is the **PID file**:
+
+| | How it works | What it costs |
+|---|---|---|
+| **A — a marker file** | the file's existence *is* the state | the simplest thing there is, and a file left behind by a crash says the capture is running when it is not |
+| **B — a PID file** ← *used* | the file holds the PID of the recorder; "running" means that PID is alive and is still ffmpeg | it says **which** process is the capture, so the stop script stops *that* recorder and not some other ffmpeg; a stale file is noticed and cleared |
+| **C — the process table** | `tasklist` to look, `taskkill /IM ffmpeg.exe` to stop | nothing to keep and nothing to go stale, but it cannot tell *whose* ffmpeg it is, so it kills every ffmpeg on the machine |
+| **D — the window title** | `taskkill /FI "WINDOWTITLE eq screen-rec"` | it targets one process and needs no file, but it is Windows-only and a hidden window has no title to match — which is exactly how a recorder should run |
+| **E — a lock directory** | `mkdir` is atomic: the first one to make the directory owns the capture | the classic lock, and the same staleness as the marker file |
+
+The PID file is the one worth the extra file: it is the only one of the
+five that both says *which* process is the capture and notices when that
+process is gone.
+
+### The file has to survive being killed
+
+The stop script **kills** the recorder — it is in the middle of writing a
+file, and a recorder that is asked to stop takes its time. A file that
+was killed is only playable if it was written in pieces, so the capture
+is a fragmented MP4 with three things said about it:
+
+```text
+-movflags +frag_keyframe+empty_moov   the file is written in pieces
+-frag_duration 2000000                a piece is closed every two seconds
+-flush_packets 1                      the pieces are on the disk as they are written
+```
+
+The second and the third are not decoration. Without the fragment
+duration a piece is closed at the next **keyframe**, and the keyframe of
+x264 is 250 frames away — a capture stopped in the first half-minute has
+nothing in it at all. Without the flush the pieces sit in the buffer of
+the muxer, and a killed recorder takes the buffer with it: the file is
+then a header and nothing else. Both were found by capturing on this
+machine and reading the file back.
+
+### The command reaches the shell as it is written
+
+A hook that names a file — `powershell -File "C:\Program Files\…\start.ps1"`,
+or a redirect to a path with a space in it — used to lose its quotes:
+the command was handed to the shell as an *argument*, and every quote in
+it was turned into `\"`. The command now goes to `cmd` as **one line**,
+with the user's own quotes left alone.
+
+### The statuses are global, and that has a consequence
+
+The statuses are a state of the **user**, not of one account (M6.14). So
+with two accounts on the same list, a status that is changed in one of
+them is changed for both — and the leave hook runs for the account that
+left it. The capture of a user who is ready on one line and paused on
+the other stops. That is the model, not a bug in it.
+
+### What is proved
+
+* **The leave hook runs when the status changes**, and **does not run**
+  when the account stays in its status.
+* **The enter hook with the trigger *only when it becomes active*** runs
+  on a change into the status and not when the status is set again.
+* **The enter hook with the trigger *every time it is set*** runs each
+  time — twice, for two presses of the same status, counted in a file.
+* **The enter hook runs when the app starts**, for an account that is
+  already in a status whose trigger is *only when it becomes active*.
+* **The leave hook runs when the app closes.**
+* **The settings file of M6.14 still opens**: the hook in four flat
+  fields is read as the hook that is set, and the trigger stays *every
+  time it is set* — so the migrated hook does not place a call at the
+  start of the app.
+* **A quoted path in a command survives**, and the command reaches the
+  file it names.
+
+### The dependency cost: nothing
+
+No new package: the hooks are strings in the settings file and the
+scripts are the user's own. `ureq` was already in the tree for M6.13.
+
+### What is *not* in M6.16
+
+* **The app does not know what a capture is.** There is no "record"
+  button and no recorder of its own — the recorder is the user's
+  command, and the hook is the seam to it.
+* **The hook does not wait for the script.** A script runs on a thread
+  of its own and what it says arrives on the channel (§3); only the
+  closing of the app waits, and only for two seconds.
+* **The plugin host is still out of scope** (§8): the plugin kind is
+  stored and reported as not there yet.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -5512,6 +5680,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.13** | The account's status: a button per account that says **Ready**, **Online** or **Pause** and lets the user pick another one, and the account's **action** — dial a code (DTMF if a call is up, a call if there is not), run a script, run an HTTP query, or name a plugin that is not there yet | **done** |
 | **M6.14** | The statuses are the user's: a **global** list in the main settings with a status of their own added inline, a **colour** and a **hook** on each of them, the hook on the **status** rather than on the account, the status picked in the **accounts list**, and an HTTP hook with a **method** and a **body** | **done** |
 | **M6.15** | The history says which **account** the call was on: a column in the history table, and the account in the details of the row | **done** |
+| **M6.16** | The capture starts when the agent is ready: two hooks on every status (**when set** and **when left**), a trigger that says *every time it is set* or *only when it becomes active*, the leave hook at the closing of the app, and the scripts in `scripts/` that start and stop a capture with a PID file | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -5575,7 +5744,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 578 tests, all passing.
+* `cargo test --workspace` — 594 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
