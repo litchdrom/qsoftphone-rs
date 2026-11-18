@@ -143,7 +143,8 @@ qsoftphone-rs/
 │   ├── start-recording.ps1        starts the capture, unless it is running
 │   ├── stop-recording.ps1         stops the capture, if it is running
 │   ├── recording-status.ps1       says whether the capture is running
-│   └── README.md                  how to wire them to a status
+│   ├── dummy-run.ps1              starts nothing, and records that it ran
+│   └── README.md                  how to wire them to a status, and how to check
 └── crates/
     ├── qsoftphone-core/           no window, no sound card, no network
     │   ├── config.rs              the JSON settings file
@@ -5562,6 +5563,25 @@ on purpose: Windows PowerShell 5.1 reads a `.ps1` with no byte-order
 mark as the system's own code page, and anything above ASCII comes out
 as gibberish.
 
+### Checking that the scripts run (M6.19)
+
+The app throws the **output** of a script away — the status line says
+whether it ran and which code it exited with, and that is all. So a
+script that wants to be checked has to leave something behind, and
+`scripts/dummy-run.ps1` is that script: it starts nothing, writes a
+line into `script-runs.log`, and exits with the code it was told to.
+
+```text
+2026-11-19 00:31:07  start  pid=17736  exit=0
+2026-11-19 00:31:09  stop   pid=22352  exit=0
+```
+
+The log proves each thing separately: the start script runs when the
+status is set, the stop script runs when the status is **left** and when
+the app closes, the trigger decides whether a second `start` line
+appears, and an exit code of 3 reaches the status line as *the command
+failed: it exited with 3*. The steps are in `scripts/README.md`.
+
 ### The ways to say "it is running"
 
 The user asked for a simple marker — a file in the directory — and there
@@ -5893,6 +5913,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.16** | The capture starts when the agent is ready: the action, the **start script** and the **stop script** on every status, the trigger that says *every time it is set* or *only when it becomes active*, the stop script at the closing of the app, and the scripts in `scripts/` that start and stop a capture with a PID file | **done** |
 | **M6.17** | The action and the capture run **together**: the status dials the server *and* the capture starts in the same breath, the start and the stop attach to any status, and the app exit kills the capture — the shape M6.16 guessed at, corrected | **done** |
 | **M6.18** | The window is drawn when something happens: the graphics backend is the user's choice and the light one (OpenGL) is the default, so the driver's shader compiler is not loaded — **428 MB → 106 MB** — and the events wake the window instead of the app drawing itself ten times a second — **6.0 % → 1.1 %** of one core | **done** |
+| **M6.19** | A dummy script for checking the scripts: `scripts/dummy-run.ps1` starts nothing and writes a line into `script-runs.log`, so the start script, the stop script, the trigger and the exit code can each be checked on their own | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.

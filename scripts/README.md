@@ -15,6 +15,10 @@ They need [ffmpeg](https://ffmpeg.org/) with `gdigrab` and `libx264`
 has both. The recorder is found on the `PATH`, or named in the
 `QSOFTPHONE_FFMPEG` environment variable, or passed with `-Ffmpeg`.
 
+There is a fourth script, `dummy-run.ps1`, which starts nothing and
+records that it ran — it is for checking that the wiring works, and it
+is described [below](#checking-that-the-scripts-run).
+
 ## How to wire them to a status
 
 In the softphone's **Settings → STATUSES**, find the status **Ready**
@@ -55,6 +59,75 @@ window from closing.
 > one account. With two accounts on the same list, a status that is
 > changed in one of them is changed for both, and the leave hook runs
 > for the one that left it.
+
+## Checking that the scripts run
+
+The app runs a script for real, and the answer is on the **status
+line** at the bottom of the window. The line is prefixed with the
+**label of the account** the status was set on:
+
+| What the status line says | What it means |
+|---|---|
+| `104: the command ran.` | the script ran and exited with 0 |
+| `104: the command failed: it exited with 3.` | the script ran and exited with 3 |
+| `104: the command could not be started: …` | the shell could not start it at all |
+
+The **output of the script is thrown away** — the app does not show it
+— so a script that wants to be checked has to leave something behind.
+`dummy-run.ps1` is that script: it writes a line into
+`script-runs.log` next to it, and does nothing else.
+
+### The dummy script
+
+| | |
+|---|---|
+| `-Label` | what the line says — `start`, `stop`, anything |
+| `-ExitCode` | the code to exit with (0 = success) |
+| `-Seconds` | how long it takes, to imitate a capture that lasts for hours |
+
+### The steps
+
+1. Put the dummy in a status of its own, so the real capture is not
+   touched while it is being checked. In **Settings → STATUSES**, add a
+   status (or use **Pause**), and give it:
+
+   | Field | Value |
+   |---|---|
+   | **Start script** | `powershell -NoProfile -ExecutionPolicy Bypass -File "<repo>\scripts\dummy-run.ps1" -Label start` |
+   | **Stop script** | `powershell -NoProfile -ExecutionPolicy Bypass -File "<repo>\scripts\dummy-run.ps1" -Label stop` |
+
+2. Save. The status is global, so it is on every account.
+
+3. Put the account into that status, from the **status button** in the
+   accounts list. The status line says that the command ran.
+
+4. Look at the log:
+
+   ```powershell
+   Get-Content "<repo>\scripts\script-runs.log" -Tail 10
+   ```
+
+   ```text
+   2026-11-19 00:31:07  start  pid=17736  exit=0
+   2026-11-19 00:31:09  stop   pid=22352  exit=0
+   ```
+
+5. Put the account into **another** status: the `stop` line appears —
+   the stop script of the status that was left runs then, and not
+   before.
+
+### What each thing proves
+
+| What you see | What it proves |
+|---|---|
+| a `start` line, and the status line says *the command ran* | the status's start script runs when the status is set |
+| a `stop` line when the account leaves the status | the stop script runs when the status is **left** |
+| a `stop` line when the app is closed | the app kills the capture on its way out |
+| a second `start` line for the same status | the trigger is **every time it is set**; with **only when it becomes active** there is no second line |
+| `exit=3` on the line, and *the command failed: it exited with 3* | the exit code of the script reaches the app — a script that cannot do its job is not hidden |
+
+The log is next to the scripts, and it is not in the repository: it is
+the state of the last run, like `recording.pid`.
 
 ## Where the state of the capture lives
 
