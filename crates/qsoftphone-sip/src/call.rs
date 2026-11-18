@@ -42,6 +42,7 @@ use qsoftphone_core::sip::refer::{
     ReferRequest, TransferProgress, attended_transfer, blind_transfer, feature_code_sequence,
 };
 use qsoftphone_core::sip::uri::normalise_sip_target;
+use qsoftphone_core::wake::Wake;
 use qsoftphone_media::{Codec, MediaConfig, MediaSession, MediaStatus};
 
 use crate::endpoint::split_host_port;
@@ -117,22 +118,46 @@ pub struct CallUpdate {
 /// The registrar reports an incoming call through it, and the UI
 /// drains it. The [`CallManager`] holds the receiving end; the bus is
 /// a handle that can be cloned.
+///
+/// The bus also carries the **wake**: an event on this channel is
+/// something the user has to see, so the window is asked to be drawn
+/// again as soon as the event is on its way.
 #[derive(Clone)]
-pub struct CallBus(UnboundedSender<CallUpdate>);
+pub struct CallBus {
+    sender: UnboundedSender<CallUpdate>,
+    wake: Wake,
+}
 
 impl CallBus {
     /// A bus, and the end the UI drains.
     pub fn new() -> (Self, UnboundedReceiver<CallUpdate>) {
         let (sender, receiver) = unbounded_channel();
-        (Self(sender), receiver)
+        (
+            Self {
+                sender,
+                wake: Wake::new(),
+            },
+            receiver,
+        )
     }
 
     /// Publish an event.
     pub fn publish(&self, account_id: &str, event: CallEvent) {
-        let _ = self.0.send(CallUpdate {
+        let _ = self.sender.send(CallUpdate {
             account_id: account_id.to_string(),
             event,
         });
+        // The event is on the channel; the window has to hear about it.
+        self.wake.wake();
+    }
+
+    /// The handle the other producers use to wake the interface.
+    ///
+    /// The registration, the Busy Lamp Field and the app's own workers
+    /// all wake the same window, and they all get the handle from here:
+    /// one wake, one window.
+    pub fn wake(&self) -> Wake {
+        self.wake.clone()
     }
 }
 

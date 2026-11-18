@@ -161,6 +161,21 @@ pub struct UiConfig {
     pub theme: String,
     pub window_width: f32,
     pub window_height: f32,
+    /// Which graphics backend the window is drawn with.
+    ///
+    /// * `auto` — the light one (OpenGL), and the modern one (wgpu) if
+    ///   the machine has no usable OpenGL at all.
+    /// * `gl` — OpenGL, through `eframe`'s glow backend.
+    /// * `vulkan` — wgpu on Vulkan.
+    /// * `dx12` — wgpu on Direct3D 12.
+    ///
+    /// The default is `auto`, and the default is the **light** path: the
+    /// Vulkan and Direct3D backends of an AMD or an Intel graphics card
+    /// load the driver's own shader compiler, and that compiler wants
+    /// three hundred megabytes of its own before the window has shown
+    /// anything. OpenGL draws the same window in a fraction of the
+    /// memory.
+    pub renderer: String,
 }
 
 impl Default for UiConfig {
@@ -169,6 +184,7 @@ impl Default for UiConfig {
             theme: "dark".to_string(),
             window_width: 1100.0,
             window_height: 700.0,
+            renderer: "auto".to_string(),
         }
     }
 }
@@ -308,6 +324,26 @@ mod tests {
             "qsoftphone-cfg-{}-{name}.json",
             uuid::Uuid::new_v4()
         ))
+    }
+
+    #[test]
+    fn a_settings_file_of_an_older_build_still_opens() {
+        // The file of a build that knew nothing about the graphics
+        // backend: it has no "renderer", and the app has to open it and
+        // pick the light one for itself.
+        let config: AppConfig = serde_json::from_str(r#"{"version":1,"ui":{"theme":"dark"}}"#)
+            .expect("the file did not open");
+        assert_eq!(config.ui.renderer, "auto");
+        assert_eq!(config.ui.theme, "dark");
+    }
+
+    #[test]
+    fn the_graphics_backend_is_kept() {
+        let mut config = AppConfig::default();
+        config.ui.renderer = "vulkan".to_string();
+        let json = serde_json::to_string(&config).expect("the config did not serialise");
+        let back: AppConfig = serde_json::from_str(&json).expect("the config did not come back");
+        assert_eq!(back.ui.renderer, "vulkan");
     }
 
     #[test]

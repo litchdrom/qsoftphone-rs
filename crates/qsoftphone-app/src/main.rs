@@ -77,7 +77,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // endpoints, and the bus is where the call events travel. Both are
     // handles: the registrar and the call manager share them.
     let sessions = qsoftphone_sip::SessionRegistry::new();
-    let (bus, call_events) = qsoftphone_sip::CallBus::new();
 
     // The `--call` diagnostic: a call without a window. It registers,
     // calls, and says what the media did — the only way to find out
@@ -88,6 +87,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(codec) = diagnostic_codec() {
             config.media.codecs = vec![codec.name().to_string()];
         }
+        let (bus, call_events) = qsoftphone_sip::CallBus::new();
         let mut app = app::QSoftphoneApp::new(
             paths.clone(),
             db,
@@ -101,11 +101,143 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let options = eframe::NativeOptions {
+    // The window.
+    //
+    // Which backend draws it is the user's choice, and the default is
+    // the **light** one: the Vulkan and Direct3D backends of an AMD or
+    // an Intel graphics card load the driver's own shader compiler, and
+    // that compiler wants three hundred megabytes of its own before
+    // the window has shown anything. OpenGL draws the same window in a
+    // fraction of the memory.
+    //
+    // The database of this function is closed first: the window opens
+    // its own, so that a second attempt — the fallback below — has a
+    // database of its own and not a locked one.
+    drop(db);
+
+    let choice = RendererChoice::from_setting(
+        &command_line_renderer().unwrap_or_else(|| config.ui.renderer.clone()),
+    );
+    tracing::info!(renderer = %choice, "the window is opening");
+
+    let opened = match choice {
+        // The light path first, and the modern one only if the light
+        // one cannot open a window at all.
+        RendererChoice::Auto => {
+            match run_window(&paths, &config, &handle, &sessions, Backend::Gl) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "the OpenGL window could not be opened; trying wgpu");
+                    run_window(&paths, &config, &handle, &sessions, Backend::Wgpu(None))
+                }
+            }
+        }
+        RendererChoice::Gl => run_window(&paths, &config, &handle, &sessions, Backend::Gl),
+        RendererChoice::Vulkan => run_window(
+            &paths,
+            &config,
+            &handle,
+            &sessions,
+            Backend::Wgpu(Some(eframe::wgpu::Backends::VULKAN)),
+        ),
+        RendererChoice::Dx12 => run_window(
+            &paths,
+            &config,
+            &handle,
+            &sessions,
+            Backend::Wgpu(Some(eframe::wgpu::Backends::DX12)),
+        ),
+    };
+    opened?;
+
+    tracing::info!("qsoftphone-rs exited cleanly");
+    Ok(())
+}
+
+/// Which graphics backend the window is drawn with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RendererChoice {
+    /// The light one, with the modern one as a fallback.
+    Auto,
+    /// OpenGL, through eframe's glow backend.
+    Gl,
+    /// wgpu on Vulkan.
+    Vulkan,
+    /// wgpu on Direct3D 12.
+    Dx12,
+}
+
+impl RendererChoice {
+    /// What the setting says.
+    ///
+    /// Anything that is not one of the four names is `auto`: a setting
+    /// file written by a newer build must not keep the app from
+    /// starting.
+    fn from_setting(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "gl" | "glow" | "opengl" => Self::Gl,
+            "vulkan" => Self::Vulkan,
+            "dx12" | "d3d12" => Self::Dx12,
+            _ => Self::Auto,
+        }
+    }
+}
+
+impl std::fmt::Display for RendererChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Gl => f.write_str("gl"),
+            Self::Vulkan => f.write_str("vulkan"),
+            Self::Dx12 => f.write_str("dx12"),
+        }
+    }
+}
+
+/// The backend the window is drawn with.
+enum Backend {
+    /// OpenGL, through eframe's glow backend.
+    Gl,
+    /// wgpu, with the given backends — or with the ones wgpu picks.
+    Wgpu(Option<eframe::wgpu::Backends>),
+}
+
+/// Open the window, and run the app in it.
+///
+/// The database is opened here, and not in the caller: the caller may
+/// try a second backend when the first one cannot open a window, and
+/// the second attempt needs a database of its own.
+fn run_window(
+    paths: &qsoftphone_core::paths::AppPaths,
+    config: &AppConfig,
+    runtime: &tokio::runtime::Handle,
+    sessions: &qsoftphone_sip::SessionRegistry,
+    backend: Backend,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([config.ui.window_width, config.ui.window_height]),
         ..Default::default()
     };
+
+    match backend {
+        Backend::Gl => options.renderer = eframe::Renderer::Glow,
+        Backend::Wgpu(backends) => {
+            options.renderer = eframe::Renderer::Wgpu;
+            if let Some(backends) = backends {
+                // The backend is chosen when the wgpu instance is
+                // made, and that is what the setup carries.
+                if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) =
+                    &mut options.wgpu_options.wgpu_setup
+                {
+                    setup.instance_descriptor.backends = backends;
+                }
+            }
+        }
+    }
+
+    let db = Db::open(&paths.accounts_db())?;
+    let (bus, call_events) = qsoftphone_sip::CallBus::new();
 
     eframe::run_native(
         "qsoftphone",
@@ -115,17 +247,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 paths.clone(),
                 db,
                 config.clone(),
-                handle.clone(),
+                runtime.clone(),
                 sessions.clone(),
                 bus.clone(),
                 call_events,
             )))
         }),
     )
-    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+}
 
-    tracing::info!("qsoftphone-rs exited cleanly");
-    Ok(())
+/// The renderer the command line asks for.
+///
+/// `--renderer gl` opens the window with OpenGL for this run, whatever
+/// the settings file says. It is the quick way to try a backend
+/// without editing the file.
+fn command_line_renderer() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--renderer" {
+            return args.next();
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -226,4 +370,48 @@ fn diagnostic_run(app: &mut app::QSoftphoneApp, number: &str, seconds: u64) {
         frame(app);
     }
     tracing::info!("the diagnostic call is over");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RendererChoice;
+
+    #[test]
+    fn the_renderer_the_setting_names_is_the_one_that_is_used() {
+        assert_eq!(RendererChoice::from_setting("gl"), RendererChoice::Gl);
+        assert_eq!(RendererChoice::from_setting("GL"), RendererChoice::Gl);
+        assert_eq!(RendererChoice::from_setting(" glow "), RendererChoice::Gl);
+        assert_eq!(
+            RendererChoice::from_setting("vulkan"),
+            RendererChoice::Vulkan
+        );
+        assert_eq!(RendererChoice::from_setting("dx12"), RendererChoice::Dx12);
+        assert_eq!(RendererChoice::from_setting("auto"), RendererChoice::Auto);
+    }
+
+    #[test]
+    fn a_renderer_this_build_does_not_know_falls_back_to_auto() {
+        // A settings file written by a newer build must not keep the
+        // app from starting.
+        assert_eq!(RendererChoice::from_setting("metal"), RendererChoice::Auto);
+        assert_eq!(RendererChoice::from_setting(""), RendererChoice::Auto);
+        assert_eq!(
+            RendererChoice::from_setting("nonsense"),
+            RendererChoice::Auto
+        );
+    }
+
+    #[test]
+    fn the_default_is_the_light_backend() {
+        // The light path is the default: the Vulkan and Direct3D
+        // backends of an AMD or an Intel graphics card load the
+        // driver's own shader compiler, and that compiler wants three
+        // hundred megabytes of its own.
+        assert_eq!(
+            RendererChoice::from_setting(
+                &qsoftphone_core::config::AppConfig::default().ui.renderer
+            ),
+            RendererChoice::Auto
+        );
+    }
 }

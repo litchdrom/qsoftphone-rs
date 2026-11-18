@@ -13,6 +13,7 @@ use std::sync::Arc;
 use qsoftphone_core::model::history::{CallRecord, Direction};
 use qsoftphone_core::storage::Db;
 use qsoftphone_core::storage::history::HistoryStore;
+use qsoftphone_core::wake::Wake;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::warn;
@@ -47,11 +48,11 @@ pub struct HistoryService {
 
 impl HistoryService {
     /// Start the history worker on the runtime.
-    pub fn new(handle: Handle, db: Arc<Db>) -> Self {
+    pub fn new(handle: Handle, db: Arc<Db>, wake: Wake) -> Self {
         let (commands, inbox) = unbounded_channel();
         let (outbox, updates) = unbounded_channel();
         handle.spawn(async move {
-            worker(db, inbox, outbox).await;
+            worker(db, inbox, outbox, wake).await;
         });
         Self { commands, updates }
     }
@@ -85,6 +86,7 @@ async fn worker(
     db: Arc<Db>,
     mut inbox: UnboundedReceiver<Command>,
     outbox: UnboundedSender<HistoryUpdate>,
+    wake: Wake,
 ) {
     let mut text = String::new();
     let mut direction: Option<Direction> = None;
@@ -130,5 +132,7 @@ async fn worker(
                 let _ = outbox.send(HistoryUpdate::Failed(e.to_string()));
             }
         }
+        // The rows are on the channel; the window has to hear about it.
+        wake.wake();
     }
 }

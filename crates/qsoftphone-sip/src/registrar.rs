@@ -25,6 +25,7 @@ use tracing::{Instrument, info, warn};
 
 use qsoftphone_core::logging::account_span;
 use qsoftphone_core::model::account::Account;
+use qsoftphone_core::wake::Wake;
 
 use crate::call::{CallBus, credential_of};
 use crate::endpoint::{build_endpoint, parse_transport, split_host_port, transport_param};
@@ -187,12 +188,23 @@ impl RegistrationManager {
     }
 }
 
-fn send(sender: &UnboundedSender<RegistrationEvent>, account: &Account, state: RegistrationState) {
+/// Report a state change, and wake the window.
+///
+/// The registration is what the header of the window shows, so the
+/// window is asked to be drawn again as soon as the state is on the
+/// channel.
+fn send(
+    sender: &UnboundedSender<RegistrationEvent>,
+    wake: &Wake,
+    account: &Account,
+    state: RegistrationState,
+) {
     let _ = sender.send(RegistrationEvent {
         account_id: account.id.clone(),
         user: account.user.clone(),
         state,
     });
+    wake.wake();
 }
 
 /// Cancels the endpoint's token when the registration task ends.
@@ -245,6 +257,10 @@ async fn run_registration_inner(
 ) {
     let transport = parse_transport(&account.transport);
 
+    // The handle that asks the window to be drawn again. It is the
+    // same handle the call bus uses: one window, one wake.
+    let wake = calls.wake();
+
     // The inspector does two jobs: it patches the RFC 7616 algorithm
     // spelling, and it notes the public address the registrar reports
     // — the address the Contact of an INVITE has to name.
@@ -264,6 +280,7 @@ async fn run_registration_inner(
             warn!(error = %e, "could not open the transport");
             send(
                 &sender,
+                &wake,
                 &account,
                 RegistrationState::Failed {
                     reason: e.to_string(),
@@ -316,6 +333,7 @@ async fn run_registration_inner(
     let Some(uri) = registrar_uri(&account.registrar, transport) else {
         send(
             &sender,
+            &wake,
             &account,
             RegistrationState::Failed {
                 reason: format!("`{}` is not a usable registrar", account.registrar),
@@ -346,7 +364,7 @@ async fn run_registration_inner(
         registration.outbound_proxy = Some(proxy);
     }
 
-    send(&sender, &account, RegistrationState::Registering);
+    send(&sender, &wake, &account, RegistrationState::Registering);
 
     let mut failures: u32 = 0;
     loop {
@@ -358,7 +376,12 @@ async fn run_registration_inner(
                 failures = 0;
                 let expires = registration.expires();
                 info!(expires, "registered");
-                send(&sender, &account, RegistrationState::Registered { expires });
+                send(
+                    &sender,
+                    &wake,
+                    &account,
+                    RegistrationState::Registered { expires },
+                );
             }
             Ok(response) => {
                 failures += 1;
@@ -367,6 +390,7 @@ async fn run_registration_inner(
                 warn!(status, reason, "the registrar rejected the registration");
                 send(
                     &sender,
+                    &wake,
                     &account,
                     RegistrationState::Rejected { status, reason },
                 );
@@ -376,6 +400,7 @@ async fn run_registration_inner(
                 warn!(error = %e, "the registration attempt failed");
                 send(
                     &sender,
+                    &wake,
                     &account,
                     RegistrationState::Failed {
                         reason: e.to_string(),
@@ -412,7 +437,7 @@ async fn run_registration_inner(
     // buffer overrun on the capture side and a corrupted microphone.
     sessions.remove(&account.id);
 
-    send(&sender, &account, RegistrationState::Idle);
+    send(&sender, &wake, &account, RegistrationState::Idle);
 }
 
 /// Parse the account's outbound proxy.

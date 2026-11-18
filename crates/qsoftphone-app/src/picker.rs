@@ -32,6 +32,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+use qsoftphone_core::wake::Wake;
+
 /// The title the C++ gives the dialog.
 pub const DIALOG_TITLE: &str = "Pick a ringtone WAV file";
 
@@ -98,16 +100,23 @@ pub struct Picker {
     /// One at a time: two dialogs on top of each other is a window
     /// nobody can find, and the second one would answer for the first.
     open: bool,
+    /// The handle that asks the window to be drawn again.
+    ///
+    /// The dialog is the operating system's own window: it stays open
+    /// until the user has chosen something, and the app carries on
+    /// without it. When it answers, the window has to hear about it.
+    wake: Wake,
 }
 
 impl Picker {
     /// A picker with no dialog open.
-    pub fn new() -> Self {
+    pub fn new(wake: Wake) -> Self {
         let (sender, results) = channel();
         Self {
             results,
             sender,
             open: false,
+            wake,
         }
     }
 
@@ -123,11 +132,15 @@ impl Picker {
         self.open = true;
 
         let sender = self.sender.clone();
+        let wake = self.wake.clone();
         let spawned = std::thread::Builder::new()
             .name("qsoftphone-file-dialog".to_string())
             .spawn(move || {
                 let picked = pick(target, start_in);
                 let _ = sender.send(picked);
+                // The answer is on the channel; the window has to hear
+                // about it.
+                wake.wake();
             });
         if let Err(error) = spawned {
             // The thread could not be started, so no answer will ever
@@ -166,7 +179,7 @@ impl Picker {
 
 impl Default for Picker {
     fn default() -> Self {
-        Self::new()
+        Self::new(Wake::new())
     }
 }
 
@@ -224,7 +237,7 @@ mod tests {
 
     #[test]
     fn an_answer_travels_from_the_worker_to_the_app() {
-        let mut picker = Picker::new();
+        let mut picker = Picker::new(Wake::new());
         assert!(!picker.is_open());
 
         let target = Target::AppRingtone;
@@ -246,7 +259,7 @@ mod tests {
 
     #[test]
     fn a_cancelled_dialog_says_so() {
-        let mut picker = Picker::new();
+        let mut picker = Picker::new(Wake::new());
         picker.deliver(Picked::Cancelled {
             target: Target::AppRingtone,
         });
@@ -261,7 +274,7 @@ mod tests {
 
     #[test]
     fn an_account_pick_carries_the_account_it_was_for() {
-        let mut picker = Picker::new();
+        let mut picker = Picker::new(Wake::new());
         let target = Target::AccountRingtone {
             account_id: "acct-1".to_string(),
         };

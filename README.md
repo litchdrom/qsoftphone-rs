@@ -35,9 +35,10 @@ is idle and it sends the DTMF tones during a call. And a call with **no
 microphone** — a remote session without a microphone redirection, a
 machine with no sound card — still sends RTP silence, so the clock
 keeps running and the call does not die. The window now **wakes up**:
-the app asks egui to draw again ten times a second, so the registration,
-the calls and the history appear when they happen instead of when the
-mouse moves. The settings page has an **echo test**: the microphone,
+the registration, the calls and the history appear when they happen
+instead of when the mouse moves — and the window is drawn *when
+something happens*, not ten times a second when nothing did (M6.18).
+The settings page has an **echo test**: the microphone,
 played back through the speaker — and it now **measures** rather than
 guesses: a live level meter, the level in decibels, the names of the
 devices it used, and a warning when the speaker is a headphone jack.
@@ -73,8 +74,11 @@ forwarded without ever being answered. And a status now carries an
 **action** of its own — the dial that tells the PBX that the agent is
 ready — **and** a **start script** and a **stop script** of the user's
 own, so a screen capture starts by itself when the status changes,
-stops when it changes back, and is stopped when the app closes. See
-[Milestones](#milestones).
+stops when it changes back, and is stopped when the app closes. And the
+window is **cheap** now: it is drawn when something happens rather than
+ten times a second when nothing did, and the graphics backend is the
+light one by default — the driver, not the softphone, was the 350
+megabytes. See [Milestones](#milestones).
 
 Two of the things that were wrong with it are right now: the **ringtone
 can be per account** — the account editor has a file of its own, so two
@@ -105,6 +109,12 @@ levels of the call to the log, once a second, and the numbers of the
 media when it stops — for when there is nobody at the machine to listen
 to it. `--seconds N` says how long the call should last and `--codec
 NAME` forces the codec. See [M4.11](#m411--where-the-silence-is).
+
+`--renderer gl|vulkan|dx12` draws the window with that backend for this
+run, whatever the settings file says. The default is the light one
+(OpenGL): the Vulkan and Direct3D backends load the graphics driver's
+own shader compiler, and that compiler wants three hundred megabytes of
+its own. See [M6.18](#m618--the-window-is-drawn-when-something-happens-and-the-graphics-driver-is-left-alone).
 
 Set `QSOFTPHONE_HOME` to put every file under one directory — handy
 for a portable install, and for testing without touching your real
@@ -142,7 +152,8 @@ qsoftphone-rs/
     │   ├── model/                 account, call event, history record
     │   ├── paths.rs               per-OS config / data / log dirs
     │   ├── sip/                   pure SIP functions (uri, identity, refer, headers)
-    │   └── storage/               SQLite: accounts, contacts, history
+    │   ├── storage/               SQLite: accounts, contacts, history
+    │   └── wake.rs                the handle that says "draw the window again"
     ├── qsoftphone-media/          the media plane: RTP, G.711, G.722, Opus, the sound card
     │   ├── audio.rs               the microphone, the speaker, the resampling
     │   ├── codec.rs               G.711, computed rather than tabulated; G.722; Opus
@@ -188,7 +199,7 @@ Pinned in the workspace `Cargo.toml`, locked in `Cargo.lock`.
 | `nanoaudio-g722` | 0.1.1 | the G.722 wideband codec |
 | `rusty-opus` | 1.1.1 | the Opus codec (M6.12) — pure Rust, no dependencies of its own |
 | `ureq` | 3.5.2 | the HTTP client for the status hook (M6.13, M6.14) |
-| `egui` / `eframe` | 0.37.0 | the UI (default wgpu backend) |
+| `egui` / `eframe` | 0.37.0 | the UI (the glow/OpenGL backend by default, wgpu as the fallback — M6.18) |
 | `rusqlite` | 0.41 | storage, `bundled` — SQLite is compiled in |
 | `tokio` | 1.54.1 | the async runtime the SIP stack runs on |
 | `tracing` | 0.1 | logging |
@@ -199,16 +210,17 @@ Pinned in the workspace `Cargo.toml`, locked in `Cargo.lock`.
 The brief asks for a resolved tree under ~250 crates, assuming
 rsipstack would be the bulk at 134.
 
-**Measured, the real number is 318 package names** for the Windows target
-(398 for Linux, which adds X11/Wayland/ALSA). Four of those are this
-workspace's own crates, so 314 and 394 are third-party packages. The gap
-is not bloat — it is two subtrees the brief's estimate did not account
-for:
+**Measured, the real number is 321 package names** for the Windows target
+(the Linux tree was 398 at M6.13 and grows by the same four crates M6.18
+adds; it cannot be measured from this Windows machine). Four of those
+are this workspace's own crates, so 317 are third-party packages. The
+gap is not bloat — it is two subtrees the brief's estimate did not
+account for:
 
 | Subtree | Crates | Trimmable? |
 |---|---|---|
 | `rtc` | 141 | No — every sub-crate (dtls, ice, srtp, stun, turn, mdns, media, datachannel) is an unconditional dependency |
-| `eframe` | 171 | No — `wgpu` alone is 69 and the brief asks for the default wgpu backend |
+| `eframe` | 175 | No — `wgpu` alone is 69, and M6.18 added the `glow` backend beside it so that the light path is available without giving up the modern one |
 | `rsipstack` | 64 | Yes — see below |
 | `cpal` | 17 | No |
 | `tokio` | 18 | No |
@@ -2150,6 +2162,11 @@ A tenth of a second is quick enough that nothing is noticed and slow
 enough that an idle window costs nothing. The request is made in
 `draw()`, so the headless tests exercise it too — there is a test that
 asserts the app asks for a repaint.
+
+> **M6.18 replaced this.** The poll is still there, but it is once a
+> second now, and it is only the safety net: the events **wake** the
+> window, so it is drawn when there is something to draw. The ten-a-second
+> poll was the reason an idle softphone cost a few percent of a core.
 
 The **start** was measured rather than guessed, because "it starts
 slowly" is a complaint that needs a number behind it. The app records
@@ -5664,6 +5681,154 @@ for M6.13.
 
 ---
 
+## M6.18 — The window is drawn when something happens, and the graphics driver is left alone
+
+*"Why softfone needs 350 mb of ram and cpu consume spikes to 6.5%"*
+
+### The 350 megabytes were the driver's, not the app's
+
+`eframe` draws through **wgpu** by default, and wgpu asks the graphics
+driver for Vulkan first. On an AMD or an Intel graphics card that means
+the **driver's own shader compiler** is loaded and fed every shader the
+window needs — and that compiler wants a few hundred megabytes of its
+own before the window has shown anything.
+
+The softphone's own footprint is small: the whole thing without a window
+is **28.8 MB** of working set. Everything above that was the driver.
+
+The fix is not to stop using the GPU — it is to use the **light** path.
+OpenGL through eframe's `glow` backend draws the same window through the
+same driver, without the Vulkan shader compiler:
+
+| Backend | Working set | Private | Threads | First frame |
+|---|---|---|---|---|
+| wgpu on **Vulkan** (the old default) | 428 MB | 386 MB | 49 | 601 ms |
+| wgpu on **Direct3D 12** | 547 MB | 532 MB | 29 | 610 ms |
+| wgpu on **Vulkan**, with the wake (below) | 345 MB | 298 MB | 33 | — |
+| **eframe's glow (OpenGL)** — the new default | **106 MB** | **90 MB** | **16** | **242–292 ms** |
+
+Measured on this machine (AMD Radeon iGPU, 4 cores, 16 GB), debug build,
+the real profile, the app registered with the PBX. The protocol is the
+same for every row: the app is started, it is left alone for 45 seconds
+so that the registration and the Busy Lamp Field subscriptions are over,
+and the next 30 seconds are measured. (The app itself without a window
+is **28.8 MB** of working set — everything above that was the driver.)
+
+### The CPU was the window drawing itself ten times a second
+
+egui only draws when something asks it to, and everything that changes in
+this app arrives from **outside** egui (§3): the registration, the calls,
+the media, the history, the result of a script. So the app asked for a
+redraw **every tenth of a second, whether anything had happened or not**
+— that was M4.8's "the window now wakes up", and it solved the symptom
+(a window that did not update) with the most expensive possible
+mechanism.
+
+The right mechanism is a **wake**: the thread that produces an event says
+"there is something new", and the window is drawn at once. That is what
+`qsoftphone_core::wake::Wake` is — a callback, installed on the first
+frame, that the producers call from their own threads:
+
+| | Before | After |
+|---|---|---|
+| wgpu on Vulkan (the old default) | **6.04 %** of one core | **0.57 %** |
+| eframe's glow (OpenGL, the new default) | — the old build had no glow | **1.09 %** |
+
+Same protocol as the table above: 45 seconds of settling, then 30
+seconds measured. On this four-core machine 6.04 % of one core is the
+1.5 % of the whole processor that the user saw in the task manager.
+
+The idle figure moves a little with the SIP traffic in the measurement
+window: a `NOTIFY` from the PBX, a keepalive, a registration refresh.
+
+The poll is still there, and it is now the **safety net** rather than the
+mechanism: once a second, for the things that change without saying so (a
+lamp, a state another thread wrote). While something is **moving** — the
+level meter of the echo test, the new-account form settling into place —
+the window is drawn every 30 ms as before.
+
+### The producers that wake the window
+
+| Producer | What wakes it |
+|---|---|
+| the **call bus** | every call event: an incoming call, an answer, a hangup |
+| the **registrar** | every registration state: registering, registered, rejected, failed |
+| the **history** | the rows of a search, and a finished call being stored |
+| the **media** | the devices of the machine, the test sound, the echo test |
+| the **actions** | the result of a script or an HTTP query |
+| the **file dialog** | the file the user picked |
+
+One handle, one window: the call bus carries it, and everything else
+takes it from there.
+
+### The backend is the user's choice
+
+The settings file says which one is used, and the default is the light
+one:
+
+```json
+{ "ui": { "renderer": "auto" } }
+```
+
+| Setting | What it draws with |
+|---|---|
+| `auto` (the default) | OpenGL, and wgpu if the machine has no usable OpenGL at all |
+| `gl` | OpenGL, through eframe's glow backend |
+| `vulkan` | wgpu on Vulkan |
+| `dx12` | wgpu on Direct3D 12 |
+
+And for one run, without touching the file:
+
+```powershell
+qsoftphone.exe --renderer vulkan
+```
+
+The setting is read when the window opens, so a change takes effect at the
+next start. A settings file that names a backend this build does not know
+falls back to `auto` rather than keeping the app from starting.
+
+### What is proved
+
+* **The first frame points the wake at the window**, and an event on the
+  bus wakes it: the call comes in on another thread, and the window is
+  drawn at once.
+* **The window is drawn fast only while something moves** — thirty
+  milliseconds for the level meter, a second for the idle window.
+* **The settings file of an older build still opens**: a file with no
+  `renderer` in it is read as `auto`.
+* **A backend this build does not know falls back to `auto`**, and the
+  four names the setting accepts are the four the app uses.
+* **The app still works end to end on the light path**: it registers with
+  the user's PBX, the Busy Lamp Field subscriptions are accepted, the
+  `NOTIFY`s are answered, and the keepalives are answered.
+
+### The dependency cost: four packages
+
+The **wake** costs nothing: it is a callback in the core crate, and every
+producer that has to wake the window already had a channel.
+
+The **light backend** costs four package names in the resolved Windows
+tree — `egui_glow`, `glutin`, `glutin_egl_sys` and `glutin-winit` — and
+the tree went from **317 to 321**. They were in the lock file already, as
+the optional dependencies they are; the count that matters is the tree,
+which is what is built. `winit` moved from 30.0.1 to 30.0.2, because
+`glutin-winit` needs it.
+
+The wgpu tree is still compiled in, so that `vulkan` and `dx12` remain
+available as a fallback and as a way out of a machine whose OpenGL is
+broken.
+
+### What is *not* in M6.18
+
+* **The window is not drawn in the background.** It is drawn when
+  something happens, and once a second besides; it is not a game loop.
+* **The log is still as loud as the user asked for.** `rsipstack` writes
+  every SIP packet out in full at `info`, and the day's log grows by
+  hundreds of kilobytes while the app is registered. The level is the
+  user's setting (`logging.level`), and `warn` is quieter.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -5727,6 +5892,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.15** | The history says which **account** the call was on: a column in the history table, and the account in the details of the row | **done** |
 | **M6.16** | The capture starts when the agent is ready: the action, the **start script** and the **stop script** on every status, the trigger that says *every time it is set* or *only when it becomes active*, the stop script at the closing of the app, and the scripts in `scripts/` that start and stop a capture with a PID file | **done** |
 | **M6.17** | The action and the capture run **together**: the status dials the server *and* the capture starts in the same breath, the start and the stop attach to any status, and the app exit kills the capture — the shape M6.16 guessed at, corrected | **done** |
+| **M6.18** | The window is drawn when something happens: the graphics backend is the user's choice and the light one (OpenGL) is the default, so the driver's shader compiler is not loaded — **428 MB → 106 MB** — and the events wake the window instead of the app drawing itself ten times a second — **6.0 % → 1.1 %** of one core | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -5790,12 +5956,19 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 596 tests, all passing.
+* `cargo test --workspace` — 608 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
   the database, and exits 0.
 * The GUI opens a window titled `qsoftphone` and stays up.
+* **The GUI opens on the light backend and works there**: it registers
+  with the user's own PBX (Asterisk 22.8.0), the Busy Lamp Field
+  subscriptions are accepted, the `NOTIFY`s are answered and the
+  keepalives are answered — on `glow`, the default. The working set is
+  **106 MB** and the idle CPU is **1.1 %** of one core, against **428 MB**
+  and **6.0 %** for the wgpu/Vulkan build it replaced (same machine, same
+  profile, same protocol).
 * Account CRUD round-trips through SQLite, including the policy block.
 * The config file loads, saves and round-trips; a malformed file is an
   error, not a silent reset.

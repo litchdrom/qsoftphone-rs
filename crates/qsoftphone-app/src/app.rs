@@ -28,6 +28,7 @@ use qsoftphone_core::sip::custom_headers::is_valid_name;
 use qsoftphone_core::sip::refer::TransferProgress;
 use qsoftphone_core::sip::uri::sip_uri_user_part;
 use qsoftphone_core::storage::{AccountStore, Db};
+use qsoftphone_core::wake::Wake;
 use qsoftphone_media::{Codec, DeviceInfo};
 use qsoftphone_sip::{
     CallBus, CallManager, RegistrationManager, RegistrationState, SessionRegistry,
@@ -206,6 +207,19 @@ pub struct QSoftphoneApp {
     /// (§3). What it says arrives on a channel and is drained at the
     /// top of the frame.
     picker: Picker,
+    /// The handle that asks the window to be drawn again.
+    ///
+    /// Everything that arrives from outside egui (§3) wakes it: the
+    /// registration, the calls, the media, the history, the result of a
+    /// script. So the window is drawn when there is something to draw,
+    /// and not ten times a second when there is not.
+    wake: Wake,
+    /// Whether the wake has been pointed at the window yet.
+    ///
+    /// The callback needs egui's own context, and the context only
+    /// exists once the window is up — so it is installed on the first
+    /// frame.
+    wake_armed: bool,
 }
 
 /// The state of the redirect popup.
@@ -594,7 +608,12 @@ impl QSoftphoneApp {
         // The history reads and writes the same database, on the
         // runtime (§6).
         let db = Arc::new(db);
-        let history = HistoryService::new(runtime.clone(), db.clone());
+        // One wake for the whole app: the call bus carries it, and
+        // everything that produces an event — the SIP stack, the
+        // history, the scripts, the file dialog — uses it to ask the
+        // window to be drawn again.
+        let wake = bus.wake();
+        let history = HistoryService::new(runtime.clone(), db.clone(), wake.clone());
         let mut calls =
             CallManager::new(runtime.clone(), sessions.clone(), bus.clone(), call_events);
         // The media settings are shared with the registrar: the codec
@@ -653,7 +672,9 @@ impl QSoftphoneApp {
             ringing: None,
             redirect: RedirectState::default(),
             active_pinned: false,
-            picker: Picker::new(),
+            picker: Picker::new(wake.clone()),
+            wake,
+            wake_armed: false,
         };
         app.load_selected();
         // The history is read on the runtime; the rows arrive on the
@@ -1590,6 +1611,15 @@ impl QSoftphoneApp {
         self.run_hook(account, &action, "the action");
     }
 
+    /// The way back to the app for the background actions.
+    ///
+    /// The report comes on the channel, and the window is woken: a
+    /// script that took thirty seconds has something to say, and the
+    /// status line has to say it without waiting for the next poll.
+    fn reporter(&self) -> action::Reporter {
+        action::Reporter::new(self.action_updates_tx.clone(), self.wake.clone())
+    }
+
     /// Run the **start script** of a status: the capture that begins
     /// when the agent becomes ready.
     ///
@@ -1601,7 +1631,7 @@ impl QSoftphoneApp {
         if command.is_empty() {
             return;
         }
-        action::spawn_script(command, &account.label, self.action_updates_tx.clone());
+        action::spawn_script(command, &account.label, self.reporter());
         self.status = format!("Starting the capture for {}.", account.label);
     }
 
@@ -1612,7 +1642,7 @@ impl QSoftphoneApp {
         if command.is_empty() {
             return;
         }
-        action::spawn_script(command, &account.label, self.action_updates_tx.clone());
+        action::spawn_script(command, &account.label, self.reporter());
         self.status = format!("Stopping the capture for {}.", account.label);
     }
 
@@ -1664,7 +1694,7 @@ impl QSoftphoneApp {
                 }
             }
             StatusAction::Script(_) | StatusAction::Http { .. } => {
-                action::spawn(action, &account.label, self.action_updates_tx.clone());
+                action::spawn(action, &account.label, self.reporter());
                 self.status = format!("Running {what} for {}.", account.label);
             }
             StatusAction::Plugin(name) => {
@@ -2171,9 +2201,13 @@ impl QSoftphoneApp {
         self.devices_loaded = true;
 
         let sender = self.media_updates_tx.clone();
+        let wake = self.wake.clone();
         self.runtime.spawn_blocking(move || {
             let devices = qsoftphone_media::devices();
             let _ = sender.send(MediaUpdate::Devices(devices));
+            // The devices are on the channel; the window has to hear
+            // about them.
+            wake.wake();
         });
     }
 
@@ -2314,10 +2348,12 @@ impl QSoftphoneApp {
 
         self.sound_test = SoundTest::Playing;
         let sender = self.media_updates_tx.clone();
+        let wake = self.wake.clone();
         self.runtime.spawn_blocking(move || {
             let outcome =
                 qsoftphone_media::play_test_sound(speaker.as_deref()).map_err(|e| e.to_string());
             let _ = sender.send(MediaUpdate::SoundTest(outcome));
+            wake.wake();
         });
     }
 
@@ -2373,6 +2409,7 @@ impl QSoftphoneApp {
         self.echo_levels = Some(level_rx);
 
         let sender = self.media_updates_tx.clone();
+        let wake = self.wake.clone();
         self.runtime.spawn_blocking(move || {
             let outcome = qsoftphone_media::play_echo_test(
                 microphone.as_deref(),
@@ -2386,6 +2423,7 @@ impl QSoftphoneApp {
             )
             .map_err(|e| e.to_string());
             let _ = sender.send(MediaUpdate::EchoTest(outcome));
+            wake.wake();
         });
     }
 
@@ -2713,27 +2751,42 @@ impl QSoftphoneApp {
         //
         // egui only draws when something asks it to, and the things
         // that change in this app all arrive from **outside** egui:
-        // the registration, the calls, the media, the history. Without
-        // this the window sits on the last picture until the user
-        // happens to move the mouse — an incoming call would not show
-        // up until then, and the status line would lag behind the app.
+        // the registration, the calls, the media, the history. Those
+        // producers wake the window themselves (§3) — the wake is
+        // installed below, on the first frame — so the window is drawn
+        // when there is something to draw, and not ten times a second
+        // when there is not.
         //
-        // A tenth of a second is quick enough that nothing is noticed
-        // and slow enough that an idle window costs nothing.
+        // The poll that is left is the safety net: something that
+        // changes without saying so — a lamp, a timer, a state that
+        // was written by another thread — is still noticed, just later.
+        // A second is enough for that, and it costs a hundredth of
+        // what the old ten-a-second poll cost.
+        //
         // The echo test is on its own thread, but it still has to be
         // given up on if the sound card never answers, and its level
-        // has to be picked up while it runs.
+        // has to be picked up while it runs. The level meter moves, so
+        // while the echo test runs the window is drawn faster. A tenth
+        // of a second is too slow for a bar.
         self.check_echo_test_deadline();
         self.poll_echo_level();
 
-        // The level meter moves, so while the echo test runs the window
-        // is drawn faster. A tenth of a second is too slow for a bar.
-        let poll = if self.echo_test == EchoTest::Running {
-            LEVEL_POLL
-        } else {
-            POLL
-        };
+        // The page keeps the new-account form in view while it settles,
+        // and it settles over a few frames — so the window is drawn
+        // faster while it is doing that too.
+        let poll = self.repaint_interval();
         ui.ctx().request_repaint_after(poll);
+
+        // Point the wake at the window.
+        //
+        // The callback is egui's own "draw again": it may be called
+        // from any thread, and it is what the registration, the calls
+        // and the workers use to say "there is something new".
+        if !self.wake_armed {
+            self.wake_armed = true;
+            let ctx = ui.ctx().clone();
+            self.wake.set(move || ctx.request_repaint());
+        }
 
         if !self.theme_applied {
             self.theme_applied = true;
@@ -5761,13 +5814,41 @@ impl eframe::App for QSoftphoneApp {
     /// An account that is in a status when the window goes has left it:
     /// the capture that was started when the agent became ready is
     /// stopped here, and it is stopped **before** the process does.
-    fn on_exit(&mut self) {
+    ///
+    /// The glow context is not used: the capture is the user's own
+    /// command, and the app does not know what it is.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.leave_everything();
     }
 }
 
+impl QSoftphoneApp {
+    /// How often the window is drawn when nothing has asked for it.
+    ///
+    /// The events wake the window (§3), so this is only the safety
+    /// net: it is how long the app may sit on the last picture if
+    /// something changes without saying so.
+    ///
+    /// While something is **moving** the window is drawn fast: the
+    /// level meter of the echo test, and the new-account form that is
+    /// still settling into place.
+    fn repaint_interval(&self) -> std::time::Duration {
+        if self.echo_test == EchoTest::Running || self.add_form_scroll > 0 {
+            LEVEL_POLL
+        } else {
+            IDLE_POLL
+        }
+    }
+}
+
 /// How often the app looks at itself when nothing else is happening.
-const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+///
+/// This is the **safety net**, not the way the app is kept up to date:
+/// everything that changes says so and wakes the window. The net is
+/// there for the things that do not say so — a lamp that changed, a
+/// state another thread wrote — and a second is slow enough to cost
+/// nothing and quick enough to be invisible.
+const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// How often the app looks at itself while the echo test is running.
 ///
@@ -10969,5 +11050,78 @@ mod tests {
             "the app did not say what was wrong: {}",
             app.status
         );
+    }
+
+    // -- M6.18: the window is drawn when something happens --
+
+    /// The first frame points the wake at the window.
+    ///
+    /// That is what makes an event from another thread draw it: the
+    /// wake is a callback, and the callback is egui's own "draw again".
+    #[tokio::test]
+    async fn the_first_frame_wakes_the_window() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        assert!(
+            !app.wake.is_armed(),
+            "the wake was armed before the window existed"
+        );
+        frame(&mut app, &ctx);
+        assert!(
+            app.wake.is_armed(),
+            "the first frame did not point the wake at the window"
+        );
+    }
+
+    /// An event on the bus wakes the window.
+    ///
+    /// This is the whole of the "draw it when it changes" idea: the
+    /// call comes in on another thread, and the window is drawn at once
+    /// instead of at the next poll.
+    #[tokio::test]
+    async fn an_event_wakes_the_window() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx);
+
+        let woken = Arc::new(AtomicUsize::new(0));
+        let seen = woken.clone();
+        app.wake.set(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+
+        bus.publish("acct-ui-1", incoming_event());
+        assert_eq!(
+            woken.load(Ordering::SeqCst),
+            1,
+            "the event did not wake the window"
+        );
+    }
+
+    /// The window is drawn fast while something moves, and slowly when
+    /// nothing does.
+    ///
+    /// The slow case is the one that costs: an idle window that is
+    /// drawn ten times a second is a window that burns a few percent of
+    /// a core for nothing.
+    #[tokio::test]
+    async fn the_window_is_drawn_fast_only_while_something_moves() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+
+        // Nothing is moving: the events wake the window, and the poll
+        // is only the safety net.
+        assert_eq!(app.repaint_interval(), IDLE_POLL);
+        assert!(
+            IDLE_POLL >= std::time::Duration::from_millis(500),
+            "an idle window is drawn too often: {IDLE_POLL:?}"
+        );
+
+        // The level meter moves: the window has to keep up with it.
+        app.echo_test = EchoTest::Running;
+        assert_eq!(app.repaint_interval(), LEVEL_POLL);
     }
 }

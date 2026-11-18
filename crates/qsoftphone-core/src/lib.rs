@@ -15,6 +15,8 @@
 //! * [`config`] — the JSON settings file next to the app data.
 //! * [`logging`] — tracing wired to a rotating file plus stderr.
 //! * [`paths`] — per-OS config/data/log directories.
+//! * [`wake`] — the handle the event producers use to ask the window
+//!   to be drawn again.
 //!
 //! The behavioural reference for everything in here is the existing
 //! C++ implementation in `../qsoftphone`. Where this crate and the
@@ -27,5 +29,6 @@ pub mod model;
 pub mod paths;
 pub mod sip;
 pub mod storage;
+pub mod wake;
 
 pub use error::{Error, Result};

@@ -63,7 +63,19 @@ rsipstack = { version = "0.7", default-features = false, features = [
 ] }
 rtc = { version = "0.21", default-features = false, features = ["crypto-ring"] }
 cpal = "0.18"
-eframe = "0.37"
+eframe = { version = "0.37", features = [
+    # Both backends are compiled in, and the settings file says which
+    # one is used: "glow" is the light one (OpenGL), "wgpu" is the
+    # modern one (Vulkan, Direct3D 12). The default is the light one —
+    # the Vulkan and Direct3D backends of an AMD or an Intel graphics
+    # card load the driver's own shader compiler, and that compiler
+    # wants three hundred megabytes of its own.
+    #
+    # The rest of eframe's default features are left on: they carry
+    # winit's own defaults, and those are what put the Wayland client
+    # decorations and the dynamic loading of libwayland on Linux.
+    "glow",
+] }
 egui = "0.37"
 
 [profile.dev]

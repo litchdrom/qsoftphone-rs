@@ -35,6 +35,7 @@ use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use qsoftphone_core::model::status::{HttpMethod, StatusAction};
+use qsoftphone_core::wake::Wake;
 
 /// How long the closing of the app waits for a script.
 ///
@@ -53,12 +54,36 @@ pub struct ActionReport {
     pub result: Result<String, String>,
 }
 
+/// The way back to the app.
+///
+/// The report goes on the channel, and the window is asked to be drawn
+/// again: a script that took thirty seconds has something to say, and
+/// the status line has to say it without waiting for the next poll.
+#[derive(Clone)]
+pub struct Reporter {
+    sender: Sender<ActionReport>,
+    wake: Wake,
+}
+
+impl Reporter {
+    /// A reporter for the given channel.
+    pub fn new(sender: Sender<ActionReport>, wake: Wake) -> Self {
+        Self { sender, wake }
+    }
+
+    /// Say what happened.
+    pub fn report(&self, account: String, result: Result<String, String>) {
+        let _ = self.sender.send(ActionReport { account, result });
+        self.wake.wake();
+    }
+}
+
 /// Run an action that takes time, on a thread of its own.
 ///
 /// The thread is not joined and nothing waits for it: the report comes
 /// back on the channel when it is ready, and the interface carries on
 /// in the meantime.
-pub fn spawn(action: &StatusAction, account: &str, sender: Sender<ActionReport>) {
+pub fn spawn(action: &StatusAction, account: &str, reporter: Reporter) {
     match action {
         StatusAction::Script(command) => {
             let command = command.clone();
@@ -67,7 +92,7 @@ pub fn spawn(action: &StatusAction, account: &str, sender: Sender<ActionReport>)
                 .name("qsoftphone-action".to_string())
                 .spawn(move || {
                     let result = run_script(&command);
-                    let _ = sender.send(ActionReport { account, result });
+                    reporter.report(account, result);
                 })
                 .ok();
         }
@@ -80,7 +105,7 @@ pub fn spawn(action: &StatusAction, account: &str, sender: Sender<ActionReport>)
                 .name("qsoftphone-action".to_string())
                 .spawn(move || {
                     let result = run_http(method, &url, &body);
-                    let _ = sender.send(ActionReport { account, result });
+                    reporter.report(account, result);
                 })
                 .ok();
         }
@@ -96,14 +121,14 @@ pub fn spawn(action: &StatusAction, account: &str, sender: Sender<ActionReport>)
 /// starts when the agent becomes ready, and the one that stops it.
 /// The command is run the way the user typed it — through the system's
 /// own shell, with the quotes they wrote in it left alone.
-pub fn spawn_script(command: &str, account: &str, sender: Sender<ActionReport>) {
+pub fn spawn_script(command: &str, account: &str, reporter: Reporter) {
     let command = command.trim().to_string();
     let account = account.to_string();
     std::thread::Builder::new()
         .name("qsoftphone-script".to_string())
         .spawn(move || {
             let result = run_script(&command);
-            let _ = sender.send(ActionReport { account, result });
+            reporter.report(account, result);
         })
         .ok();
 }
@@ -120,7 +145,9 @@ pub fn spawn_script(command: &str, account: &str, sender: Sender<ActionReport>) 
 /// there is no status line left to say it on.
 pub fn spawn_script_and_wait(command: &str, deadline: Duration) {
     let (sender, receiver) = std::sync::mpsc::channel();
-    spawn_script(command, "", sender);
+    // Nobody is watching this one: the app is on its way out, and there
+    // is no window left to wake.
+    spawn_script(command, "", Reporter::new(sender, Wake::new()));
     // The thread sends its report when it is done, and the channel is
     // what says it is done.
     let _ = receiver.recv_timeout(deadline);
@@ -346,7 +373,7 @@ mod tests {
         spawn(
             &StatusAction::Script("echo hello".to_string()),
             "Office",
-            sender,
+            Reporter::new(sender, Wake::new()),
         );
         let report = receiver
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -438,7 +465,7 @@ mod tests {
                 body: "{}".to_string(),
             },
             "Office",
-            sender,
+            Reporter::new(sender, Wake::new()),
         );
         let report = receiver
             .recv_timeout(std::time::Duration::from_secs(10))
