@@ -46,7 +46,7 @@
 //! what the switch is wired to.
 //!
 //! So the action belongs to the **status**, not to the account:
-//! "Online" dials 666 whoever is online, and "Pause" dials 555 — and
+//! "Online" dials 101 whoever is online, and "Pause" dials 555 — and
 //! the two numbers are two lines in the settings, not two lines in
 //! every account.
 //!
@@ -948,8 +948,8 @@ mod tests {
         // The hook of an account that was saved before the hooks moved
         // to the statuses: it is in the column, and it is not lost.
         let action =
-            StatusAction::from_legacy_json(r#"{"dial":"666"}"#).expect("the old action is read");
-        assert_eq!(action, StatusAction::Dial("666".to_string()));
+            StatusAction::from_legacy_json(r#"{"dial":"101"}"#).expect("the old action is read");
+        assert_eq!(action, StatusAction::Dial("101".to_string()));
 
         // The old HTTP action was a URL and nothing else, and it is a
         // GET: a user who had one had a GET.
@@ -1030,11 +1030,11 @@ mod tests {
         // different things: what the softphone does, the command that
         // starts the capture, and the command that stops it.
         let mut status = StatusDefinition::built_ins().remove(1);
-        status.action = StatusHook::of(&StatusAction::Dial("666".to_string()));
+        status.action = StatusHook::of(&StatusAction::Dial("101".to_string()));
         status.start_script = "start.exe".to_string();
         status.stop_script = "stop.exe".to_string();
 
-        assert_eq!(status.enter_action(), StatusAction::Dial("666".to_string()));
+        assert_eq!(status.enter_action(), StatusAction::Dial("101".to_string()));
         assert_eq!(status.start_command(), "start.exe");
         assert_eq!(status.stop_command(), "stop.exe");
         assert!(status.has_action());
@@ -1045,7 +1045,7 @@ mod tests {
     #[test]
     fn a_status_survives_a_json_round_trip() {
         let mut status = StatusDefinition::built_ins().remove(0);
-        status.action = StatusHook::of(&StatusAction::Dial("666".to_string()));
+        status.action = StatusHook::of(&StatusAction::Dial("101".to_string()));
         status.start_script = "start.exe".to_string();
         status.stop_script = "stop.exe".to_string();
         status.script_trigger = EnterTrigger::Set;
@@ -1073,13 +1073,13 @@ mod tests {
             "name": "Ready",
             "colour": "#4cc06a",
             "actionKind": "dial",
-            "actionValue": "666",
+            "actionValue": "101",
             "actionMethod": "GET",
             "actionBody": ""
         }"##;
         let status: StatusDefinition = serde_json::from_str(json).expect("the old status reads");
         assert_eq!(status.id, "ready");
-        assert_eq!(status.enter_action(), StatusAction::Dial("666".to_string()));
+        assert_eq!(status.enter_action(), StatusAction::Dial("101".to_string()));
         assert!(
             !status.has_start_script(),
             "the old shape had no capture, and it has none"
@@ -1108,10 +1108,10 @@ mod tests {
         // And an enter hook that was not a script is the action.
         let json = r#"{
             "id": "ready",
-            "onEnter": {"kind": "dial", "value": "666"}
+            "onEnter": {"kind": "dial", "value": "101"}
         }"#;
         let status: StatusDefinition = serde_json::from_str(json).expect("the old status reads");
-        assert_eq!(status.enter_action(), StatusAction::Dial("666".to_string()));
+        assert_eq!(status.enter_action(), StatusAction::Dial("101".to_string()));
         assert!(!status.has_start_script());
     }
 
@@ -1123,7 +1123,7 @@ mod tests {
         let json = r#"{
             "id": "ready",
             "actionKind": "dial",
-            "actionValue": "666",
+            "actionValue": "101",
             "action": {"kind": "http", "value": "https://crm.example.com/api/state"}
         }"#;
         let status: StatusDefinition = serde_json::from_str(json).expect("the status reads");

@@ -160,8 +160,8 @@ mod tests {
             "sip:6666@sip:example.com"
         );
         assert_eq!(
-            normalise_sip_target(" 666 6 ", "example.com"),
-            "sip:6666@example.com"
+            normalise_sip_target(" 101 1 ", "example.com"),
+            "sip:1011@example.com"
         );
     }
 

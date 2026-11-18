@@ -5207,7 +5207,7 @@ it, and a blocking client is simpler than an async one. It declares
 
 ## M6.14 — The statuses are the user's, and the hook is on the status
 
-*"Better to add status selector to accounts. Https query might need put post or patch method. Also statuses should be configurable per status — Online dials 666, Pause dials 555. Possible it needs to be main settings for all accounts. So user adds inline status with hooks on that. Maybe with a color selection."*
+*"Better to add status selector to accounts. Https query might need put post or patch method. Also statuses should be configurable per status — Online dials 101, Pause dials 555. Possible it needs to be main settings for all accounts. So user adds inline status with hooks on that. Maybe with a color selection."*
 
 M6.13 gave every account a status out of three and a hook of its own. This
 milestone makes both of them the **user's**:
@@ -5216,7 +5216,7 @@ milestone makes both of them the **user's**:
   title;
 * the list of statuses is **global** — the user's own, in the main settings,
   with a status of their own added inline;
-* the **hook belongs to the status**, not to the account: "Online dials 666"
+* the **hook belongs to the status**, not to the account: "Online dials 101"
   is one line and it holds for every account that is online;
 * each status has a **colour** of its own;
 * the HTTP hook has a **method** and a **body**: `GET`, `POST`, `PUT`,
@@ -5261,7 +5261,7 @@ Each status is a **name**, a **colour** and a **hook**:
 ● Ready            #4cc06a                                    ×
   When set  [Nothing ▾]
 ● Online           #d8a630                                    ×
-  When set  [Dial a code ▾]  [666                    ]
+  When set  [Dial a code ▾]  [101                    ]
 ● Pause            #808080                                    ×
   When set  [Run an HTTP query ▾]  [https://crm/api/state]  [PATCH ▾]  [{"state":"pause"}]
 ● In a meeting     #9b59b6                                    ×
@@ -5291,7 +5291,7 @@ Now the hook is on the **status**:
 | **Run an HTTP query** | the URL is fetched with the method and the body the user chose |
 | **Use a plugin** | nothing yet — §8 of the brief puts the plugin host out of scope |
 
-So "Online dials 666" and "Pause dials 555" are two lines in the settings,
+So "Online dials 101" and "Pause dials 555" are two lines in the settings,
 and they hold for every account.
 
 ### The HTTP hook has a method and a body
@@ -5336,7 +5336,7 @@ The statuses are in the **settings file**, in a `statuses` section:
   { "id": "ready",  "name": "Ready",  "colour": "#4cc06a",
     "actionKind": "",   "actionValue": "", "actionMethod": "GET", "actionBody": "" },
   { "id": "online", "name": "Online", "colour": "#d8a630",
-    "actionKind": "dial", "actionValue": "666", "actionMethod": "GET", "actionBody": "" }
+    "actionKind": "dial", "actionValue": "101", "actionMethod": "GET", "actionBody": "" }
 ]
 ```
 

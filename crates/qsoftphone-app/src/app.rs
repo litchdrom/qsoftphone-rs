@@ -695,7 +695,7 @@ impl QSoftphoneApp {
     /// An account saved by an older build has a hook of its own, in a
     /// column of its own, and a status with no hook of its own: the
     /// hook moves to the status, and it moves for **every** account —
-    /// which is what the hook was always about. "Online dials 666" was
+    /// which is what the hook was always about. "Online dials 101" was
     /// one line on one account; it is one line on the status now.
     ///
     /// A status that has a hook of its own keeps it: the user wrote
@@ -4459,7 +4459,7 @@ impl QSoftphoneApp {
     /// are the start of it, and every one of them — the built-ins
     /// included — can be renamed, recoloured and given a hook.
     ///
-    /// The hook is here and not on the account: "Online dials 666" is
+    /// The hook is here and not on the account: "Online dials 101" is
     /// one line, and it holds for every account that is online. A hook
     /// on the account would be the same line written down twice, once
     /// for every account the user has.
@@ -6092,7 +6092,7 @@ fn action_hint(kind: &str) -> &'static str {
 /// What the value of a kind of action is, in a word.
 fn action_value_hint(kind: &str) -> &'static str {
     match kind {
-        "dial" => "666",
+        "dial" => "101",
         "script" => "capture.exe --screen",
         "http" => "https://crm.example.com/api/state",
         "plugin" => "bitrix",
@@ -6580,7 +6580,7 @@ mod tests {
 
     /// Give a status an **action**, and say which status it is.
     ///
-    /// The action belongs to the **status** now: "Online dials 666" is
+    /// The action belongs to the **status** now: "Online dials 101" is
     /// one line in the settings, and it holds for every account that
     /// is online. An action on the account would be the same line
     /// written down once for every account the user has.
@@ -6778,16 +6778,16 @@ mod tests {
     async fn the_hook_is_saved_with_the_status() {
         let (mut app, _bus) = build_app_in_own_folder("hook", tokio::runtime::Handle::current());
 
-        // "Online dials 666" — and the method of the HTTP hook is the
+        // "Online dials 101" — and the method of the HTTP hook is the
         // one the user chose.
-        status_with_hook(&mut app, "online", StatusAction::Dial("666".to_string()));
+        status_with_hook(&mut app, "online", StatusAction::Dial("101".to_string()));
         app.save_settings();
 
         let path = app.paths.config_file();
         let loaded = AppConfig::load(&path).expect("the settings file reads back");
         let online = loaded.status("online").expect("the status is there");
         assert_eq!(online.action.kind, "dial");
-        assert_eq!(online.action.value, "666");
+        assert_eq!(online.action.value, "101");
     }
 
     /// An HTTP hook keeps its method and its body.
@@ -6818,7 +6818,7 @@ mod tests {
     /// The hook of an account of an older build is not lost: it moves
     /// onto the status the account was in.
     ///
-    /// "Online dials 666" was one line on one account; it is one line
+    /// "Online dials 101" was one line on one account; it is one line
     /// on the status now, and it holds for every account.
     #[tokio::test]
     async fn the_old_per_account_hook_moves_onto_the_status() {
@@ -6830,7 +6830,7 @@ mod tests {
         store.upsert(&account).expect("the account is saved");
         // The hook of an older build, in the column it was kept in.
         store
-            .write_legacy_hook("acct-ui-1", r#"{"dial":"666"}"#)
+            .write_legacy_hook("acct-ui-1", r#"{"dial":"101"}"#)
             .expect("the old hook is written");
 
         let paths = AppPaths::under(std::env::temp_dir().join("qsoftphone-app-ui-test-migrate"));
@@ -6849,7 +6849,7 @@ mod tests {
         // The hook is on the status now.
         let pause = app.config.status("pause").expect("the status is there");
         assert_eq!(pause.action.kind, "dial");
-        assert_eq!(pause.action.value, "666");
+        assert_eq!(pause.action.value, "101");
 
         // And the account has let it go.
         assert!(
@@ -6872,7 +6872,7 @@ mod tests {
         account.status = "pause".to_string();
         store.upsert(&account).expect("the account is saved");
         store
-            .write_legacy_hook("acct-ui-1", r#"{"dial":"666"}"#)
+            .write_legacy_hook("acct-ui-1", r#"{"dial":"101"}"#)
             .expect("the old hook is written");
 
         // The status has a hook of its own: "Pause dials 555".
@@ -7084,8 +7084,8 @@ mod tests {
             build_app_in_own_folder("together", tokio::runtime::Handle::current());
         let account_id = app.accounts[0].id.clone();
 
-        // "Ready dials 666" — the softphone tells the PBX.
-        status_with_hook(&mut app, "ready", StatusAction::Dial("666".to_string()));
+        // "Ready dials 101" — the softphone tells the PBX.
+        status_with_hook(&mut app, "ready", StatusAction::Dial("101".to_string()));
         // And the capture starts at the same time.
         let marks = marks_file(&app, "start.txt");
         status_with_scripts(&mut app, "ready", &mark_command(&marks), "");
@@ -7093,7 +7093,7 @@ mod tests {
         app.set_account_status(&account_id, "ready");
 
         assert_eq!(
-            app.dial_number, "666",
+            app.dial_number, "101",
             "the action of the status did not run"
         );
         assert_eq!(
@@ -7333,14 +7333,14 @@ mod tests {
         std::fs::write(
             &file,
             r#"{"version":1,"statuses":[
-                 {"id":"ready","name":"Ready","actionKind":"dial","actionValue":"666"}
+                 {"id":"ready","name":"Ready","actionKind":"dial","actionValue":"101"}
                ]}"#,
         )
         .expect("the file is written");
 
         let config = AppConfig::load(&file).expect("the settings file reads");
         let ready = config.status("ready").expect("the status is there");
-        assert_eq!(ready.enter_action(), StatusAction::Dial("666".to_string()));
+        assert_eq!(ready.enter_action(), StatusAction::Dial("101".to_string()));
         assert!(
             !ready.has_start_script(),
             "the old shape had no capture, and it has none"
