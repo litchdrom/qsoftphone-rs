@@ -1714,6 +1714,9 @@ impl QSoftphoneApp {
     ///
     /// The script is therefore waited for, but only for a short while,
     /// so a command that hangs cannot keep the window from closing.
+    ///
+    /// And then the accounts are put back into the status the app
+    /// starts from, so that the next morning begins in a known state.
     fn leave_everything(&mut self) {
         let accounts = self.accounts.clone();
         for account in accounts {
@@ -1725,6 +1728,38 @@ impl QSoftphoneApp {
                 continue;
             }
             action::spawn_script_and_wait(command, action::LEAVE_DEADLINE);
+        }
+
+        self.restore_account_statuses();
+    }
+
+    /// Put every account back into the status the app starts from.
+    ///
+    /// The reset is **silent**: the action of the status does not run,
+    /// and its start script does not run either. The app is closing —
+    /// the capture of the status that is being left has already stopped
+    /// — and a capture that starts on the way out is a capture nobody
+    /// asked for.
+    ///
+    /// Nothing happens when the user has not chosen a status: every
+    /// account then keeps the status it was in, and the next start
+    /// begins where the last one ended.
+    fn restore_account_statuses(&mut self) {
+        let Some(definition) = self.config.restore_target().cloned() else {
+            return;
+        };
+        for index in 0..self.accounts.len() {
+            let mut account = self.accounts[index].clone();
+            if account.status == definition.id {
+                continue;
+            }
+            account.status = definition.id.clone();
+            match AccountStore::new(&self.db).upsert(&account) {
+                Ok(saved) => self.accounts[index] = saved,
+                Err(e) => {
+                    tracing::warn!(error = %e, "the status was not restored");
+                }
+            }
         }
     }
 
@@ -4442,6 +4477,43 @@ impl QSoftphoneApp {
         // the fields that are being typed into.
         let mut remove: Option<usize> = None;
         let mut changed = false;
+
+        // The status the accounts go back into when the app closes.
+        //
+        // The choice is drawn on a copy and written back, for the same
+        // reason the fields of a status are: the list is walked while
+        // it is being drawn.
+        let mut restore = self.config.restore_status.clone();
+        let restore_label = match self.config.restore_target() {
+            Some(definition) => definition.name.clone(),
+            None => "Keep the status of each account".to_string(),
+        };
+        ui.horizontal(|ui| {
+            ui.weak("Default status after restore");
+            egui::ComboBox::from_id_salt("restore_status")
+                .selected_text(restore_label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut restore,
+                        String::new(),
+                        "Keep the status of each account",
+                    );
+                    let statuses = self.config.statuses.clone();
+                    for status in statuses {
+                        ui.selectable_value(&mut restore, status.id.clone(), status.name);
+                    }
+                });
+        });
+        ui.weak(
+            "Every account is put back into this status when the app closes, so the next start \
+             begins in a known state. Nothing runs on the way out: the capture of the status that \
+             is left stops, and nothing starts.",
+        );
+        if restore != self.config.restore_status {
+            self.config.restore_status = restore;
+            changed = true;
+        }
+        ui.add_space(4.0);
 
         for index in 0..self.config.statuses.len() {
             let original = self.config.statuses[index].clone();
@@ -11123,5 +11195,105 @@ mod tests {
         // The level meter moves: the window has to keep up with it.
         app.echo_test = EchoTest::Running;
         assert_eq!(app.repaint_interval(), LEVEL_POLL);
+    }
+
+    // -- M6.20: the status the app starts from --
+
+    /// The accounts go back into the chosen status when the app closes.
+    ///
+    /// The next start then begins in a known state, and the state is
+    /// the one the user chose — not the one the app happened to be in
+    /// when the window was closed.
+    #[tokio::test]
+    async fn the_accounts_go_back_to_the_default_status_when_the_app_closes() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let account_id = app.accounts[0].id.clone();
+
+        // The user chose the status the app starts from.
+        app.config.restore_status = "ready".to_string();
+        // The account is somewhere else.
+        app.set_account_status(&account_id, "online");
+        assert_eq!(app.accounts[0].status, "online");
+
+        // The app closes.
+        app.leave_everything();
+
+        assert_eq!(
+            app.accounts[0].status, "ready",
+            "the account was not put back into the status"
+        );
+        // And it is in the database as well: the next start reads it
+        // from there.
+        let accounts = AccountStore::new(&app.db).list().expect("the accounts");
+        assert_eq!(
+            accounts[0].status, "ready",
+            "the status was not saved, so the next start would not see it"
+        );
+    }
+
+    /// The reset is silent: nothing starts on the way out.
+    ///
+    /// The capture of the status that is **left** stops — that is the
+    /// stop script — but the capture of the status the accounts are put
+    /// back into must not start: the app is closing.
+    #[tokio::test]
+    async fn the_reset_does_not_start_the_capture() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let account_id = app.accounts[0].id.clone();
+        let marks = marks_file(&app, "restore-marks.txt");
+        let _ = std::fs::remove_file(&marks);
+
+        // Ready starts a capture; Online stops one.
+        status_with_scripts(&mut app, "ready", &mark_command(&marks), "");
+        status_with_scripts(&mut app, "online", "", &mark_command(&marks));
+        app.config.restore_status = "ready".to_string();
+        app.set_account_status(&account_id, "online");
+
+        // The app closes.
+        app.leave_everything();
+
+        let hits = wait_for_marks(&marks, 1, 3000);
+        assert_eq!(
+            hits, 1,
+            "the stop script of the status that was left did not run"
+        );
+        // A start script that must not run gets its chance to run.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert_eq!(
+            marks_in(&marks),
+            1,
+            "the reset started the capture of the status it put the account back into"
+        );
+    }
+
+    /// Without a chosen status, every account keeps the one it is in.
+    #[tokio::test]
+    async fn without_a_chosen_status_the_accounts_keep_their_own() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let account_id = app.accounts[0].id.clone();
+        app.set_account_status(&account_id, "online");
+
+        app.leave_everything();
+
+        assert_eq!(
+            app.accounts[0].status, "online",
+            "the account was put back without being asked to"
+        );
+    }
+
+    /// The settings page says what the status is for, and offers it.
+    #[tokio::test]
+    async fn the_settings_page_has_the_default_status_after_restore() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        app.view = View::Settings;
+
+        let output = frame(&mut app, &ctx);
+        assert!(
+            text_at(&output, "Default status after restore").is_some(),
+            "the settings page has no way to choose the status the app starts from:\n{}",
+            screen_text(&output)
+        );
     }
 }

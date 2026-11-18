@@ -5849,6 +5849,98 @@ broken.
 
 ---
 
+## M6.20 — The status the app starts from
+
+*"I suppose we need to add default state to reset when shutdown. Like
+switch in statuses — default status after restore."*
+
+### The problem
+
+A softphone that is left in a status is left in it: an account that was
+**Offline** at ten past six is still **Offline** at nine the next
+morning, and the agent has to remember to put it back. The status is
+the state of the *user*, and the state of the user at the end of the
+day is not the state the user wants to start the next one in.
+
+### The switch
+
+In **Settings → STATUSES** there is now a **Default status after
+restore** — a list of the user's own statuses, plus *Keep the status of
+each account*, which is what it does when nothing is chosen.
+
+| | |
+|---|---|
+| **Keep the status of each account** | the app starts the next morning where the evening left it — the old behaviour |
+| **Ready** (or any other status) | every account is put back into that status when the app closes, and the next start begins there |
+
+### The reset is silent
+
+Two things run when the app closes, and they are not the same thing:
+
+| | Runs? |
+|---|---|
+| the **stop script** of the status that is being left | **yes** — the capture has to stop before the process goes |
+| the **action** of the status the account is put back into | **no** — the app is closing; the PBX is not told anything |
+| the **start script** of the status the account is put back into | **no** — a capture that starts on the way out is a capture nobody asked for |
+
+So the reset writes the status into the database and nothing else: the
+next start reads it from there, and the capture of the new status
+starts then — by the trigger, like any other.
+
+### What is proved
+
+* **The accounts go back into the chosen status when the app closes**,
+  and the status is in the database as well, so the next start sees it.
+* **The reset does not start the capture**: the stop script of the
+  status that is left runs, and the start script of the status the
+  account is put back into does not.
+* **Without a chosen status, every account keeps its own.**
+* **The settings file of an older build still opens**: a file with no
+  `restoreStatus` in it is read as *keep the status of each account*.
+* **A status that is not there any more is no restore status** — the app
+  does not fall back to some other status behind the user's back.
+
+### The dependency cost: nothing
+
+The setting is a field in the settings file, and the reset is a write to
+the database the app already has open.
+
+---
+
+## M6.21 — The examples are 101, not 666
+
+*"Please cleanup all 666 with UI examples and replace it to 101."*
+
+### What was changed
+
+The placeholder number in the examples — the number the **Online** status
+dials, the number the hint in the dialer shows, the number in the
+settings file of the README — was `666` everywhere. It is `101` now.
+
+| | Before | After |
+|---|---|---|
+| the **Online** status of the built-in list | dials `666` | dials `101` |
+| the hint in the number field | `666` | `101` |
+| the dial action in the settings file | `"actionValue": "666"` | `"actionValue": "101"` |
+| the example in the docs | `sip:666@example.com` | `sip:101@example.com` |
+
+Thirty-five places: the README, the settings page, the status model and
+the URI test.
+
+### What was **not** changed, and why
+
+| | Why it stays |
+|---|---|
+| `6661`, `6662`, `6663`, `6666` | these are **peer numbers** in the call examples — a customer number, not a placeholder. `6666` is the customer in the DID example and the caller in the history, and changing them would change what the examples say |
+| **RFC 6665** | that is a standard number, not a number in an example |
+| **`555`** | a second placeholder family — "Pause dials 555". It is the same kind of placeholder as the `666` was, and it is still there. The user was asked about it and the answer is not in yet; changing a number in the **quoted** feature request of M6.14 would falsify the quote |
+
+### The dependency cost: nothing
+
+A number in a string.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -5914,6 +6006,8 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.17** | The action and the capture run **together**: the status dials the server *and* the capture starts in the same breath, the start and the stop attach to any status, and the app exit kills the capture — the shape M6.16 guessed at, corrected | **done** |
 | **M6.18** | The window is drawn when something happens: the graphics backend is the user's choice and the light one (OpenGL) is the default, so the driver's shader compiler is not loaded — **428 MB → 106 MB** — and the events wake the window instead of the app drawing itself ten times a second — **6.0 % → 1.1 %** of one core | **done** |
 | **M6.19** | A dummy script for checking the scripts: `scripts/dummy-run.ps1` starts nothing and writes a line into `script-runs.log`, so the start script, the stop script, the trigger and the exit code can each be checked on their own | **done** |
+| **M6.20** | The status the app starts from: a **Default status after restore** in the statuses settings, and every account is put back into it when the app closes — silently, so nothing starts on the way out | **done** |
+| **M6.21** | The examples are 101: the placeholder number in the dialer hint, in the built-in **Online** status and in the docs was `666`, and it is `101` now — the peer numbers (`6661`, `6666`) and **RFC 6665** are left alone, and so is the second placeholder family (`555`) | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -5977,7 +6071,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 608 tests, all passing.
+* `cargo test --workspace` — 629 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and

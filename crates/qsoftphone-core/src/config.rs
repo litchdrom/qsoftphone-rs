@@ -27,6 +27,17 @@ pub struct AppConfig {
     pub ui: UiConfig,
     /// The account the UI should select at startup.
     pub active_account_id: Option<String>,
+    /// The status every account is put back into when the app closes.
+    ///
+    /// Empty = every account keeps the status it was in, and the app
+    /// starts the next morning where the evening left it.
+    ///
+    /// The reset is **silent**: the action of the status does not run
+    /// and its start script does not run either. The app is closing —
+    /// the capture of the status that is being left has already stopped
+    /// — and a capture that starts on the way out is a capture nobody
+    /// asked for.
+    pub restore_status: String,
     /// The statuses an account can be put into.
     ///
     /// The list is **global**: every account uses these, and each of
@@ -46,6 +57,7 @@ impl Default for AppConfig {
             network: NetworkConfig::default(),
             ui: UiConfig::default(),
             active_account_id: None,
+            restore_status: String::new(),
             statuses: StatusDefinition::built_ins(),
         }
     }
@@ -238,6 +250,19 @@ impl AppConfig {
             .unwrap_or_else(StatusDefinition::fallback)
     }
 
+    /// The status the accounts go back into when the app closes.
+    ///
+    /// `None` when the user has not chosen one — every account then
+    /// keeps the status it was in — and `None` when the status that was
+    /// chosen is not in the list any more (the user deleted it).
+    pub fn restore_target(&self) -> Option<&StatusDefinition> {
+        let id = self.restore_status.trim();
+        if id.is_empty() {
+            return None;
+        }
+        self.status(id)
+    }
+
     /// Make the statuses usable.
     ///
     /// A settings file is a document a user may edit by hand, and a
@@ -335,6 +360,10 @@ mod tests {
             .expect("the file did not open");
         assert_eq!(config.ui.renderer, "auto");
         assert_eq!(config.ui.theme, "dark");
+        // And nothing about the status the app starts from: every
+        // account keeps the one it is in.
+        assert_eq!(config.restore_status, "");
+        assert!(config.restore_target().is_none());
     }
 
     #[test]
@@ -344,6 +373,32 @@ mod tests {
         let json = serde_json::to_string(&config).expect("the config did not serialise");
         let back: AppConfig = serde_json::from_str(&json).expect("the config did not come back");
         assert_eq!(back.ui.renderer, "vulkan");
+    }
+
+    #[test]
+    fn the_status_the_app_starts_from_is_kept() {
+        let config = AppConfig {
+            restore_status: "pause".to_string(),
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_string(&config).expect("the config did not serialise");
+        let back: AppConfig = serde_json::from_str(&json).expect("the config did not come back");
+        assert_eq!(back.restore_status, "pause");
+        assert_eq!(
+            back.restore_target().map(|status| status.id.as_str()),
+            Some("pause")
+        );
+    }
+
+    #[test]
+    fn a_status_that_is_not_there_any_more_is_no_restore_status() {
+        // The user chose a status and then deleted it: the app must not
+        // fall back to some other status behind their back.
+        let config = AppConfig {
+            restore_status: "gone".to_string(),
+            ..AppConfig::default()
+        };
+        assert!(config.restore_target().is_none());
     }
 
     #[test]
