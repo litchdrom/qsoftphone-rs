@@ -256,11 +256,8 @@ impl AppConfig {
             if self.statuses[index].colour.trim().is_empty() {
                 self.statuses[index].colour = DEFAULT_COLOUR.to_string();
             }
-            if self.statuses[index].on_enter.method.trim().is_empty() {
-                self.statuses[index].on_enter.method = "GET".to_string();
-            }
-            if self.statuses[index].on_leave.method.trim().is_empty() {
-                self.statuses[index].on_leave.method = "GET".to_string();
+            if self.statuses[index].action.method.trim().is_empty() {
+                self.statuses[index].action.method = "GET".to_string();
             }
         }
         // The built-ins are put back, and their names and colours are
@@ -405,8 +402,9 @@ mod tests {
             id: "in a meeting".to_string(),
             name: "In a meeting".to_string(),
             colour: "#ff0000".to_string(),
-            on_enter: StatusHook::of(&StatusAction::Dial("666".to_string())),
-            on_leave: StatusHook::of(&StatusAction::Script("stop.exe".to_string())),
+            action: StatusHook::of(&StatusAction::Dial("666".to_string())),
+            start_script: "start.exe".to_string(),
+            stop_script: "stop.exe".to_string(),
             ..Default::default()
         });
         config.save(&path).unwrap();
@@ -416,17 +414,14 @@ mod tests {
         let meeting = loaded.status("in a meeting").expect("the status is there");
         assert_eq!(meeting.name, "In a meeting");
         assert_eq!(meeting.colour, "#ff0000");
-        assert_eq!(meeting.on_enter.value, "666");
+        assert_eq!(meeting.action.value, "666");
         assert_eq!(
             meeting.enter_action(),
             StatusAction::Dial("666".to_string()),
-            "the hook is built from what the status carries"
+            "the action is built from what the status carries"
         );
-        assert_eq!(
-            meeting.leave_action(),
-            StatusAction::Script("stop.exe".to_string()),
-            "and the leave hook is carried too"
-        );
+        assert_eq!(meeting.start_command(), "start.exe");
+        assert_eq!(meeting.stop_command(), "stop.exe");
 
         let _ = std::fs::remove_file(&path);
     }

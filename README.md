@@ -69,11 +69,11 @@ whenever the far end answers with a `180 Ringing` that carries no SDP, so
 there is nothing to hear. A call that is still ringing can be
 **redirected**: the incoming-call screen answers the `INVITE` with a `302
 Moved Temporarily` and a `Contact` naming the target, so the call is
-forwarded without ever being answered. And a status now carries **two**
-hooks — what happens when the agent **becomes** ready and what happens
-when they **stop** being ready — so a screen capture starts by itself
-when the status changes, stops when it changes back, and is stopped
-when the app closes. See
+forwarded without ever being answered. And a status now carries an
+**action** of its own — the dial that tells the PBX that the agent is
+ready — **and** a **start script** and a **stop script** of the user's
+own, so a screen capture starts by itself when the status changes,
+stops when it changes back, and is stopped when the app closes. See
 [Milestones](#milestones).
 
 Two of the things that were wrong with it are right now: the **ringtone
@@ -5467,51 +5467,67 @@ attach script: `script start ffmpeg blah start`, `script end ffmpeg stop`.
 With some simple control if script is running, like run file in the
 directory (please suggest variants)."*
 
-### Two hooks on every status
+### The action and the capture, together
 
-M6.14 gave every status **one** hook: what happens when the status is
-set. A capture needs **two** — what happens when the agent *becomes*
-ready, and what happens when they stop being ready:
+M6.14 gave every status **one** hook: what the softphone does when the
+status is set — the dial that tells the PBX that the agent is ready.
+A capture needs a **second** thing, and it is not another hook: it is
+the user's **own command**, and it runs **at the same time** as the
+action.
 
-| Hook | When it runs |
-|---|---|
-| **When set** | the status is set on the account |
-| **When left** | the account moves away from it — and the app closes while the account is in it |
+So every status carries three things:
 
-So "Ready" carries the start of the capture in **When set** and the end
-of it in **When left**:
+| | What it is | When it runs |
+|---|---|---|
+| the **action** | the dial, the HTTP query, the plugin — the app's own business | when the status is set |
+| the **start script** | a command of the user's own — the capture | when the status is set |
+| the **stop script** | a command of the user's own — the capture stops | when the status is **left**, and when the app closes |
+
+Setting "Ready" therefore does two things in the same breath:
 
 ```text
-Ready
-  When set  → Run a script → powershell -NoProfile -ExecutionPolicy Bypass -File "…\scripts\start-recording.ps1"
-  When left → Run a script → powershell -NoProfile -ExecutionPolicy Bypass -File "…\scripts\stop-recording.ps1"
+User sets "Ready"
+  → the softphone dials the server, or fetches the URL   (the action)
+  → and the screen capture starts                        (the start script)
 ```
 
-The **leave** hook is what makes the capture end by itself. It runs when
-the account moves to another status, and when the app is closed with the
-account still in the status — a capture that is left running with nobody
-watching it is a capture nobody wanted. The app waits for that script
-(§3 is about the interface thread, and the closing of the window is the
-one place where there is no frame after it), but only for two seconds: a
-hook that hangs must not keep the window from closing.
+and setting "Pause" (or any other status) runs the **stop script** of
+the status that is being left — the capture that Ready started stops.
+
+Any status can carry the pair, not only Ready: the start and the stop
+are attached to a status of the user's own as well as to the three that
+come with the app.
+
+The **stop script** is what makes the capture end by itself, and it is
+what the app runs when the window closes: a capture that is left
+running with nobody watching it is a capture nobody wanted. The app
+waits for it (§3 is about the interface thread, and the closing of the
+window is the one place where there is no frame after it), but only for
+two seconds: a script that hangs must not keep the window from
+closing.
 
 ### The trigger: every time, or only when it becomes active
 
-The enter hook has a trigger of its own, because "the status is set" and
-"the state became active" are two different moments:
+The **start script** has a trigger of its own, because "the status is
+set" and "the state became active" are two different moments:
 
-| Trigger | The hook runs |
+| Trigger | The capture starts |
 |---|---|
 | **Every time it is set** (the default) | each time the status is picked — *including* the one the account is already in |
 | **Only when it becomes active** | on a change into the status, and when the app opens with the account already in it |
 
-The first one is what M6.13 did: a user who wants to tell the PBX twice
-presses the button twice. The second one is what a capture wants: the
-recording starts when the agent becomes ready, not every time the button
-is pressed, and not at every start of the app.
+The first one is the button: the agent presses Ready and the capture
+starts. It is safe to press it twice — the start script is
+**idempotent**, it says "the capture is already running" and does
+nothing, so there is never a second capture.
 
-The trigger belongs to the **enter** hook only. The leave hook always
-runs on a change — an account that stays in its status has not left it.
+The second one is for the agent who opens the app and is **already**
+ready: the capture starts by itself, without anybody pressing anything.
+
+The trigger governs the **start script** only. The **action** always
+runs when the status is set — that is M6.13's behaviour and it does not
+change: a user who wants to tell the PBX twice presses the button
+twice.
 
 ### The scripts
 
@@ -5579,41 +5595,70 @@ with the user's own quotes left alone.
 
 The statuses are a state of the **user**, not of one account (M6.14). So
 with two accounts on the same list, a status that is changed in one of
-them is changed for both — and the leave hook runs for the account that
+them is changed for both — and the stop script runs for the account that
 left it. The capture of a user who is ready on one line and paused on
 the other stops. That is the model, not a bug in it.
 
+### What M6.17 changed
+
+M6.16 gave every status **two hooks** — one for setting it and one for
+leaving it — and a hook was one *kind*: a dial, or a script, or a
+query. The user asked for something else, and it is this:
+
+> User sets "Ready" — the softphone sends dial to the server or http, and
+> **in the same time** the script for the screen capture runs. When the
+> user sets "Pause" or off, the script stops. The user can attach start
+> and stop to any status. The app exit should kill the script.
+
+So the hook and the script are **separate things**: one is the app's own
+business (the dial that tells the PBX), the other is the user's own
+command (the capture), and they run **together** rather than one or the
+other. The status now carries the **action**, the **start script** and
+the **stop script**, and the trigger governs the start script alone —
+the action still runs every time the status is set, which is M6.13's
+behaviour.
+
+The general **leave hook** of M6.16 is gone: the stop script is what
+runs when the status is left. A settings file written by M6.16 still
+opens — its `onEnter` becomes the action (or the start script, if it
+was a script) and its `onLeave` becomes the stop script.
+
 ### What is proved
 
-* **The leave hook runs when the status changes**, and **does not run**
+* **The action and the capture run together**: the status dials *and*
+  the capture starts, in the same call of the button.
+* **The stop script runs when the status changes**, and **does not run**
   when the account stays in its status.
-* **The enter hook with the trigger *only when it becomes active*** runs
+* **The capture with the trigger *only when it becomes active*** starts
   on a change into the status and not when the status is set again.
-* **The enter hook with the trigger *every time it is set*** runs each
+* **The capture with the trigger *every time it is set*** starts each
   time — twice, for two presses of the same status, counted in a file.
-* **The enter hook runs when the app starts**, for an account that is
+* **The capture starts when the app starts**, for an account that is
   already in a status whose trigger is *only when it becomes active*.
-* **The leave hook runs when the app closes.**
+* **The capture stops when the app closes.**
+* **The settings page has all three**: the action, the start script and
+  the stop script.
 * **The settings file of M6.14 still opens**: the hook in four flat
-  fields is read as the hook that is set, and the trigger stays *every
-  time it is set* — so the migrated hook does not place a call at the
-  start of the app.
+  fields is read as the action of the status.
+* **The settings file of M6.16 still opens**: its two hooks are read as
+  the action and the pair of scripts.
 * **A quoted path in a command survives**, and the command reaches the
   file it names.
 
 ### The dependency cost: nothing
 
-No new package: the hooks are strings in the settings file and the
-scripts are the user's own. `ureq` was already in the tree for M6.13.
+No new package: the scripts are strings in the settings file and the
+scripts themselves are the user's own. `ureq` was already in the tree
+for M6.13.
 
 ### What is *not* in M6.16
 
 * **The app does not know what a capture is.** There is no "record"
-  button and no recorder of its own — the recorder is the user's
-  command, and the hook is the seam to it.
-* **The hook does not wait for the script.** A script runs on a thread
-  of its own and what it says arrives on the channel (§3); only the
-  closing of the app waits, and only for two seconds.
+  button and no recorder of its own — the recorder is the user's own
+  command, and the script is the seam to it.
+* **The scripts do not wait for anything.** A script runs on a thread of
+  its own and what it says arrives on the channel (§3); only the closing
+  of the app waits, and only for two seconds.
 * **The plugin host is still out of scope** (§8): the plugin kind is
   stored and reported as not there yet.
 
@@ -5680,7 +5725,8 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.13** | The account's status: a button per account that says **Ready**, **Online** or **Pause** and lets the user pick another one, and the account's **action** — dial a code (DTMF if a call is up, a call if there is not), run a script, run an HTTP query, or name a plugin that is not there yet | **done** |
 | **M6.14** | The statuses are the user's: a **global** list in the main settings with a status of their own added inline, a **colour** and a **hook** on each of them, the hook on the **status** rather than on the account, the status picked in the **accounts list**, and an HTTP hook with a **method** and a **body** | **done** |
 | **M6.15** | The history says which **account** the call was on: a column in the history table, and the account in the details of the row | **done** |
-| **M6.16** | The capture starts when the agent is ready: two hooks on every status (**when set** and **when left**), a trigger that says *every time it is set* or *only when it becomes active*, the leave hook at the closing of the app, and the scripts in `scripts/` that start and stop a capture with a PID file | **done** |
+| **M6.16** | The capture starts when the agent is ready: the action, the **start script** and the **stop script** on every status, the trigger that says *every time it is set* or *only when it becomes active*, the stop script at the closing of the app, and the scripts in `scripts/` that start and stop a capture with a PID file | **done** |
+| **M6.17** | The action and the capture run **together**: the status dials the server *and* the capture starts in the same breath, the start and the stop attach to any status, and the app exit kills the capture — the shape M6.16 guessed at, corrected | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -5744,7 +5790,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 594 tests, all passing.
+* `cargo test --workspace` — 596 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and

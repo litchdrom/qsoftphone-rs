@@ -90,24 +90,37 @@ pub fn spawn(action: &StatusAction, account: &str, sender: Sender<ActionReport>)
     }
 }
 
-/// Run an action on a thread of its own and wait for it, up to a
+/// Run a command on a thread of its own, and say what it did.
+///
+/// This is the seam for the user's **own** commands: the capture that
+/// starts when the agent becomes ready, and the one that stops it.
+/// The command is run the way the user typed it — through the system's
+/// own shell, with the quotes they wrote in it left alone.
+pub fn spawn_script(command: &str, account: &str, sender: Sender<ActionReport>) {
+    let command = command.trim().to_string();
+    let account = account.to_string();
+    std::thread::Builder::new()
+        .name("qsoftphone-script".to_string())
+        .spawn(move || {
+            let result = run_script(&command);
+            let _ = sender.send(ActionReport { account, result });
+        })
+        .ok();
+}
+
+/// Run a command on a thread of its own and wait for it, up to a
 /// deadline.
 ///
-/// This is what the app does when it is closing: the hook that stops
-/// a screen capture has to have run before the process goes, and a
-/// hook that hangs must not keep the window from closing — so the
-/// wait has an end.
+/// This is what the app does when it is closing: the capture has to
+/// have stopped before the process goes — otherwise it is left running
+/// with nobody watching it — and a command that hangs must not keep the
+/// window from closing either, so the wait has an end.
 ///
 /// The report is not sent anywhere: the app is on its way out, and
 /// there is no status line left to say it on.
-pub fn spawn_and_wait(action: &StatusAction, deadline: Duration) {
-    // Only the two kinds that take time are waited for: the others
-    // are the app's own business and are done before this is called.
-    if !matches!(action, StatusAction::Script(_) | StatusAction::Http { .. }) {
-        return;
-    }
+pub fn spawn_script_and_wait(command: &str, deadline: Duration) {
     let (sender, receiver) = std::sync::mpsc::channel();
-    spawn(action, "", sender);
+    spawn_script(command, "", sender);
     // The thread sends its report when it is done, and the channel is
     // what says it is done.
     let _ = receiver.recv_timeout(deadline);

@@ -18,22 +18,38 @@ has both. The recorder is found on the `PATH`, or named in the
 ## How to wire them to a status
 
 In the softphone's **Settings → STATUSES**, find the status **Ready**
-and give it two hooks:
+and give it three things:
 
 | Field | Value |
 |---|---|
-| **When set** → Run a script | `powershell -NoProfile -ExecutionPolicy Bypass -File "<repo>\scripts\start-recording.ps1"` |
-| **When left** → Run a script | `powershell -NoProfile -ExecutionPolicy Bypass -File "<repo>\scripts\stop-recording.ps1"` |
-| **Trigger** | *Only when it becomes active* |
+| **When set** | the action of the status — the dial that tells the PBX that the agent is ready, or the query that tells the CRM. It runs at the same time as the capture. |
+| **Start script** | `powershell -NoProfile -ExecutionPolicy Bypass -File "<repo>\scripts\start-recording.ps1"` |
+| **Stop script** | `powershell -NoProfile -ExecutionPolicy Bypass -File "<repo>\scripts\stop-recording.ps1"` |
 
-The **trigger** is what makes it a capture and not a button: with
-*Every time it is set* the capture starts each time the status is
-picked — including the one the account is already in. With *Only when
-it becomes active* it starts when the state changes into Ready, and
-when the app is opened with the account already in Ready.
+Setting the status then does both things at once: the softphone tells
+the PBX that the agent is ready, and the capture starts. Setting
+**Pause** runs Pause's stop script — and the capture that was started
+by Ready stops, because Ready was left.
+
+Any status can carry the pair: the start and the stop are attached to
+a status of the user's own as well as to the three that come with the
+app.
+
+The **trigger** says when the capture starts:
+
+| Trigger | The capture starts |
+|---|---|
+| **Every time it is set** (the default) | each time the status is picked — *including* the one the account is already in |
+| **Only when it becomes active** | on a change into the status, and when the app is opened with the account already in it |
+
+The start script is **idempotent**: it says "the capture is already
+running" and does nothing, so pressing the same status twice does not
+start two captures.
 
 The app waits for the stop script when it closes: a capture that is
-left running with nobody watching it is a capture nobody wanted.
+left running with nobody watching it is a capture nobody wanted. The
+wait is short — two seconds — so a script that hangs cannot keep the
+window from closing.
 
 > The statuses are **global** — they are a state of the user, not of
 > one account. With two accounts on the same list, a status that is

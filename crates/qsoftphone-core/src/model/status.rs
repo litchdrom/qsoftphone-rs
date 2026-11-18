@@ -20,15 +20,17 @@
 //!
 //! ## What a status does
 //!
-//! Each status carries **two hooks** — what happens when the status is
-//! **set**, and what happens when it is **left**:
+//! A status carries **three** things, and they are three different
+//! things:
 //!
-//! | Hook | When it runs |
+//! | | What it is |
 //! |---|---|
-//! | **on enter** | when the status is set on the account |
-//! | **on leave** | when the account moves away from it — and when the app closes while the account is in it |
+//! | the **action** | what the softphone itself does when the status is set |
+//! | the **start script** | a command of the user's own that runs at the same time |
+//! | the **stop script** | a command of the user's own that runs when the status is left |
 //!
-//! A hook is one of four kinds, and they are the four a user asked for:
+//! The action is one of four kinds, and they are the four a user asked
+//! for:
 //!
 //! | Kind | What it does |
 //! |---|---|
@@ -37,36 +39,39 @@
 //! | run an HTTP query | the URL, with the method and the body the user chose |
 //! | use a plugin | nothing yet — §8 puts the plugin host out of scope |
 //!
-//! The point of the hook is that the *state* lives in the PBX, not in
-//! the softphone: a user who is ready tells the PBX so with a feature
-//! code, and a user who is online tells a CRM so with an HTTP query.
-//! The softphone's own button is the switch, and the hook is what the
-//! switch is wired to.
+//! The point of the action is that the *state* lives in the PBX, not
+//! in the softphone: a user who is ready tells the PBX so with a
+//! feature code, and a user who is online tells a CRM so with an HTTP
+//! query. The softphone's own button is the switch, and the action is
+//! what the switch is wired to.
 //!
-//! So the hook belongs to the **status**, not to the account: "Online"
-//! dials 666 whoever is online, and "Pause" dials 555 — and the two
-//! numbers are two lines in the settings, not two lines in every
-//! account.
+//! So the action belongs to the **status**, not to the account:
+//! "Online" dials 666 whoever is online, and "Pause" dials 555 — and
+//! the two numbers are two lines in the settings, not two lines in
+//! every account.
 //!
-//! The two hooks are what makes a **screen capture** work: the capture
-//! starts when the agent becomes ready and stops when they stop being
-//! ready. The start is the **enter** hook of "Ready" and the stop is
-//! the **leave** hook of the same status.
+//! The scripts are what make a **screen capture** work, and they are
+//! **separate from the action**: the capture starts when the agent
+//! becomes ready, and the softphone tells the PBX that they are ready
+//! **at the same time**. One is the user's own command, the other is
+//! the app's business, and a status can have both.
 //!
-//! ## When the enter hook runs
+//! Any status can carry the pair: the start and the stop are attached
+//! to a status of the user's own as well as to the three that come
+//! with the app.
 //!
-//! * **Every time it is set** — the default. The hook runs each time
-//!   the status is picked, *even the one the account is already in*: a
-//!   user who wants to tell the PBX twice presses the button twice.
-//! * **Only when it becomes active** — the hook runs when the state
-//!   changes *into* the status, and when the app starts with the
-//!   account already in it. This is what a recorder wants: the capture
-//!   starts when the agent becomes ready, not every time the button is
-//!   pressed, and not at every start of the app.
+//! ## When the start script runs
 //!
-//! The leave hook always runs on a **change**: an account that stays
-//! in its status has not left it, and one that leaves it at the closing
-//! of the app has.
+//! * **Only when it becomes active** — the default. The script runs
+//!   when the state changes *into* the status, and when the app starts
+//!   with the account already in it: an agent who opens the app and is
+//!   already ready is recording from the first moment.
+//! * **Every time it is set** — the script runs each time the status
+//!   is picked, *even the one the account is already in*.
+//!
+//! The stop script always runs on a **change**: an account that stays
+//! in its status has not left it, and one that leaves it at the
+//! closing of the app has.
 //!
 //! ## The id
 //!
@@ -433,8 +438,23 @@ impl EnterTrigger {
 /// One status the user can put an account into.
 ///
 /// The fields are plain strings on purpose: this is a line in a JSON
-/// file that a user may edit by hand. The typed [`StatusAction`]s are
-/// built from the hooks when they run.
+/// file that a user may edit by hand. The typed [`StatusAction`] is
+/// built from the action when it runs.
+///
+/// A status carries **three** things, and they are three different
+/// things:
+///
+/// * the **action** — what the softphone itself does when the status
+///   is set: dial a code, fetch a URL, tell a CRM;
+/// * the **start script** — a command of the user's own that runs at
+///   the same time: the screen capture that starts when the agent
+///   becomes ready;
+/// * the **stop script** — the command that ends it, when the agent
+///   stops being ready.
+///
+/// The action and the start script run **together**: the softphone
+/// tells the PBX that the agent is ready *and* the capture starts, in
+/// the same breath.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusDefinition {
@@ -445,34 +465,49 @@ pub struct StatusDefinition {
     pub name: String,
     /// The colour of the lamp: `#4cc06a`.
     pub colour: String,
-    /// What happens when the status is set.
-    pub on_enter: StatusHook,
-    /// When the enter hook runs.
-    pub enter_trigger: EnterTrigger,
-    /// What happens when the status is left.
-    pub on_leave: StatusHook,
+    /// What the softphone does when the status is set.
+    pub action: StatusHook,
+    /// The command that starts the capture, run when the status is
+    /// set.
+    pub start_script: String,
+    /// The command that stops the capture, run when the status is
+    /// left — and when the app closes.
+    pub stop_script: String,
+    /// When the start script runs.
+    pub script_trigger: EnterTrigger,
 }
 
 /// The status as it is read out of the settings file.
 ///
-/// It carries the shape of **M6.14** as well: the hook was one flat
-/// set of fields then, and a file written by that build must still
-/// open. The old fields are folded into `on_enter` when they are
-/// there and `on_enter` is not.
+/// It carries the shape of **M6.14** and of **M6.16** as well: a file
+/// written by either of those builds must still open, and what it
+/// held must still be there.
+///
+/// * **M6.14** had one hook, in four flat fields. It is the **action**
+///   now.
+/// * **M6.16** had two hooks, `onEnter` and `onLeave`. The enter hook
+///   is the **action** — unless it was a script, and then it was the
+///   capture, and it is the **start script**. The leave hook, if it
+///   was a script, is the **stop script**.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct StatusDefinitionFile {
     id: String,
     name: String,
     colour: String,
-    on_enter: StatusHook,
-    enter_trigger: EnterTrigger,
-    on_leave: StatusHook,
+    action: StatusHook,
+    start_script: String,
+    stop_script: String,
+    script_trigger: Option<EnterTrigger>,
     // The shape of M6.14.
     action_kind: String,
     action_value: String,
     action_method: String,
     action_body: String,
+    // The shape of M6.16.
+    on_enter: StatusHook,
+    on_leave: StatusHook,
+    enter_trigger: Option<EnterTrigger>,
 }
 
 impl Default for StatusDefinitionFile {
@@ -481,13 +516,17 @@ impl Default for StatusDefinitionFile {
             id: String::new(),
             name: String::new(),
             colour: DEFAULT_COLOUR.to_string(),
-            on_enter: StatusHook::default(),
-            enter_trigger: EnterTrigger::default(),
-            on_leave: StatusHook::default(),
+            action: StatusHook::default(),
+            start_script: String::new(),
+            stop_script: String::new(),
+            script_trigger: None,
             action_kind: String::new(),
             action_value: String::new(),
             action_method: HttpMethod::default().name().to_string(),
             action_body: String::new(),
+            on_enter: StatusHook::default(),
+            on_leave: StatusHook::default(),
+            enter_trigger: None,
         }
     }
 }
@@ -498,26 +537,69 @@ impl<'de> Deserialize<'de> for StatusDefinition {
         D: Deserializer<'de>,
     {
         let file = StatusDefinitionFile::deserialize(deserializer)?;
-        let mut on_enter = file.on_enter;
-        if on_enter.is_empty() {
-            // The shape of M6.14: one hook, in four flat fields.
-            let legacy = StatusHook {
+
+        // The two hooks of M6.16.
+        let on_enter = file.on_enter;
+        let on_leave = file.on_leave;
+
+        // The start script: the field of its own, else the script that
+        // was the enter hook of M6.16 — an enter hook that was a
+        // script was the capture.
+        let mut start_script = file.start_script.trim().to_string();
+        if start_script.is_empty()
+            && on_enter.kind.trim().eq_ignore_ascii_case("script")
+            && !on_enter.value.trim().is_empty()
+        {
+            start_script = on_enter.value.trim().to_string();
+        }
+
+        // The stop script: the field of its own, else the script that
+        // was the leave hook of M6.16.
+        let mut stop_script = file.stop_script.trim().to_string();
+        if stop_script.is_empty()
+            && on_leave.kind.trim().eq_ignore_ascii_case("script")
+            && !on_leave.value.trim().is_empty()
+        {
+            stop_script = on_leave.value.trim().to_string();
+        }
+
+        // The action: the field of its own, else the flat fields of
+        // M6.14, else the enter hook of M6.16 — unless that one was
+        // the capture, and then it is the start script.
+        let mut action = file.action;
+        if action.is_empty() {
+            let flat = StatusHook {
                 kind: file.action_kind,
                 value: file.action_value,
                 method: file.action_method,
                 body: file.action_body,
             };
-            if !legacy.is_empty() {
-                on_enter = legacy;
+            if !flat.is_empty() {
+                action = flat;
             }
         }
+        if action.is_empty()
+            && !on_enter.is_empty()
+            && !on_enter.kind.trim().eq_ignore_ascii_case("script")
+        {
+            action = on_enter;
+        }
+
+        // When the start script runs: the trigger of its own, else the
+        // trigger of M6.16, else the default.
+        let script_trigger = file
+            .script_trigger
+            .or(file.enter_trigger)
+            .unwrap_or(StatusDefinition::default().script_trigger);
+
         Ok(StatusDefinition {
             id: file.id,
             name: file.name,
             colour: file.colour,
-            on_enter,
-            enter_trigger: file.enter_trigger,
-            on_leave: file.on_leave,
+            action,
+            start_script,
+            stop_script,
+            script_trigger,
         })
     }
 }
@@ -528,9 +610,12 @@ impl Default for StatusDefinition {
             id: String::new(),
             name: String::new(),
             colour: DEFAULT_COLOUR.to_string(),
-            on_enter: StatusHook::default(),
-            enter_trigger: EnterTrigger::default(),
-            on_leave: StatusHook::default(),
+            action: StatusHook::default(),
+            start_script: String::new(),
+            stop_script: String::new(),
+            // The capture starts when the status is set: that is what
+            // the button is for.
+            script_trigger: EnterTrigger::Set,
         }
     }
 }
@@ -612,24 +697,34 @@ impl StatusDefinition {
         matches!(self.id.as_str(), "ready" | "online" | "pause")
     }
 
-    /// What the status does when it is **set**.
+    /// What the softphone does when the status is **set**.
     pub fn enter_action(&self) -> StatusAction {
-        self.on_enter.action()
+        self.action.action()
     }
 
-    /// What the status does when it is **left**.
-    pub fn leave_action(&self) -> StatusAction {
-        self.on_leave.action()
+    /// The command that **starts** the capture.
+    pub fn start_command(&self) -> &str {
+        self.start_script.trim()
+    }
+
+    /// The command that **stops** the capture.
+    pub fn stop_command(&self) -> &str {
+        self.stop_script.trim()
     }
 
     /// Whether the status has anything to do when it is set.
-    pub fn has_enter_hook(&self) -> bool {
-        self.on_enter.is_some()
+    pub fn has_action(&self) -> bool {
+        self.action.is_some()
     }
 
-    /// Whether the status has anything to do when it is left.
-    pub fn has_leave_hook(&self) -> bool {
-        self.on_leave.is_some()
+    /// Whether the status starts anything when it is set.
+    pub fn has_start_script(&self) -> bool {
+        !self.start_command().is_empty()
+    }
+
+    /// Whether the status stops anything when it is left.
+    pub fn has_stop_script(&self) -> bool {
+        !self.stop_command().is_empty()
     }
 
     /// The colour as red, green and blue.
@@ -930,35 +1025,39 @@ mod tests {
     }
 
     #[test]
-    fn a_status_builds_its_two_hooks() {
-        // The status carries a hook for setting it and a hook for
-        // leaving it, and they are two different things.
+    fn a_status_carries_an_action_and_two_scripts() {
+        // The status carries three things, and they are three
+        // different things: what the softphone does, the command that
+        // starts the capture, and the command that stops it.
         let mut status = StatusDefinition::built_ins().remove(1);
-        status.on_enter = StatusHook::of(&StatusAction::Dial("666".to_string()));
-        status.on_leave = StatusHook::of(&StatusAction::Script("stop.exe".to_string()));
+        status.action = StatusHook::of(&StatusAction::Dial("666".to_string()));
+        status.start_script = "start.exe".to_string();
+        status.stop_script = "stop.exe".to_string();
+
         assert_eq!(status.enter_action(), StatusAction::Dial("666".to_string()));
-        assert_eq!(
-            status.leave_action(),
-            StatusAction::Script("stop.exe".to_string())
-        );
-        assert!(status.has_enter_hook());
-        assert!(status.has_leave_hook());
+        assert_eq!(status.start_command(), "start.exe");
+        assert_eq!(status.stop_command(), "stop.exe");
+        assert!(status.has_action());
+        assert!(status.has_start_script());
+        assert!(status.has_stop_script());
     }
 
     #[test]
     fn a_status_survives_a_json_round_trip() {
         let mut status = StatusDefinition::built_ins().remove(0);
-        status.on_enter = StatusHook::of(&StatusAction::Script("start.exe".to_string()));
-        status.enter_trigger = EnterTrigger::Enter;
-        status.on_leave = StatusHook::of(&StatusAction::Script("stop.exe".to_string()));
+        status.action = StatusHook::of(&StatusAction::Dial("666".to_string()));
+        status.start_script = "start.exe".to_string();
+        status.stop_script = "stop.exe".to_string();
+        status.script_trigger = EnterTrigger::Set;
 
         let json = serde_json::to_string(&status).expect("the status serialises");
         assert!(
-            json.contains("\"onEnter\""),
+            json.contains("\"action\""),
             "the new shape is not what is written:\n{json}"
         );
-        assert!(json.contains("\"enterTrigger\":\"enter\""));
-        assert!(json.contains("\"onLeave\""));
+        assert!(json.contains("\"startScript\":\"start.exe\""));
+        assert!(json.contains("\"stopScript\":\"stop.exe\""));
+        assert!(json.contains("\"scriptTrigger\":\"set\""));
 
         let back: StatusDefinition = serde_json::from_str(&json).expect("the status reads back");
         assert_eq!(back, status);
@@ -968,7 +1067,7 @@ mod tests {
     fn the_shape_of_m614_still_reads() {
         // The hook was one flat set of fields then. A file written by
         // that build must still open, and the hook it holds must be
-        // the hook that is set.
+        // the action of the status.
         let json = r##"{
             "id": "ready",
             "name": "Ready",
@@ -981,15 +1080,39 @@ mod tests {
         let status: StatusDefinition = serde_json::from_str(json).expect("the old status reads");
         assert_eq!(status.id, "ready");
         assert_eq!(status.enter_action(), StatusAction::Dial("666".to_string()));
-        assert_eq!(
-            status.enter_trigger,
-            EnterTrigger::Set,
-            "the old hook ran every time the status was set, and it still does"
-        );
         assert!(
-            status.leave_action() == StatusAction::None,
-            "the old shape had no leave hook, and it has none"
+            !status.has_start_script(),
+            "the old shape had no capture, and it has none"
         );
+        assert!(!status.has_stop_script());
+    }
+
+    #[test]
+    fn the_shape_of_m616_still_reads() {
+        // Two hooks then: the enter hook and the leave hook. The
+        // enter hook that was a script was the capture, and it is the
+        // start script; the leave hook that was a script is the stop
+        // script. The enter hook that was not a script is the action.
+        let json = r#"{
+            "id": "ready",
+            "onEnter": {"kind": "script", "value": "start.exe"},
+            "onLeave": {"kind": "script", "value": "stop.exe"},
+            "enterTrigger": "set"
+        }"#;
+        let status: StatusDefinition = serde_json::from_str(json).expect("the old status reads");
+        assert_eq!(status.start_command(), "start.exe");
+        assert_eq!(status.stop_command(), "stop.exe");
+        assert!(!status.has_action(), "the capture was not an action");
+        assert_eq!(status.script_trigger, EnterTrigger::Set);
+
+        // And an enter hook that was not a script is the action.
+        let json = r#"{
+            "id": "ready",
+            "onEnter": {"kind": "dial", "value": "666"}
+        }"#;
+        let status: StatusDefinition = serde_json::from_str(json).expect("the old status reads");
+        assert_eq!(status.enter_action(), StatusAction::Dial("666".to_string()));
+        assert!(!status.has_start_script());
     }
 
     #[test]
@@ -1001,12 +1124,16 @@ mod tests {
             "id": "ready",
             "actionKind": "dial",
             "actionValue": "666",
-            "onEnter": {"kind": "script", "value": "start.exe"}
+            "action": {"kind": "http", "value": "https://crm.example.com/api/state"}
         }"#;
         let status: StatusDefinition = serde_json::from_str(json).expect("the status reads");
         assert_eq!(
             status.enter_action(),
-            StatusAction::Script("start.exe".to_string())
+            StatusAction::Http {
+                method: HttpMethod::Get,
+                url: "https://crm.example.com/api/state".to_string(),
+                body: String::new(),
+            }
         );
     }
 
@@ -1016,9 +1143,10 @@ mod tests {
         // does nothing, and it must not fail to open.
         let json = r#"{"id":"ready","name":"Ready"}"#;
         let status: StatusDefinition = serde_json::from_str(json).expect("the status reads");
-        assert!(!status.has_enter_hook());
-        assert!(!status.has_leave_hook());
-        assert_eq!(status.enter_trigger, EnterTrigger::Set);
+        assert!(!status.has_action());
+        assert!(!status.has_start_script());
+        assert!(!status.has_stop_script());
+        assert_eq!(status.script_trigger, EnterTrigger::Set);
         assert_eq!(status.colour, DEFAULT_COLOUR);
     }
 }
