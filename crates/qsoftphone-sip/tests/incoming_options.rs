@@ -65,6 +65,7 @@ fn serve_incoming(endpoint: &Endpoint, token: &CancellationToken) {
         },
         PublicAddress::default(),
         registry.media_config_handle(),
+        registry.auto_answer_handle(),
     );
     let (bus, _receiver) = CallBus::new();
 

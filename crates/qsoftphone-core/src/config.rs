@@ -14,6 +14,61 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::model::status::{DEFAULT_COLOUR, DEFAULT_STATUS_ID, StatusDefinition};
 
+/// The auto-answer settings.
+///
+/// The whole application: every account answers by itself, or none of
+/// them does. A setting that is on one account and off on another is a
+/// setting nobody can remember.
+///
+/// The C++ had no auto-answer at all — the user picked the call up —
+/// so this is a new thing rather than a port.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AutoAnswerConfig {
+    /// Whether incoming calls are answered by themselves.
+    pub enabled: bool,
+    /// How long the call rings before it is answered, in seconds.
+    ///
+    /// Zero = at once: the caller does not hear a ringtone at all.
+    /// Anything else is the number of seconds the caller waits before
+    /// the call is picked up — the way a PBX's "answer after" works.
+    pub delay_sec: u32,
+    /// The header the INVITE has to carry.
+    ///
+    /// Empty = **unconditional**: every incoming call is answered.
+    ///
+    /// The name is matched without regard to case, because a header is
+    /// a header: `X-Auto-Answer` and `x-auto-answer` are the same
+    /// header.
+    pub header: String,
+    /// The value the header has to have.
+    ///
+    /// Empty = any value will do: the header has to be **there**, and
+    /// that is all. This is how a PBX says "this one is for the
+    /// agent" — `X-Auto-Answer: agent-3` — without the softphone
+    /// having to know what an agent is.
+    pub header_value: String,
+}
+
+impl AutoAnswerConfig {
+    /// Whether the INVITE with these headers is to be answered.
+    ///
+    /// The header is matched without regard to case, and the value only
+    /// when one was asked for.
+    pub fn header_agrees(&self, headers: &[(String, String)]) -> bool {
+        let name = self.header.trim();
+        if name.is_empty() {
+            // Unconditional: every call is answered.
+            return true;
+        }
+        let wanted = self.header_value.trim();
+        headers.iter().any(|(header, value)| {
+            header.trim().eq_ignore_ascii_case(name)
+                && (wanted.is_empty() || value.trim().eq_ignore_ascii_case(wanted))
+        })
+    }
+}
+
 /// The settings document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -25,6 +80,10 @@ pub struct AppConfig {
     pub media: MediaConfig,
     pub network: NetworkConfig,
     pub ui: UiConfig,
+    /// Whether incoming calls are answered by themselves.
+    ///
+    /// The whole application: every account answers, or none does.
+    pub auto_answer: AutoAnswerConfig,
     /// The account the UI should select at startup.
     pub active_account_id: Option<String>,
     /// The status every account is put back into when the app closes.
@@ -56,6 +115,7 @@ impl Default for AppConfig {
             media: MediaConfig::default(),
             network: NetworkConfig::default(),
             ui: UiConfig::default(),
+            auto_answer: AutoAnswerConfig::default(),
             active_account_id: None,
             restore_status: String::new(),
             statuses: StatusDefinition::built_ins(),
@@ -402,6 +462,68 @@ mod tests {
     }
 
     #[test]
+    fn the_auto_answer_settings_are_kept() {
+        let config = AppConfig {
+            auto_answer: AutoAnswerConfig {
+                enabled: true,
+                delay_sec: 5,
+                header: "X-Auto-Answer".to_string(),
+                header_value: "agent-3".to_string(),
+            },
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_string(&config).expect("the config did not serialise");
+        let back: AppConfig = serde_json::from_str(&json).expect("the config did not come back");
+        assert!(back.auto_answer.enabled);
+        assert_eq!(back.auto_answer.delay_sec, 5);
+        assert_eq!(back.auto_answer.header, "X-Auto-Answer");
+        assert_eq!(back.auto_answer.header_value, "agent-3");
+    }
+
+    #[test]
+    fn an_older_settings_file_has_no_auto_answer() {
+        let config: AppConfig = serde_json::from_str(r#"{"version":1}"#).expect("the file opened");
+        assert!(!config.auto_answer.enabled);
+        assert_eq!(config.auto_answer.delay_sec, 0);
+        assert!(config.auto_answer.header.is_empty());
+    }
+
+    #[test]
+    fn the_header_decides_whether_a_call_is_answered() {
+        // No header named: every call is answered. That is the
+        // **unconditional** case, and it is the default.
+        let unconditional = AutoAnswerConfig {
+            enabled: true,
+            ..AutoAnswerConfig::default()
+        };
+        assert!(unconditional.header_agrees(&[]));
+        assert!(unconditional.header_agrees(&[("X-Anything".to_string(), "yes".to_string())]));
+
+        // A header is named: it has to be on the INVITE.
+        let config = AutoAnswerConfig {
+            enabled: true,
+            header: "X-Auto-Answer".to_string(),
+            ..AutoAnswerConfig::default()
+        };
+        assert!(!config.header_agrees(&[("X-Other".to_string(), "agent-3".to_string())]));
+        assert!(config.header_agrees(&[("X-Auto-Answer".to_string(), "any".to_string())]));
+        // The name is a header's name: its case does not matter.
+        assert!(config.header_agrees(&[("x-auto-answer".to_string(), "any".to_string())]));
+
+        // A value is named too: it has to match.
+        let with_value = AutoAnswerConfig {
+            enabled: true,
+            header: "X-Auto-Answer".to_string(),
+            header_value: "agent-3".to_string(),
+            ..AutoAnswerConfig::default()
+        };
+        assert!(with_value.header_agrees(&[("X-Auto-Answer".to_string(), "agent-3".to_string())]));
+        assert!(with_value.header_agrees(&[("X-Auto-Answer".to_string(), "AGENT-3".to_string())]));
+        assert!(!with_value.header_agrees(&[("X-Auto-Answer".to_string(), "agent-4".to_string())]));
+        assert!(!with_value.header_agrees(&[("X-Auto-Answer".to_string(), String::new())]));
+    }
+
+    #[test]
     fn a_missing_file_yields_the_defaults() {
         let path = temp_path("missing");
         let config = AppConfig::load(&path).unwrap();
@@ -493,7 +615,7 @@ mod tests {
             id: "in a meeting".to_string(),
             name: "In a meeting".to_string(),
             colour: "#ff0000".to_string(),
-            action: StatusHook::of(&StatusAction::Dial("666".to_string())),
+            action: StatusHook::of(&StatusAction::Dial("101".to_string())),
             start_script: "start.exe".to_string(),
             stop_script: "stop.exe".to_string(),
             ..Default::default()
@@ -505,10 +627,10 @@ mod tests {
         let meeting = loaded.status("in a meeting").expect("the status is there");
         assert_eq!(meeting.name, "In a meeting");
         assert_eq!(meeting.colour, "#ff0000");
-        assert_eq!(meeting.action.value, "666");
+        assert_eq!(meeting.action.value, "101");
         assert_eq!(
             meeting.enter_action(),
-            StatusAction::Dial("666".to_string()),
+            StatusAction::Dial("101".to_string()),
             "the action is built from what the status carries"
         );
         assert_eq!(meeting.start_command(), "start.exe");

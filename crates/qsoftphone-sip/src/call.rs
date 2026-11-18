@@ -34,6 +34,7 @@ use rsipstack::transaction::key::TransactionRole;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::{info, warn};
 
+use qsoftphone_core::config::AutoAnswerConfig;
 use qsoftphone_core::model::account::Account;
 use qsoftphone_core::model::call_event::{CallEvent, CallEventType, Direction};
 use qsoftphone_core::sip::custom_headers::{self, HeaderVars};
@@ -345,63 +346,23 @@ impl CallManager {
             .sessions
             .get(account_id)
             .ok_or(CallError::NotRegistered)?;
-        let dialog = session.dialog(call_id).ok_or(CallError::NoSuchCall)?;
-        let account = session.account.clone();
+        answer_call(&session, call_id)
+    }
 
-        let local = session
-            .endpoint
-            .get_addrs()
-            .first()
-            .cloned()
-            .ok_or_else(|| CallError::Sip("the endpoint has no local address".to_string()))?;
+    /// Whether incoming calls are answered by themselves.
+    ///
+    /// The setting is global: one switch for the whole application, and
+    /// every account answers or none of them does.
+    pub fn set_auto_answer(&self, config: AutoAnswerConfig) {
+        self.sessions.set_auto_answer(config);
+    }
 
-        // The media comes first: the answer has to name the port the
-        // RTP socket is bound to.
-        let media_config = self.sessions.media_config();
-        let media = MediaSession::new(&media_config).map_err(|e| CallError::Sip(e.to_string()))?;
-
-        let headers = vec![Header::ContentType("application/sdp".into())];
-        let offer = dialog.initial_request().body.clone();
-        let body = sdp::answer_sdp(
-            &offer,
-            &media_address(&session),
-            media.local_port(),
-            1,
-            &media_config.codecs,
-        );
-
-        // The answer settled on one of the formats the offer listed —
-        // and the media has to speak that one. Without this the
-        // session would keep the first codec of the list and send it
-        // under the wrong payload type, and the peer would hear
-        // nothing at all.
-        if let Some(format) = sdp::choose_format(&offer, &media_config.codecs) {
-            if let Some(codec) =
-                Codec::from_payload_type(format.payload_type, Some(&format.encoding))
-            {
-                media.negotiate(codec, format.payload_type);
-            }
-        }
-
-        // The peer said where its RTP comes from. It is in the offer,
-        // and the answer only confirms the codec.
-        if let Some((address, port)) = sdp::media_endpoint(&offer) {
-            if let Err(e) = media.set_remote(&address, port) {
-                warn!(call_id = %call_id, error = %e, "the peer's media address did not resolve");
-            }
-        }
-
-        session.remember_media(call_id, media);
-
-        dialog
-            .accept_with_public_contact(
-                &account.user,
-                session.public_address.get(),
-                &local,
-                Some(headers),
-                Some(body),
-            )
-            .map_err(|e| CallError::Sip(e.to_string()))
+    /// The auto-answer settings, as they are now.
+    ///
+    /// The settings the call layer works by — not the ones in the file,
+    /// which may be older.
+    pub fn auto_answer(&self) -> AutoAnswerConfig {
+        self.sessions.auto_answer()
     }
 
     /// Decline an incoming call.
@@ -897,6 +858,135 @@ impl CallManager {
     }
 }
 
+/// Answer a call: the media, the SDP, and the `200 OK`.
+///
+/// The `200 OK` carries the SDP and a NAT-aware Contact.
+///
+/// The SDP is the **answer** to the offer the peer sent, not a
+/// fixed body: RFC 3264 §6 says the answer may only name media
+/// formats the offer listed, and a peer that offered only G.711
+/// A-law would hang up on a fixed G.711 µ-law answer.
+///
+/// The port in it is the one the RTP socket is bound to, so the
+/// peer's audio arrives somewhere.
+///
+/// It is a free function and not a method of the call manager, because
+/// the **auto answer** answers a call by itself: it has to be exactly
+/// the same answer, down to the SDP and the port.
+pub fn answer_call(session: &Arc<AccountSession>, call_id: &str) -> Result<(), CallError> {
+    let dialog = session.dialog(call_id).ok_or(CallError::NoSuchCall)?;
+    let account = session.account.clone();
+
+    let local = session
+        .endpoint
+        .get_addrs()
+        .first()
+        .cloned()
+        .ok_or_else(|| CallError::Sip("the endpoint has no local address".to_string()))?;
+
+    // The media comes first: the answer has to name the port the
+    // RTP socket is bound to.
+    let media_config = session.media_config();
+    let media = MediaSession::new(&media_config).map_err(|e| CallError::Sip(e.to_string()))?;
+
+    let headers = vec![Header::ContentType("application/sdp".into())];
+    let offer = dialog.initial_request().body.clone();
+    let body = sdp::answer_sdp(
+        &offer,
+        &media_address(session),
+        media.local_port(),
+        1,
+        &media_config.codecs,
+    );
+
+    // The answer settled on one of the formats the offer listed —
+    // and the media has to speak that one. Without this the
+    // session would keep the first codec of the list and send it
+    // under the wrong payload type, and the peer would hear
+    // nothing at all.
+    if let Some(format) = sdp::choose_format(&offer, &media_config.codecs) {
+        if let Some(codec) = Codec::from_payload_type(format.payload_type, Some(&format.encoding)) {
+            media.negotiate(codec, format.payload_type);
+        }
+    }
+
+    // The peer said where its RTP comes from. It is in the offer,
+    // and the answer only confirms the codec.
+    if let Some((address, port)) = sdp::media_endpoint(&offer) {
+        if let Err(e) = media.set_remote(&address, port) {
+            warn!(call_id = %call_id, error = %e, "the peer's media address did not resolve");
+        }
+    }
+
+    session.remember_media(call_id, media);
+
+    dialog
+        .accept_with_public_contact(
+            &account.user,
+            session.public_address.get(),
+            &local,
+            Some(headers),
+            Some(body),
+        )
+        .map_err(|e| CallError::Sip(e.to_string()))
+}
+
+/// Whether an incoming call is to be answered by itself, and after
+/// how long.
+///
+/// `None` when it is not: the setting is off, or the header the
+/// setting names is not on the INVITE.
+fn auto_answer_delay(
+    config: &AutoAnswerConfig,
+    request: &rsipstack::sip::Request,
+) -> Option<std::time::Duration> {
+    if !config.enabled {
+        return None;
+    }
+    let headers: Vec<(String, String)> = request
+        .headers
+        .iter()
+        .map(|header| (header.name().to_string(), header.value().to_string()))
+        .collect();
+    if !config.header_agrees(&headers) {
+        return None;
+    }
+    Some(std::time::Duration::from_secs(u64::from(config.delay_sec)))
+}
+
+/// Whether a call that answers itself may still be answered.
+///
+/// Only the `Early` state may: the user may have answered it, or
+/// declined it, in the meantime. A call that is answered twice is a
+/// call that is broken.
+fn may_answer_by_itself(state: &DialogState) -> bool {
+    matches!(state, DialogState::Early(_, _))
+}
+
+/// Answer a call that answers itself.
+///
+/// It is the same answer the button makes — the media, the SDP, the
+/// `200 OK` — and it is made **only if the call is still ringing**:
+/// the user may have answered it, or declined it, in the meantime. A
+/// call that is answered twice is a call that is broken.
+async fn answer_by_itself(session: &Arc<AccountSession>, call_id: &str) {
+    let Some(dialog) = session.dialog(call_id) else {
+        return;
+    };
+    if !may_answer_by_itself(&dialog.state()) {
+        // The user got there first.
+        return;
+    }
+    match answer_call(session, call_id) {
+        Ok(()) => info!(call_id = %call_id, "the call was answered by itself"),
+        Err(e) => warn!(
+            call_id = %call_id,
+            error = %e,
+            "the call could not be answered by itself"
+        ),
+    }
+}
+
 /// Handle an incoming INVITE.
 ///
 /// §5.4: the `180 Ringing` goes out **right away**, before the user
@@ -981,6 +1071,23 @@ pub async fn handle_incoming_invite(
     event.call_state = "ringing".to_string();
     fill_identity(&mut event, &account, &request, &session);
     bus.publish(&account.id, event);
+
+    // The auto answer.
+    //
+    // The call is answered by itself after the delay the user asked
+    // for — and only if the header the setting names agrees. The
+    // timer runs on the runtime, not on the interface thread (§3), and
+    // the answer is the same answer the button makes.
+    if let Some(delay) = auto_answer_delay(&session.auto_answer(), &request) {
+        let session = session.clone();
+        let call_id = call_id.clone();
+        tokio::spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            answer_by_itself(&session, &call_id).await;
+        });
+    }
 
     tokio::spawn(watch_dialog(
         session.clone(),
@@ -1556,6 +1663,116 @@ mod tests {
         }
     }
 
+    /// An INVITE with the given headers.
+    ///
+    /// The header the setting names is an **untyped** one, and
+    /// rsipstack keeps an unknown header as it arrived — so the test
+    /// builds it the way the wire carries it.
+    fn an_invite_with(headers: &[(&str, &str)]) -> rsipstack::sip::Request {
+        let mut request = rsipstack::sip::Request {
+            method: rsipstack::sip::Method::Invite,
+            uri: rsipstack::sip::Uri::try_from("sip:104@example.com").expect("uri"),
+            version: rsipstack::sip::Version::V2,
+            headers: rsipstack::sip::Headers::default(),
+            body: Vec::new(),
+        };
+        for (name, value) in headers {
+            request
+                .headers
+                .push(Header::Other(name.to_string(), value.to_string()));
+        }
+        request
+    }
+
+    #[test]
+    fn the_auto_answer_is_off_until_the_user_turns_it_on() {
+        let config = AutoAnswerConfig::default();
+        let request = an_invite_with(&[]);
+        assert!(
+            auto_answer_delay(&config, &request).is_none(),
+            "the call must not be answered while the setting is off"
+        );
+    }
+
+    #[test]
+    fn the_header_decides_whether_the_call_is_answered() {
+        let config = AutoAnswerConfig {
+            enabled: true,
+            header: "X-Auto-Answer".to_string(),
+            ..AutoAnswerConfig::default()
+        };
+
+        // The header is not on the INVITE: the call rings.
+        let without = an_invite_with(&[("X-Other", "agent-3")]);
+        assert!(
+            auto_answer_delay(&config, &without).is_none(),
+            "a call without the header must not be answered by itself"
+        );
+
+        // The header is on it: the call is answered.
+        let with = an_invite_with(&[("X-Auto-Answer", "agent-3")]);
+        assert!(
+            auto_answer_delay(&config, &with).is_some(),
+            "a call with the header must be answered by itself"
+        );
+
+        // The name is matched without regard to case.
+        let lower = an_invite_with(&[("x-auto-answer", "agent-3")]);
+        assert!(
+            auto_answer_delay(&config, &lower).is_some(),
+            "the header name must not depend on its case"
+        );
+    }
+
+    #[test]
+    fn the_timer_is_the_delay_the_user_asked_for() {
+        let config = AutoAnswerConfig {
+            enabled: true,
+            delay_sec: 7,
+            ..AutoAnswerConfig::default()
+        };
+        let request = an_invite_with(&[]);
+        let delay = auto_answer_delay(&config, &request).expect("the call is answered");
+        assert_eq!(delay, Duration::from_secs(7));
+
+        // And no timer at all when the delay is zero: the call is
+        // answered at once.
+        let at_once = AutoAnswerConfig {
+            enabled: true,
+            ..AutoAnswerConfig::default()
+        };
+        let delay = auto_answer_delay(&at_once, &request).expect("the call is answered");
+        assert_eq!(delay, Duration::from_secs(0));
+    }
+
+    #[test]
+    fn a_call_that_is_no_longer_ringing_is_not_answered_by_itself() {
+        // The user answered it first — or declined it. Either way the
+        // auto answer must keep its hands off it.
+        let id = rsipstack::dialog::DialogId {
+            call_id: "call-1@example.com".to_string(),
+            local_tag: "local".to_string(),
+            remote_tag: "remote".to_string(),
+        };
+        let response = rsipstack::sip::Response::default();
+
+        assert!(
+            may_answer_by_itself(&DialogState::Early(id.clone(), response.clone())),
+            "a call that is still ringing may be answered by itself"
+        );
+        assert!(
+            !may_answer_by_itself(&DialogState::Confirmed(id.clone(), response.clone())),
+            "a call that is already up must not be answered again"
+        );
+        assert!(
+            !may_answer_by_itself(&DialogState::Terminated(
+                id,
+                rsipstack::dialog::dialog::TerminatedReason::UasDecline
+            )),
+            "a call that was declined must not be answered"
+        );
+    }
+
     /// A session with an endpoint, for the tests that need one.
     async fn a_session() -> Arc<AccountSession> {
         let token = rsipstack::platform::CancellationToken::new();
@@ -1569,6 +1786,7 @@ mod tests {
             endpoint,
             PublicAddress::default(),
             registry.media_config_handle(),
+            registry.auto_answer_handle(),
         )
     }
 

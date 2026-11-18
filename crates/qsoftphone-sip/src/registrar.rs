@@ -309,6 +309,7 @@ async fn run_registration_inner(
         endpoint,
         public_address,
         sessions.media_config_handle(),
+        sessions.auto_answer_handle(),
     );
     sessions.insert(&account.id, session.clone());
 

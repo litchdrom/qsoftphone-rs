@@ -5941,6 +5941,87 @@ A number in a string.
 
 ---
 
+## M6.22 — The calls answer themselves
+
+*"New feature. Auto answer — with timer, with sip header, unconditional.
+System wide or per account (I prefer system one)."*
+
+### The three parts of the setting
+
+**Settings → AUTO ANSWER**, one switch for the whole application — the
+user asked for the system-wide one, and a switch that is on one account
+and off on another is a switch nobody can remember.
+
+| | What it does |
+|---|---|
+| **Answer incoming calls by themselves** | the switch. Off, every call rings until somebody picks it up |
+| **Answer after N seconds** | the timer. `0` = the caller does not hear a ringtone at all; anything else is the number of seconds the caller waits — the way a PBX's *answer after* works |
+| **Only when the INVITE carries the header** | the condition. Empty = **unconditional**: every call is answered. With a name = only an INVITE that carries it is answered |
+| **with the value** | the value the header has to have. Empty = any value will do: the header has to be **there**, and that is all |
+
+The header name is matched without regard to case — a header is a
+header, `X-Auto-Answer` and `x-auto-answer` are the same header — and so
+is the value.
+
+### The answer is the same answer
+
+The auto answer calls the **same function** the Answer button calls:
+`answer_call` — the media session, the SDP that answers the offer
+(RFC 3264 §6), and the `200 OK` with the NAT-aware Contact. There is no
+second, simpler answer: a call answered by itself is a call that was
+answered.
+
+And it is made **only if the call is still ringing**. The user may have
+answered it, or declined it, in the meantime, and a call that is
+answered twice is a call that is broken.
+
+### Where the work happens
+
+The timer runs on the runtime, not on the interface thread (§3):
+
+```
+the INVITE arrives
+  → the 180 Ringing goes out right away (§5.4)
+  → the call is published to the interface
+  → the timer task starts on the runtime
+  → the delay passes
+  → the dialog is still Early?
+      no  → the user got there first: nothing happens
+      yes → answer_call: the media, the SDP, the 200 OK
+```
+
+### The setting is global, and it is pushed at once
+
+The settings live in the **session registry**, and every account's
+session holds the same handle — the same way the media settings are
+global. The app writes the setting into the registry **now**, not at the
+next start: a switch the user turns on and forgets about is a switch
+that works from tomorrow.
+
+### What is proved
+
+* **The header decides**: an INVITE that carries `X-Auto-Answer` is
+  answered by itself; an INVITE that does not is not. Checked over a
+  real UDP socket, against the real stack: the answer that comes back
+  is a `180 Ringing` and then a `200 OK` with an SDP in it.
+* **An unconditional auto answer answers a call without any header.**
+* **An auto answer that is off keeps the call ringing**, whatever the
+  INVITE carries.
+* **The timer is the delay the user asked for**, and zero means *at
+  once*.
+* **A call that is no longer ringing is not answered by itself** — the
+  user answered it first, or declined it.
+* **The switch reaches the call layer**, and the settings file is
+  written: a switch that is forgotten when the app closes is a switch
+  that is off again tomorrow morning.
+
+### The dependency cost: nothing
+
+A field in the settings file, a task on the runtime, and the answer the
+button already makes.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -6008,6 +6089,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.19** | A dummy script for checking the scripts: `scripts/dummy-run.ps1` starts nothing and writes a line into `script-runs.log`, so the start script, the stop script, the trigger and the exit code can each be checked on their own | **done** |
 | **M6.20** | The status the app starts from: a **Default status after restore** in the statuses settings, and every account is put back into it when the app closes — silently, so nothing starts on the way out | **done** |
 | **M6.21** | The examples are 101: the placeholder number in the dialer hint, in the built-in **Online** status and in the docs was `666`, and it is `101` now — the peer numbers (`6661`, `6666`) and **RFC 6665** are left alone, and so is the second placeholder family (`555`) | **done** |
+| **M6.22** | The calls answer themselves: one **system-wide** switch with a **timer** and an optional **SIP header** — the same answer the button makes, made only while the call is still ringing, and proved against the real stack over a UDP socket | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.

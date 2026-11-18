@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
 use eframe::egui;
-use qsoftphone_core::config::AppConfig;
+use qsoftphone_core::config::{AppConfig, AutoAnswerConfig};
 use qsoftphone_core::model::account::{Account, BlfEntry, now_ms};
 use qsoftphone_core::model::call_event::{CallEventType, Direction};
 use qsoftphone_core::model::history::{
@@ -619,6 +619,10 @@ impl QSoftphoneApp {
         // The media settings are shared with the registrar: the codec
         // the user picks has to reach the offer that is built.
         calls.set_media_config(media_config_of(&config));
+        // And so are the auto-answer settings: the call layer holds a
+        // copy of them, and the copy has to be the one the user has
+        // chosen.
+        calls.set_auto_answer(config.auto_answer.clone());
         let blf = qsoftphone_sip::BlfManager::new(sessions.clone(), runtime.clone());
         let (media_updates_tx, media_updates) = std::sync::mpsc::channel();
         let (action_updates_tx, action_updates) = std::sync::mpsc::channel();
@@ -2220,6 +2224,22 @@ impl QSoftphoneApp {
         self.calls.set_media_config(media);
         if let Err(e) = self.config.save(&self.paths.config_file()) {
             tracing::warn!(error = %e, "could not persist the sound settings");
+        }
+    }
+
+    /// The auto-answer settings — into the config, into the call layer
+    /// and onto the disk.
+    ///
+    /// The call layer keeps a copy of the settings, and a copy that is
+    /// not the one the user has just changed is a copy that answers the
+    /// calls by the old rules. The change is pushed **now**, not at the
+    /// next start: a switch the user turns on and forgets about is a
+    /// switch that works from tomorrow.
+    fn set_auto_answer(&mut self, config: AutoAnswerConfig) {
+        self.config.auto_answer = config.clone();
+        self.calls.set_auto_answer(config);
+        if let Err(e) = self.config.save(&self.paths.config_file()) {
+            tracing::warn!(error = %e, "could not persist the auto-answer settings");
         }
     }
 
@@ -5202,6 +5222,76 @@ impl QSoftphoneApp {
         }
 
         ui.add_space(10.0);
+
+        // The auto answer.
+        //
+        // One switch for the whole application: every account answers
+        // by itself, or none of them does. The setting is drawn on a
+        // copy and written back — the same rule as the status list
+        // below: a widget owns the value it is drawn from, and the
+        // copy is what the settings get.
+        ui.label(egui::RichText::new("AUTO ANSWER").strong().size(11.0));
+        ui.separator();
+
+        let mut auto = self.config.auto_answer.clone();
+
+        ui.checkbox(&mut auto.enabled, "Answer incoming calls by themselves");
+        if auto.enabled {
+            ui.horizontal(|ui| {
+                ui.label("Answer after");
+                ui.add(
+                    egui::DragValue::new(&mut auto.delay_sec)
+                        .range(0..=120)
+                        .suffix(" seconds"),
+                );
+            });
+            ui.weak("Zero seconds: the caller does not hear a ringtone at all.");
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Only when the INVITE carries the header");
+                ui.add(
+                    egui::TextEdit::singleline(&mut auto.header)
+                        .id_salt("auto_answer_header")
+                        .desired_width(170.0)
+                        .hint_text("X-Auto-Answer"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("with the value");
+                ui.add(
+                    egui::TextEdit::singleline(&mut auto.header_value)
+                        .id_salt("auto_answer_header_value")
+                        .desired_width(170.0)
+                        .hint_text("agent-3"),
+                );
+            });
+
+            // What the setting does, in words.
+            //
+            // A header with no value is a header that has to be
+            // **there** — and a header with no name at all is the
+            // unconditional case: every call is answered.
+            let header = auto.header.trim();
+            let value = auto.header_value.trim();
+            if header.is_empty() {
+                ui.weak("Every incoming call is answered, whatever it carries.");
+            } else if value.is_empty() {
+                ui.weak(format!(
+                    "Only an INVITE that carries '{header}' is answered — with any value."
+                ));
+            } else {
+                ui.weak(format!(
+                    "Only an INVITE that carries '{header}: {value}' is answered."
+                ));
+            }
+        } else {
+            ui.weak("The calls ring until they are answered by hand.");
+        }
+
+        if auto != self.config.auto_answer {
+            self.set_auto_answer(auto);
+        }
+        ui.add_space(10.0);
         self.draw_statuses(ui);
     }
 }
@@ -7394,6 +7484,7 @@ mod tests {
             endpoint,
             qsoftphone_sip::PublicAddress::default(),
             sessions.media_config_handle(),
+            sessions.auto_answer_handle(),
         );
         sessions.insert("acct-ui-1", session);
 
@@ -9258,6 +9349,136 @@ mod tests {
         assert!(
             text.contains("microphone"),
             "the echo test does not say it plays the microphone:\n{text}"
+        );
+    }
+
+    /// Scroll the settings page until the text is on the screen.
+    ///
+    /// The page is longer than the window, and a widget that is out of
+    /// sight cannot be clicked: the click lands outside the window and
+    /// nothing happens.
+    fn scroll_to(app: &mut QSoftphoneApp, ctx: &egui::Context, text: &str) -> egui::Rect {
+        for _ in 0..20 {
+            let output = frame(app, ctx);
+            if let Some(rect) = text_at(&output, text) {
+                if rect.min.y > 0.0 && rect.max.y < 700.0 {
+                    return rect;
+                }
+            }
+            // The page is scrolled the way a user scrolls it: with the
+            // wheel, over the page.
+            let mut input = egui::RawInput::default();
+            input
+                .events
+                .push(egui::Event::PointerMoved(egui::pos2(550.0, 500.0)));
+            input.events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -150.0),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+                modifiers: egui::Modifiers::default(),
+            });
+            let _ = frame_with(app, ctx, input);
+        }
+        panic!("the text {text} did not come into view");
+    }
+
+    /// The auto answer is a setting, and it is on the settings page.
+    #[tokio::test]
+    async fn the_auto_answer_is_on_the_settings_page() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        app.view = View::Settings;
+        let output = frame(&mut app, &ctx);
+
+        assert!(
+            text_at(&output, "AUTO ANSWER").is_some(),
+            "the settings page has no auto-answer section:\n{}",
+            screen_text(&output)
+        );
+        assert!(
+            text_at(&output, "Answer incoming calls by themselves").is_some(),
+            "the settings page has no auto-answer switch:\n{}",
+            screen_text(&output)
+        );
+    }
+
+    /// The switch is the setting: it turns the auto answer on, and the
+    /// call layer hears about it at once.
+    ///
+    /// The call layer holds a copy of the settings, and a copy that is
+    /// not the one the user has just changed is a copy that answers the
+    /// calls by the old rules.
+    #[tokio::test]
+    async fn the_auto_answer_switch_reaches_the_call_layer() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        app.view = View::Settings;
+        // The switch is near the bottom of a page that is longer than
+        // the window, so the page is scrolled to it first.
+        let switch = scroll_to(&mut app, &ctx, "Answer incoming calls by themselves");
+
+        click_at(&mut app, &ctx, switch);
+
+        assert!(
+            app.config.auto_answer.enabled,
+            "the switch did not turn the auto answer on"
+        );
+        assert!(
+            app.calls.auto_answer().enabled,
+            "the call layer did not hear about the auto answer"
+        );
+    }
+
+    /// The setting is written to the file.
+    ///
+    /// A switch that is forgotten when the app closes is a switch that
+    /// is off again tomorrow morning.
+    #[tokio::test]
+    async fn the_auto_answer_setting_is_written_to_the_file() {
+        let (mut app, _bus) =
+            build_app_in_own_folder("auto-answer", tokio::runtime::Handle::current());
+
+        app.set_auto_answer(AutoAnswerConfig {
+            enabled: true,
+            delay_sec: 3,
+            header: "X-Auto-Answer".to_string(),
+            header_value: String::new(),
+        });
+
+        let file = app.paths.config_file();
+        assert!(file.exists(), "the settings file was not written");
+        let text = std::fs::read_to_string(&file).expect("the file reads");
+        assert!(
+            text.contains("autoAnswer"),
+            "the file has no auto-answer section:\n{text}"
+        );
+        assert!(
+            text.contains("X-Auto-Answer"),
+            "the file has no header:\n{text}"
+        );
+    }
+
+    /// The settings the app starts with are the ones the call layer
+    /// works by.
+    ///
+    /// A file that says the calls are answered and a call layer that
+    /// does not answer them is a setting that does nothing.
+    #[tokio::test]
+    async fn the_auto_answer_of_the_settings_file_reaches_the_call_layer() {
+        let (mut app, _bus) =
+            build_app_in_own_folder("auto-answer-start", tokio::runtime::Handle::current());
+
+        app.config.auto_answer.enabled = true;
+        app.set_auto_answer(app.config.auto_answer.clone());
+
+        assert!(
+            app.calls.auto_answer().enabled,
+            "the call layer does not answer the calls the settings file asks it to"
         );
     }
 

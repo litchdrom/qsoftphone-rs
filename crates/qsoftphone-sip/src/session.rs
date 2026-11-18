@@ -19,6 +19,7 @@ use rsipstack::sip::Request;
 use rsipstack::transaction::endpoint::Endpoint;
 use rsipstack::transaction::transaction::TransactionEventSender;
 
+use qsoftphone_core::config::AutoAnswerConfig;
 use qsoftphone_core::model::account::Account;
 use qsoftphone_core::sip::blf::{BlfState, DialogInfo, Presence};
 use qsoftphone_media::{MediaConfig, MediaSession};
@@ -84,6 +85,12 @@ pub struct AccountSession {
     /// section of the config file held the codec priorities for the
     /// whole application, not for one account.
     media_config: Arc<RwLock<MediaConfig>>,
+    /// Whether incoming calls are answered by themselves.
+    ///
+    /// Global as well: the setting is on for the whole application, or
+    /// it is off. A per-account switch would be a thing to remember,
+    /// and the user asked for the one that is not.
+    auto_answer: Arc<RwLock<AutoAnswerConfig>>,
     /// The Busy Lamp Field subscriptions of this account, by extension.
     ///
     /// They live here because the `NOTIFY` that updates them arrives on
@@ -99,6 +106,7 @@ impl AccountSession {
         endpoint: Endpoint,
         public_address: PublicAddress,
         media_config: Arc<RwLock<MediaConfig>>,
+        auto_answer: Arc<RwLock<AutoAnswerConfig>>,
     ) -> Arc<Self> {
         let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
         Arc::new(Self {
@@ -113,6 +121,7 @@ impl AccountSession {
             targets: Mutex::new(HashMap::new()),
             ringing_calls: Mutex::new(HashMap::new()),
             media_config,
+            auto_answer,
             blf: Mutex::new(HashMap::new()),
         })
     }
@@ -138,6 +147,14 @@ impl AccountSession {
     /// What the media of a call should be.
     pub fn media_config(&self) -> MediaConfig {
         self.media_config.read().expect("media settings").clone()
+    }
+
+    /// Whether incoming calls are answered by themselves.
+    pub fn auto_answer(&self) -> AutoAnswerConfig {
+        self.auto_answer
+            .read()
+            .expect("auto answer settings")
+            .clone()
     }
 
     /// Remember a dialog so the UI can act on it later.
@@ -424,6 +441,8 @@ pub struct SessionRegistry {
     inner: Arc<Mutex<HashMap<String, Arc<AccountSession>>>>,
     /// What the media of a call should be.
     media_config: Arc<RwLock<MediaConfig>>,
+    /// Whether incoming calls are answered by themselves.
+    auto_answer: Arc<RwLock<AutoAnswerConfig>>,
 }
 
 impl SessionRegistry {
@@ -449,6 +468,27 @@ impl SessionRegistry {
     /// The shared handle to the media settings.
     pub fn media_config_handle(&self) -> Arc<RwLock<MediaConfig>> {
         self.media_config.clone()
+    }
+
+    /// The auto-answer settings, read.
+    pub fn auto_answer(&self) -> AutoAnswerConfig {
+        self.auto_answer
+            .read()
+            .expect("auto answer settings")
+            .clone()
+    }
+
+    /// The auto-answer settings, set.
+    ///
+    /// The setting is global, so one handle serves every account: the
+    /// user asked for the one switch, not one per account.
+    pub fn set_auto_answer(&self, config: AutoAnswerConfig) {
+        *self.auto_answer.write().expect("auto answer settings") = config;
+    }
+
+    /// The shared handle to the auto-answer settings.
+    pub fn auto_answer_handle(&self) -> Arc<RwLock<AutoAnswerConfig>> {
+        self.auto_answer.clone()
     }
 
     /// Publish a session under its account id.
@@ -519,6 +559,7 @@ mod tests {
             endpoint,
             PublicAddress::default(),
             registry.media_config_handle(),
+            registry.auto_answer_handle(),
         );
 
         registry.insert("acct-1", session.clone());
@@ -555,6 +596,7 @@ mod tests {
             endpoint,
             PublicAddress::default(),
             registry.media_config_handle(),
+            registry.auto_answer_handle(),
         );
 
         // The transport, not the sound card: the test must not open a
@@ -591,6 +633,7 @@ mod tests {
             endpoint,
             PublicAddress::default(),
             registry.media_config_handle(),
+            registry.auto_answer_handle(),
         );
 
         let media = MediaSession::new(&MediaConfig::default()).expect("media");
