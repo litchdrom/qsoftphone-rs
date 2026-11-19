@@ -2269,6 +2269,133 @@ async fn an_incoming_call_rings_before_the_user_answers() {
 }
 
 #[tokio::test]
+async fn a_call_is_held_with_a_re_invite_that_says_send_only() {
+    // A hold is a **re-INVITE** whose SDP says `a=sendonly` (RFC 3264
+    // §5): "I will send, I will not receive". The peer answers
+    // `a=recvonly` and stops sending, so the far end goes quiet.
+    //
+    // The test watches the wire: the peer records every request it
+    // receives, and the second INVITE is the hold.
+    init_tracing();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("peer socket");
+    let peer_addr = socket.local_addr().expect("peer addr");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    tokio::spawn(run_peer(
+        socket,
+        observations.clone(),
+        PeerOptions {
+            call_back: true,
+            dtmf: None,
+            challenge_invite: false,
+            challenge_subscribe: false,
+            transfer: None,
+            public_address: None,
+            bye_status: None,
+            early_media: false,
+            cancel_the_call: false,
+            ring_for: None,
+            ring_delay: None,
+            blf_state: None,
+            presence_basic: None,
+        },
+    ));
+
+    let handle = tokio::runtime::Handle::current();
+    let mut stack = stack(handle);
+
+    let mut account = Account::new("Office", peer_addr.to_string(), "104", "secret", "udp");
+    account.id = "acct-loopback-hold".to_string();
+    stack.registrations.start(&account, 0);
+
+    let mut seen = Vec::new();
+    let incoming = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::IncomingCall,
+        Duration::from_secs(5),
+    )
+    .await;
+    let incoming = incoming.expect("the incoming call never arrived");
+
+    // The user answers, and the call is up.
+    stack
+        .calls
+        .answer(&account.id, &incoming.call_id)
+        .expect("answer");
+    let answered = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallAnswered,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(answered.is_some(), "the call was never confirmed");
+
+    // The hold.
+    stack
+        .calls
+        .hold(&account.id, &incoming.call_id)
+        .expect("hold");
+    let held = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallOnHold,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(held.is_some(), "the call was never held");
+
+    // The peer got a re-INVITE, and it says the direction that a hold
+    // is. The peer's own INVITE is not in the list: it sent that one.
+    let invites = observations
+        .lock()
+        .expect("observations lock")
+        .requests("INVITE");
+    assert_eq!(
+        invites.len(),
+        1,
+        "the peer did not get the re-INVITE:\n{invites:#?}"
+    );
+    assert!(
+        invites[0].contains("a=sendonly"),
+        "the hold is not a sendonly:\n{}",
+        invites[0]
+    );
+    // And the format did not change: the same one the answer named. A
+    // hold that changed the codec under the call would be a new stream.
+    assert!(
+        invites[0].contains("a=rtpmap:8 PCMA/8000"),
+        "the hold changed the format:\n{}",
+        invites[0]
+    );
+
+    // And the unhold puts the direction back.
+    stack
+        .calls
+        .unhold(&account.id, &incoming.call_id)
+        .expect("unhold");
+    let resumed = wait_for(
+        &mut seen,
+        &mut stack.calls,
+        CallEventType::CallResumed,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(resumed.is_some(), "the call was never resumed");
+
+    let invites = observations
+        .lock()
+        .expect("observations lock")
+        .requests("INVITE");
+    assert_eq!(invites.len(), 2, "the peer did not get the unhold");
+    assert!(
+        invites[1].contains("a=sendrecv"),
+        "the unhold did not put the direction back:\n{}",
+        invites[1]
+    );
+}
+
+#[tokio::test]
 async fn a_ringing_incoming_call_is_declined_when_it_is_hung_up() {
     init_tracing();
     // §5.5: an incoming call that is still ringing is declined with

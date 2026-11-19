@@ -275,6 +275,14 @@ pub struct AudioState {
     mic_muted: AtomicBool,
     /// The speaker is muted.
     speaker_muted: AtomicBool,
+    /// The call is on hold.
+    ///
+    /// The hold is **not** a mute: it is a state of its own, and the
+    /// effective silence is the mute *or* the hold. A user who muted
+    /// the microphone before the hold gets it back when the call comes
+    /// off the hold — and a hold that is taken off does not unmute a
+    /// microphone the user muted on purpose.
+    held: AtomicBool,
     /// The microphone gain, as the bits of an `f32`.
     mic_gain: AtomicU32,
     /// The speaker gain, as the bits of an `f32`.
@@ -384,6 +392,7 @@ impl AudioState {
             inbound: Mutex::new(VecDeque::new()),
             mic_muted: AtomicBool::new(false),
             speaker_muted: AtomicBool::new(false),
+            held: AtomicBool::new(false),
             mic_gain: AtomicU32::new(mic_gain.clamp(0.0, MAX_GAIN).to_bits()),
             speaker_gain: AtomicU32::new(speaker_gain.clamp(0.0, MAX_GAIN).to_bits()),
             frame_samples: AtomicUsize::new(FRAME_SAMPLES),
@@ -452,6 +461,30 @@ impl AudioState {
     /// Whether the speaker is muted.
     pub fn speaker_muted(&self) -> bool {
         self.speaker_muted.load(Ordering::Relaxed)
+    }
+
+    /// Put the call on hold, or take it off the hold.
+    pub fn set_held(&self, held: bool) {
+        self.held.store(held, Ordering::Relaxed);
+    }
+
+    /// Whether the call is on hold.
+    pub fn held(&self) -> bool {
+        self.held.load(Ordering::Relaxed)
+    }
+
+    /// Whether the microphone sends silence.
+    ///
+    /// The mute and the hold are two different silences: the user
+    /// muted the microphone, or the call is on hold and nothing is
+    /// said into it. Either of them is silence.
+    pub fn mic_silent(&self) -> bool {
+        self.mic_muted() || self.held()
+    }
+
+    /// Whether the speaker plays silence.
+    pub fn speaker_silent(&self) -> bool {
+        self.speaker_muted() || self.held()
     }
 
     /// The microphone gain.
@@ -979,7 +1012,7 @@ impl FrameBuilder {
         // Above unity it is a preamp — the microphone turned up — and
         // what it clips is clipped by the codec, which is a log
         // codec, and forgives a great deal.
-        let sample = if state.mic_muted() {
+        let sample = if state.mic_silent() {
             0.0
         } else {
             sample * self.gain
@@ -2030,7 +2063,7 @@ impl Playback {
             return 0.0;
         }
 
-        let muted = state.speaker_muted();
+        let muted = state.speaker_silent();
         let gain = state.speaker_gain();
 
         loop {

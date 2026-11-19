@@ -175,6 +175,11 @@ pub struct MediaStatus {
     pub mic_muted: bool,
     /// Whether the speaker is muted.
     pub speaker_muted: bool,
+    /// Whether the call is on hold.
+    ///
+    /// The hold is a state of its own, and not a mute: the stream
+    /// keeps running and carries silence.
+    pub held: bool,
     /// The loudest sample the **peer** sent, from 0.0 to 1.0.
     ///
     /// Zero means the peer sent silence for the whole call. That is a
@@ -234,6 +239,9 @@ impl MediaStatus {
         let mut line = format!("Media: {}", self.codec.name());
         if !self.running {
             line.push_str(" — not started");
+        }
+        if self.held {
+            line.push_str(" — on hold");
         }
         if self.mic_muted || self.speaker_muted {
             let mut parts = Vec::new();
@@ -415,6 +423,20 @@ impl MediaSession {
     /// Whether the speaker is muted.
     pub fn speaker_muted(&self) -> bool {
         self.inner.state.speaker_muted()
+    }
+
+    /// Put the call on hold, or take it off the hold.
+    ///
+    /// A hold is not a mute: the stream keeps running — the peer has to
+    /// see it, or it tears the call down — and it carries silence
+    /// instead of the user's voice.
+    pub fn set_held(&self, held: bool) {
+        self.inner.state.set_held(held);
+    }
+
+    /// Whether the call is on hold.
+    pub fn held(&self) -> bool {
+        self.inner.state.held()
     }
 
     /// Set the microphone gain.
@@ -662,6 +684,7 @@ impl MediaSession {
             problem: self.inner.problem.lock().expect("problem lock").clone(),
             mic_muted: self.mic_muted(),
             speaker_muted: self.speaker_muted(),
+            held: self.held(),
             incoming_peak: self.inner.state.inbound_peak(),
             incoming_level: self.inner.state.inbound_level(),
             outgoing_peak: self.inner.state.outbound_peak(),

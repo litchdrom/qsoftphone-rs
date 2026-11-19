@@ -835,7 +835,9 @@ endpoint to go out from, and the call layer refuses it if there is
 none. The call panel follows the newest call that is not over, and
 shows the resolved peer name, the dialled number, the last DTMF digit
 and a hang-up button, with the DTMF keypad once the call is
-connected. A call that arrives switches the window to the call page.
+connected. A call that is up also has a **Hold** button, and a call that
+is on hold has a **Resume** one (M6.23). A call that arrives switches
+the window to the call page.
 
 The incoming-call modal is §5.7's rule: **it cannot be closed by the
 user.** No close button, no click-outside-to-dismiss, no Esc — only
@@ -6022,6 +6024,83 @@ button already makes.
 
 ---
 
+## M6.23 — The other line waits
+
+*"Lets add Hold feature to the call. If user answered or start dial other
+line became hold with blinking notification."*
+
+### A hold is a re-INVITE
+
+A hold is not a flag in the interface: it is a **re-INVITE** whose SDP
+says `a=sendonly` (RFC 3264 §5) — *I will send, I will not receive*. The
+peer answers `a=recvonly` and stops sending, so the far end goes quiet.
+The hold comes off with the same re-INVITE, back to `a=sendrecv`.
+
+The re-offer names **one** format: the one that was negotiated, with the
+**payload type** that was negotiated. A hold must not change the codec
+under the call — a peer may put G.711 on a dynamic payload type of its
+own, and an offer that named the codec's own default would ask for a
+different stream than the one that is running.
+
+### The hold is not a mute
+
+The media plane has a **hold** of its own, beside the two mute flags:
+
+| | The microphone | The speaker |
+|---|---|---|
+| **muted** by the user | silence | silence |
+| **on hold** | silence | silence |
+
+The effective silence is the mute *or* the hold. So a user who muted the
+microphone before the hold gets it back when the call comes off it, and a
+hold that is taken off does not unmute a microphone the user muted on
+purpose. The RTP stream keeps running either way: a peer that sees the
+stream stop tears the call down.
+
+### The other line goes on hold
+
+The call the user is talking to is the one that is up; the other line of
+the same account waits:
+
+* the user **answers** a call → the other line goes on hold,
+* the user **dials** → the other line goes on hold,
+* a call that is answered **by itself** (M6.22) does the same.
+
+The rule is the **event**, not the button: a call is answered when the
+peer says so, and whatever answered it — the user, the auto answer, the
+PBX — the other line waits.
+
+The row of the held call says **on hold** and **blinks**. The blink is
+the notification: a row that says *on hold* in the same grey as
+everything else is a row nobody sees. The window is drawn every 120 ms
+while a call is on hold, so the blink moves.
+
+There is a **Hold** button on the call that is up and a **Resume** button
+on the call that is waiting, so a call can be put on hold by hand and
+taken off again.
+
+### What is proved
+
+* **The re-INVITE says `a=sendonly`**, and it names the format that was
+  negotiated — the same `a=rtpmap:8 PCMA/8000` the call was set up with.
+  Checked over a real UDP socket, against the real stack: the peer
+  receives the re-INVITE, and the hold comes off with `a=sendrecv`.
+* **The events arrive** — `CallOnHold` and `CallResumed` — so the row can
+  say *on hold* and the blink can start.
+* **The other line is the one that goes on hold**: the call of the same
+  account that is up, and not the call that was answered.
+* **The row blinks**, and the window is drawn often enough for the blink
+  to move.
+* **A call on hold offers the way back** — *Resume*, and not a second
+  *Hold*.
+
+### The dependency cost: nothing
+
+A re-INVITE the stack already makes, one flag in the media plane, and one
+column in the call list.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -6090,6 +6169,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.20** | The status the app starts from: a **Default status after restore** in the statuses settings, and every account is put back into it when the app closes — silently, so nothing starts on the way out | **done** |
 | **M6.21** | The examples are 101: the placeholder number in the dialer hint, in the built-in **Online** status and in the docs was `666`, and it is `101` now — the peer numbers (`6661`, `6666`) and **RFC 6665** are left alone, and so is the second placeholder family (`555`) | **done** |
 | **M6.22** | The calls answer themselves: one **system-wide** switch with a **timer** and an optional **SIP header** — the same answer the button makes, made only while the call is still ringing, and proved against the real stack over a UDP socket | **done** |
+| **M6.23** | The other line waits: a call that is answered or dialled puts the other line of the account **on hold** — a re-INVITE with `a=sendonly` that keeps the negotiated format and its payload type — and the held row says **on hold** and **blinks**, with a **Hold** and a **Resume** button of its own | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -6153,7 +6233,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 629 tests, all passing.
+* `cargo test --workspace` — 634 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -6749,6 +6829,11 @@ player lands.
   knobs next to the mute buttons, and the settings page has the volume
   every call starts with — and the knob is in decibels, because a gain
   on its own means nothing to a user.
+* **A hold is a re-INVITE, and the peer sees it.** The loopback peer
+  records the re-INVITE: its SDP says `a=sendonly`, and it names the
+  format the call was set up with — `a=rtpmap:8 PCMA/8000`, the
+  negotiated payload type and not the codec's own. The hold comes off
+  with `a=sendrecv`, and the interface is told about both.
 
 **Not verified:**
 
@@ -6883,6 +6968,14 @@ player lands.
   which holds the call in the early state — but a PBX that rings and
   then **answers after the REFER has already gone out** is the case
   that has not been run, and that is the case the user asked for.
+* **The hold has not been seen against the real PBX.** The re-INVITE with
+  `a=sendonly`, the negotiated format and the `CallOnHold` /
+  `CallResumed` events are all proved against the peer in this
+  repository, over a real socket: the peer receives the re-INVITE and
+  the hold comes off with `a=sendrecv`. What the user's own Asterisk
+  makes of a re-INVITE that names **one** format is not known, and
+  neither is the silence at the far end — which is the thing the user
+  will hear.
 * **The ringtone and the ringback have not been heard.** The tones are
   made, the WAV is read and the decision is tested — and the sound
   itself has not been through a speaker, because no call has rung yet:

@@ -766,13 +766,16 @@ impl CallManager {
         }
         let media = session.media(call_id).ok_or(CallError::NoSuchCall)?;
 
-        // The re-offer names the codec that was negotiated and nothing
-        // else: a hold must not change the codec under the call.
-        let body = sdp::offer_sdp_with_direction(
+        // The re-offer names the format that was negotiated and nothing
+        // else: a hold must not change the codec under the call. The
+        // payload type is the one that was negotiated and not the
+        // codec's own — a peer may put G.711 on a dynamic type.
+        let body = sdp::offer_sdp_one_format(
             &media_address(&session),
             media.local_port(),
             1,
-            &[media.codec()],
+            media.codec(),
+            media.payload_type(),
             if held {
                 sdp::Direction::SendOnly
             } else {
@@ -780,11 +783,26 @@ impl CallManager {
             },
         );
 
-        // The speaker goes quiet at once, whatever the peer does.
-        media.set_speaker_muted(held);
+        // The call goes quiet at once, whatever the peer does, and so
+        // does the microphone: a call on hold carries silence and not
+        // the user's voice.
+        //
+        // The hold is a state of its own in the media plane, and not a
+        // mute: the flags the user set are not touched, so a
+        // microphone the user muted before the hold is still muted
+        // when the call comes off it.
+        media.set_held(held);
 
         let call_id = call_id.to_string();
         let media = media.clone();
+        let account = session.account.clone();
+        // Which way the call was going does not change with the hold.
+        let direction = if dialog.role() == TransactionRole::Server {
+            Direction::Incoming
+        } else {
+            Direction::Outgoing
+        };
+        let bus = self.bus.clone();
         self.handle.spawn(async move {
             let headers = vec![Header::ContentType("application/sdp".into())];
             let response = match dialog.reinvite(Some(headers), Some(body)).await {
@@ -793,7 +811,7 @@ impl CallManager {
                     warn!(call_id = %call_id, error = %e, "the hold could not be sent");
                     // The peer is still sending: give the user their
                     // voice back rather than leaving them in silence.
-                    media.set_speaker_muted(false);
+                    media.set_held(false);
                     return;
                 }
             };
@@ -801,10 +819,23 @@ impl CallManager {
                 let status = response.status_code();
                 if status.code() >= 300 {
                     warn!(call_id = %call_id, code = status.code(), "the peer refused the hold");
-                    media.set_speaker_muted(false);
+                    media.set_held(false);
+                    return;
                 }
             }
+            // The event: the interface shows the call as on hold, and
+            // the row blinks so that the eye finds it.
+            let mut event = CallEvent::new(if held {
+                CallEventType::CallOnHold
+            } else {
+                CallEventType::CallResumed
+            });
+            event.user = account.user.clone();
+            event.call_id = call_id.clone();
+            event.call_direction = Some(direction);
+            event.call_state = if held { "onhold" } else { "connected" }.to_string();
             tracing::info!(call_id = %call_id, held, "the call was held");
+            bus.publish(&account.id, event);
         });
         Ok(())
     }

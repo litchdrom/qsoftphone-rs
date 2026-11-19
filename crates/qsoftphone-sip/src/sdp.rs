@@ -186,6 +186,42 @@ pub fn offer_sdp_with_direction(
     sdp.into_bytes()
 }
 
+/// The offer of **one** format, with the direction the stream should
+/// have.
+///
+/// A hold must not change the format: the stream that was negotiated
+/// stays, and only the direction changes (RFC 3264 §5, §6). The
+/// payload type is the one that was **negotiated** and not the codec's
+/// own default — a peer may put G.711 on a dynamic type of its own.
+pub fn offer_sdp_one_format(
+    address: &str,
+    port: u16,
+    session_id: u64,
+    codec: Codec,
+    payload_type: u8,
+    direction: Direction,
+) -> Vec<u8> {
+    let fmtp = codec
+        .fmtp()
+        .map(|parameters| format!("a=fmtp:{payload_type} {parameters}\r\n"))
+        .unwrap_or_default();
+    let sdp = format!(
+        "v=0\r\n\
+         o=- {session_id} {session_id} IN IP4 {address}\r\n\
+         s=-\r\n\
+         c=IN IP4 {address}\r\n\
+         t=0 0\r\n\
+         m=audio {port} RTP/AVP {payload_type}\r\n\
+         a=rtpmap:{payload_type} {rtpmap}\r\n\
+         {fmtp}\
+         a=ptime:20\r\n\
+         {direction}\r\n",
+        rtpmap = codec.rtpmap(),
+        direction = direction.as_attribute(),
+    );
+    sdp.into_bytes()
+}
+
 /// The answer to an offer.
 ///
 /// The codec is one the offer listed — RFC 3264 §6. When this build
