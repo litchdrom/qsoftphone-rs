@@ -23,8 +23,8 @@ use crate::storage::db::Db;
 /// where it is and nothing reads it.
 const COLUMNS: &str = "id, label, registrar, user, password, transport, domain,
                         outbound_proxy, caller_id_header, dialed_number_header,
-                        capture_headers, custom_headers, blf_extensions, crm_preset_id,
-                        ringtone_file, status, created_at, updated_at";
+                        capture_headers, custom_headers, blf_extensions, blf_pickup_prefix,
+                        crm_preset_id, ringtone_file, status, created_at, updated_at";
 
 /// CRUD over the `accounts` table.
 pub struct AccountStore<'a> {
@@ -94,9 +94,9 @@ impl<'a> AccountStore<'a> {
                 "INSERT INTO accounts
                     (id, label, registrar, user, password, transport, domain,
                      outbound_proxy, caller_id_header, dialed_number_header,
-                     capture_headers, custom_headers, blf_extensions, crm_preset_id,
-                     ringtone_file, status, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                     capture_headers, custom_headers, blf_extensions, blf_pickup_prefix,
+                     crm_preset_id, ringtone_file, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                  ON CONFLICT(id) DO UPDATE SET
                     label                = excluded.label,
                     registrar            = excluded.registrar,
@@ -110,6 +110,7 @@ impl<'a> AccountStore<'a> {
                     capture_headers      = excluded.capture_headers,
                     custom_headers       = excluded.custom_headers,
                     blf_extensions       = excluded.blf_extensions,
+                    blf_pickup_prefix    = excluded.blf_pickup_prefix,
                     crm_preset_id        = excluded.crm_preset_id,
                     ringtone_file        = excluded.ringtone_file,
                     status               = excluded.status,
@@ -128,6 +129,7 @@ impl<'a> AccountStore<'a> {
                     capture,
                     custom,
                     blf,
+                    account.blf_pickup_prefix,
                     account.crm_preset_id,
                     account.ringtone_file,
                     status,
@@ -283,7 +285,7 @@ fn row_to_account(row: &Row<'_>) -> rusqlite::Result<Account> {
     // statuses is kept as it is, because the list of statuses is the
     // user's and may grow one back. An empty id is the default one —
     // the state a phone is in when nobody has said otherwise.
-    let status: String = row.get(15)?;
+    let status: String = row.get(16)?;
     let status = match status.trim() {
         "" => DEFAULT_STATUS_ID.to_string(),
         id => id.to_string(),
@@ -302,11 +304,14 @@ fn row_to_account(row: &Row<'_>) -> rusqlite::Result<Account> {
         capture_headers,
         custom_headers,
         blf_extensions,
-        crm_preset_id: row.get(13)?,
-        ringtone_file: row.get(14)?,
+        // The prefix that picks up a call that is ringing on a watched
+        // extension. Empty = the pickup is off.
+        blf_pickup_prefix: row.get(13)?,
+        crm_preset_id: row.get(14)?,
+        ringtone_file: row.get(15)?,
         status,
-        created_at: row.get(16)?,
-        updated_at: row.get(17)?,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
     })
 }
 
@@ -498,6 +503,41 @@ mod tests {
 
         let fetched = store.get(&account.id).unwrap().unwrap();
         assert!(fetched.blf_extensions.is_empty());
+    }
+
+    #[test]
+    fn the_pickup_prefix_survives_a_round_trip() {
+        // The prefix is a feature code of the server: an account that
+        // loses it stops picking up calls, and the user is not told.
+        let db = Db::open_in_memory().unwrap();
+        let store = AccountStore::new(&db);
+
+        let mut account = Account::new("Office", "example.com", "104", "", "udp");
+        account.blf_pickup_prefix = "**".to_string();
+        store.upsert(&account).unwrap();
+
+        let fetched = store.get(&account.id).unwrap().unwrap();
+        assert_eq!(fetched.blf_pickup_prefix, "**");
+    }
+
+    #[test]
+    fn an_account_without_a_pickup_prefix_keeps_the_lamps_and_the_pickup_off() {
+        // An account that was saved before the pickup existed must open
+        // as it was: the lamps still work, and nothing is picked up.
+        let db = Db::open_in_memory().unwrap();
+        let store = AccountStore::new(&db);
+
+        let mut account = Account::new("Office", "example.com", "104", "", "udp");
+        account.blf_extensions = vec![BlfEntry {
+            watch: "105".to_string(),
+            dial: String::new(),
+        }];
+        store.upsert(&account).unwrap();
+
+        let fetched = store.get(&account.id).unwrap().unwrap();
+        assert_eq!(fetched.blf_pickup_prefix, "");
+        assert_eq!(fetched.blf_extensions.len(), 1);
+        assert_eq!(fetched.pickup_target("105"), None);
     }
 
     #[test]

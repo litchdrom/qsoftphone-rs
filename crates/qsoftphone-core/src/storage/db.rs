@@ -68,6 +68,7 @@ impl Db {
                     capture_headers      TEXT    NOT NULL DEFAULT '[]',
                     custom_headers       TEXT    NOT NULL DEFAULT '[]',
                     blf_extensions       TEXT    NOT NULL DEFAULT '[]',
+                    blf_pickup_prefix   TEXT    NOT NULL DEFAULT '',
                     crm_preset_id        TEXT    NOT NULL DEFAULT '',
                     ringtone_file        TEXT    NOT NULL DEFAULT '',
                     status               TEXT    NOT NULL DEFAULT 'ready',
@@ -154,6 +155,11 @@ impl Db {
             // is so that a database that has it and one that does not
             // are the same database.
             ("accounts", "status_action", "TEXT NOT NULL DEFAULT ''"),
+            // The prefix that picks up a call that is ringing on a
+            // watched extension. Empty means the pickup is off: an
+            // account that is already in the table keeps the lamps it
+            // has and does not start picking up other people's calls.
+            ("accounts", "blf_pickup_prefix", "TEXT NOT NULL DEFAULT ''"),
         ];
         self.with_conn(|conn| {
             for (table, column, ty) in additions {

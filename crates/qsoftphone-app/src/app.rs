@@ -24,6 +24,7 @@ use qsoftphone_core::model::status::{
     EnterTrigger, HttpMethod, StatusAction, StatusDefinition, StatusHook,
 };
 use qsoftphone_core::paths::AppPaths;
+use qsoftphone_core::sip::blf::BlfState;
 use qsoftphone_core::sip::custom_headers::is_valid_name;
 use qsoftphone_core::sip::refer::TransferProgress;
 use qsoftphone_core::sip::uri::sip_uri_user_part;
@@ -58,6 +59,13 @@ pub struct QSoftphoneApp {
     /// The Busy Lamp Field: the lamps that say whether the extensions
     /// this account watches are free, busy or ringing.
     blf: qsoftphone_sip::BlfManager,
+    /// What each lamp said the last time it was looked at.
+    ///
+    /// The pickup is a **change**: a lamp that starts ringing is a call
+    /// to pick up, and a lamp that is still ringing is not a second
+    /// call. So the app keeps what each lamp said, and acts on the
+    /// difference.
+    blf_states: HashMap<String, BlfState>,
     /// The history, and the rows it last answered with.
     history: HistoryService,
     /// The history rows the UI shows.
@@ -507,6 +515,10 @@ struct Draft {
     ///
     /// A pair: the extension to watch, and the number to dial for it.
     blf_extensions: Vec<BlfEntry>,
+    /// The prefix that picks up a call that is ringing on one of them.
+    ///
+    /// Empty = the pickup is off.
+    blf_pickup_prefix: String,
     /// The status the account shows: the id of a status.
     ///
     /// The statuses themselves are the user's and live in the settings
@@ -534,6 +546,7 @@ impl Draft {
         account.ringtone_file = self.ringtone_file.trim().to_string();
         account.custom_headers = Self::clean_headers(&self.custom_headers);
         account.blf_extensions = Self::clean_entries(&self.blf_extensions);
+        account.blf_pickup_prefix = self.blf_pickup_prefix.trim().to_string();
         account.status = self.status.trim().to_string();
         account
     }
@@ -553,6 +566,7 @@ impl Draft {
             ringtone_file: account.ringtone_file.clone(),
             custom_headers: account.custom_headers.clone(),
             blf_extensions: account.blf_extensions.clone(),
+            blf_pickup_prefix: account.blf_pickup_prefix.clone(),
             status: account.status.clone(),
         }
     }
@@ -642,6 +656,7 @@ impl QSoftphoneApp {
             registrations: RegistrationManager::new(runtime.clone(), sessions.clone(), bus.clone()),
             calls,
             blf,
+            blf_states: HashMap::new(),
             history,
             history_rows: Vec::new(),
             history_query: String::new(),
@@ -834,6 +849,62 @@ impl QSoftphoneApp {
     fn unwatch_blf(&mut self, account_id: &str) {
         for lamp in self.blf.lamps(account_id) {
             self.blf.unwatch(account_id, &lamp.extension);
+        }
+    }
+
+    /// Look at the lamps, and pick up a call that is ringing.
+    ///
+    /// The pickup is the lamp doing its job: when a watched extension
+    /// starts ringing, the app dials the pickup number — the prefix the
+    /// account has, and the extension — and the PBX hands the call over
+    /// instead of letting it ring at a desk that cannot answer it.
+    ///
+    /// It happens **once** per ring. The lamp says *ringing* over and
+    /// over, and a pickup that repeated would put the call through
+    /// twice: the second one would find no call to pick up, and the
+    /// user would hear the PBX say so.
+    ///
+    /// The lamps are read here rather than taken from an event: the
+    /// `NOTIFY` that changes a lamp arrives on the session's own
+    /// endpoint, and the window is drawn at least once a second (§ the
+    /// idle poll) — so the pickup is at most a second late, and the
+    /// call is still ringing when it goes out.
+    fn poll_blf(&mut self) {
+        // The lamps are read first: the app cannot be borrowed while it
+        // is being asked about them.
+        let mut lamps: Vec<(String, String, BlfState)> = Vec::new();
+        for account in self.accounts.clone() {
+            for entry in &account.blf_extensions {
+                let watch = entry.watch.trim();
+                if watch.is_empty() {
+                    continue;
+                }
+                let state = self.blf.state_of(&account.id, watch);
+                lamps.push((account.id.clone(), watch.to_string(), state));
+            }
+        }
+
+        for (account_id, extension, state) in lamps {
+            let previous = self
+                .blf_states
+                .insert(lamp_key(&account_id, &extension), state)
+                .unwrap_or_default();
+            // Only the **change** is a call to pick up.
+            if state != BlfState::Ringing || previous == BlfState::Ringing {
+                continue;
+            }
+            let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() else {
+                continue;
+            };
+            let Some(number) = account.pickup_target(&extension) else {
+                continue;
+            };
+            tracing::info!(
+                extension = %extension,
+                number = %number,
+                "a watched extension is ringing: the call is picked up"
+            );
+            self.place_call_on(&account, &number);
         }
     }
 
@@ -2976,6 +3047,9 @@ impl QSoftphoneApp {
         self.drain_media();
         self.drain_actions();
         self.drain_picker();
+        // The lamps: a call that is ringing on a watched extension is
+        // picked up.
+        self.poll_blf();
 
         // The header. One line: who we are and whether we are
         // registered. Everything else is a page.
@@ -4953,6 +5027,28 @@ impl QSoftphoneApp {
         if ui.button("+ Add an extension").clicked() {
             draft.blf_extensions.push(BlfEntry::default());
         }
+
+        // The pickup.
+        //
+        // The Yealink way: a prefix and the extension make the number
+        // that takes the call over — `**` and `104` make `**104`, and
+        // the PBX hands the call that is ringing on 104 to whoever
+        // dialled it.
+        ui.horizontal(|ui| {
+            ui.label("Pick up a call that is ringing:");
+            ui.add(
+                egui::TextEdit::singleline(&mut draft.blf_pickup_prefix)
+                    .id_source((("blf_pickup_prefix",), &account.id))
+                    .desired_width(80.0)
+                    .hint_text("**"),
+            );
+            ui.weak("prefix + extension");
+        });
+        ui.weak(
+            "When one of these extensions starts ringing, the app dials the prefix and the \
+             extension — **104 — and the call comes here. Leave the prefix empty to turn \
+             the pickup off.",
+        );
     }
 
     /// The Busy Lamp Field: the lamps of the extensions the accounts
@@ -5539,6 +5635,15 @@ fn the_other_call(calls: &[CallView], account_id: &str, keep: &str) -> Option<Ca
                 && call.state == "connected"
         })
         .cloned()
+}
+
+/// The key a lamp is remembered under.
+///
+/// The account and the extension: two accounts may watch the same
+/// extension, and they are two different lamps — the pickup belongs to
+/// the account that watches it.
+fn lamp_key(account_id: &str, extension: &str) -> String {
+    format!("{account_id}\u{0}{extension}")
 }
 
 /// Whether the blink is on at this moment.
@@ -7780,6 +7885,241 @@ mod tests {
         assert!(
             text.contains("00101"),
             "the number to dial is not shown:\n{text}"
+        );
+    }
+
+    /// A session with a lamp for an extension.
+    ///
+    /// The lamp needs a session of its own: a subscription needs
+    /// somewhere to live, and the session is where the lamps are.
+    async fn session_with_lamp(
+        sessions: &SessionRegistry,
+        account: &Account,
+        extension: &str,
+    ) -> Arc<qsoftphone_sip::AccountSession> {
+        let token = qsoftphone_sip::CancellationToken::new();
+        let endpoint =
+            qsoftphone_sip::build_endpoint(qsoftphone_sip::Transport::Udp, 0, token, None)
+                .await
+                .expect("endpoint");
+        let session = qsoftphone_sip::AccountSession::new(
+            account.clone(),
+            endpoint,
+            qsoftphone_sip::PublicAddress::default(),
+            sessions.media_config_handle(),
+            sessions.auto_answer_handle(),
+        );
+        session.remember_blf(qsoftphone_sip::blf::BlfSubscription {
+            extension: extension.to_string(),
+            aor: format!("sip:{extension}@{}", account.registrar),
+            dial: extension.to_string(),
+            dialog: qsoftphone_sip::blf::BlfHandle {
+                call_id: format!("blf-dialog-{extension}"),
+                from_tag: "ftag".to_string(),
+                to_tag: String::new(),
+                cseq: 1,
+            },
+            presence: qsoftphone_sip::blf::BlfHandle {
+                call_id: format!("blf-presence-{extension}"),
+                from_tag: "ftag".to_string(),
+                to_tag: String::new(),
+                cseq: 1,
+            },
+            tracker: qsoftphone_core::sip::blf::Tracker::new(),
+        });
+        sessions.insert(&account.id, session.clone());
+        session
+    }
+
+    /// A `dialog-info` document that puts the extension in a state.
+    fn dialog_info(
+        extension: &str,
+        state: qsoftphone_core::sip::blf::DialogState,
+    ) -> qsoftphone_core::sip::blf::DialogInfo {
+        qsoftphone_core::sip::blf::DialogInfo {
+            entity: format!("sip:{extension}@example.com"),
+            state: "full".to_string(),
+            dialogs: vec![qsoftphone_core::sip::blf::Dialog {
+                id: "1".to_string(),
+                state,
+            }],
+        }
+    }
+
+    /// The lamp says the extension is ringing.
+    fn ring(session: &qsoftphone_sip::AccountSession, extension: &str) {
+        let state = session.apply_blf(
+            &format!("blf-dialog-{extension}"),
+            &dialog_info(extension, qsoftphone_core::sip::blf::DialogState::Trying),
+        );
+        assert_eq!(
+            state,
+            Some(BlfState::Ringing),
+            "the lamp does not say that the extension is ringing"
+        );
+    }
+
+    /// The lamp says the extension is free.
+    fn free(session: &qsoftphone_sip::AccountSession, extension: &str) {
+        session.apply_blf(
+            &format!("blf-dialog-{extension}"),
+            &dialog_info(
+                extension,
+                qsoftphone_core::sip::blf::DialogState::Terminated,
+            ),
+        );
+    }
+
+    /// An app with one account that watches an extension and picks the
+    /// calls up.
+    async fn app_that_picks_calls_up(
+        prefix: &str,
+    ) -> (
+        QSoftphoneApp,
+        Arc<qsoftphone_sip::AccountSession>,
+        egui::Context,
+    ) {
+        let (mut app, _bus, sessions) = build_app_with_sessions(
+            Db::open_in_memory().expect("db"),
+            tokio::runtime::Handle::current(),
+        );
+        let ctx = egui::Context::default();
+
+        let mut account = app.accounts[0].clone();
+        account.blf_extensions = vec![BlfEntry {
+            watch: "105".to_string(),
+            dial: String::new(),
+        }];
+        account.blf_pickup_prefix = prefix.to_string();
+        app.accounts[0] = account.clone();
+
+        let session = session_with_lamp(&sessions, &account, "105").await;
+        (app, session, ctx)
+    }
+
+    #[tokio::test]
+    async fn a_ringing_extension_picks_the_call_up() {
+        // The lamp is the feature: a watched extension that starts
+        // ringing is a call to pick up, and the number that picks it up
+        // is the prefix and the extension.
+        let (mut app, session, ctx) = app_that_picks_calls_up("**").await;
+
+        // The extension starts ringing.
+        ring(&session, "105");
+        frame(&mut app, &ctx);
+
+        assert_eq!(
+            app.dial_number, "**105",
+            "the pickup did not dial the prefix and the extension"
+        );
+        assert!(
+            app.status.contains("**105"),
+            "the status line does not say what was dialled: {}",
+            app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pickup_happens_once_per_ring() {
+        // The lamp says *ringing* over and over, and a pickup that
+        // repeated would put the call through twice: the second one
+        // would find no call to pick up.
+        let (mut app, session, ctx) = app_that_picks_calls_up("**").await;
+
+        ring(&session, "105");
+        frame(&mut app, &ctx);
+        assert_eq!(app.dial_number, "**105");
+
+        // The lamp is still ringing, and the user types something else.
+        app.dial_number = "101".to_string();
+        frame(&mut app, &ctx);
+        assert_eq!(
+            app.dial_number, "101",
+            "the pickup happened twice for one ring"
+        );
+
+        // The extension is free again, and rings once more: the pickup
+        // happens again — it is a new call.
+        free(&session, "105");
+        frame(&mut app, &ctx);
+        ring(&session, "105");
+        frame(&mut app, &ctx);
+        assert_eq!(
+            app.dial_number, "**105",
+            "the pickup did not happen for the second ring"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_without_a_prefix_picks_nothing_up() {
+        // The feature is off until the user says which feature code the
+        // server uses: a softphone that answers other people's calls on
+        // its own is a softphone nobody leaves running.
+        let (mut app, session, ctx) = app_that_picks_calls_up("").await;
+
+        ring(&session, "105");
+        frame(&mut app, &ctx);
+
+        assert_eq!(
+            app.dial_number, "",
+            "the call was picked up without a prefix: {}",
+            app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn the_watched_extensions_offer_the_pickup_prefix() {
+        // The prefix lives with the watched extensions: it is the
+        // number that picks a call up, and it is the Yealink's way.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.accounts[0].blf_extensions = vec![BlfEntry {
+            watch: "101".to_string(),
+            dial: String::new(),
+        }];
+        reload_the_editor(&mut app);
+        app.view = View::Account;
+
+        open_block(&mut app, &ctx, "WATCHED EXTENSIONS");
+        let output = frame(&mut app, &ctx);
+        let text = screen_text(&output);
+        assert!(
+            text.contains("Pick up a call that is ringing"),
+            "the account page does not offer the pickup:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pickup_prefix_is_saved_with_the_account() {
+        // The prefix is a feature code of the server: an account that
+        // loses it stops picking up calls.
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.accounts[0].blf_extensions = vec![BlfEntry {
+            watch: "101".to_string(),
+            dial: String::new(),
+        }];
+        reload_the_editor(&mut app);
+        app.view = View::Account;
+
+        // The user types the prefix into the form.
+        open_block(&mut app, &ctx, "WATCHED EXTENSIONS");
+        let account = app.accounts[0].clone();
+        let draft = app.draft_of(&account);
+        draft.blf_pickup_prefix = "**".to_string();
+
+        let id = app.accounts[0].id.clone();
+        app.save_account(&id);
+
+        let stored = AccountStore::new(&app.db)
+            .get(&app.accounts[0].id)
+            .expect("the account is in the store")
+            .expect("the account is there");
+        assert_eq!(
+            stored.blf_pickup_prefix, "**",
+            "the pickup prefix was not saved"
         );
     }
 

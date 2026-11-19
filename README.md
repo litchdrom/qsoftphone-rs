@@ -4441,6 +4441,10 @@ values:
 * **Watch** is the extension whose lamp is subscribed to.
 * **Dial** is the number that is dialled when the lamp is pressed. It is
   empty by default, and an empty one means "dial the extension itself".
+* **Pick up a call that is ringing** is the **prefix** the account uses
+  to take a call over — `**` and the watched extension make `**104`
+  (M6.24). It is empty by default, and an empty one means the pickup is
+  off.
 
 The two are separate because they are separate things. On many
 dialplans the extension `101` is not reached by dialling `101`: it is
@@ -6101,6 +6105,79 @@ column in the call list.
 
 ---
 
+## M6.24 — The call is picked up
+
+*"New feature - pickup the call. If some of blf is in ringing state -
+softphone dials prefix described in the account settings like **104 where
+104 is blf number. Might be in yealink style in watched extensions."*
+
+### The lamp picks the call up
+
+A **watched extension** that starts ringing is a call to pick up. The app
+dials the pickup number — the **prefix** the account has, and the
+extension — and the PBX hands the call over instead of letting it ring
+at a desk that cannot answer it.
+
+This is the Yealink's way: `**` and `104` make `**104`, and that is what
+the PBX reads as *pick up the call that is ringing on 104*.
+
+The prefix lives in the **watched extensions** block of the account —
+with the lamps it belongs to — and it is **per account**: the prefix is
+a feature code of the server this account is registered with, and `**` on
+one PBX means nothing on another.
+
+**Empty = the pickup is off.** A softphone that answers other people's
+calls on its own is a softphone nobody leaves running.
+
+### Once per ring
+
+The lamp says *ringing* over and over — every `NOTIFY` that mentions
+the dialog says so again. A pickup that repeated would put the call
+through twice, and the second one would find no call to pick up: the
+user would hear the PBX say so.
+
+So the app remembers what each lamp said and acts on the **change**:
+*not ringing → ringing* is a call to pick up, and *ringing → ringing* is
+nothing at all. The extension has to go free and ring again before there
+is a second pickup.
+
+The **first** look at a lamp counts as a change too: a lamp that is
+already ringing when the app starts is picked up as well. The rule the
+user asked for is the state of the lamp — *ringing means the call is
+picked up* — and a call that was already ringing when the app opened is
+still a call that is ringing.
+
+### Where the work happens
+
+The `NOTIFY` that changes a lamp arrives on the session's own endpoint:
+it is not a call event and it does not come down the app's channel. The
+app looks at the lamps every frame — at most a second apart, the idle
+poll — and the pickup goes out with the rest of the calls: the INVITE is
+a task on the runtime, and the interface thread does not wait for it
+(§3).
+
+### What is proved
+
+* **The pickup number is the prefix and the extension** — `**` and `104`
+  make `**104`, and nothing else is dialled.
+* **A lamp that starts ringing picks the call up**: the app dials
+  `**105` when the watched extension `105` starts ringing.
+* **It happens once per ring**: a lamp that is still ringing does not
+  pick the call up again, and the extension has to go free and ring
+  again before there is a second pickup.
+* **An account without a prefix picks nothing up** — the feature is off
+  until the user says which feature code the server uses.
+* **The prefix is saved with the account** and comes back out of the
+  database: a prefix that is forgotten when the app closes is a prefix
+  that is off again tomorrow morning.
+
+### The dependency cost: nothing
+
+A column in the accounts table, a field in the account model, and one
+number that is dialled.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -6170,6 +6247,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.21** | The examples are 101: the placeholder number in the dialer hint, in the built-in **Online** status and in the docs was `666`, and it is `101` now — the peer numbers (`6661`, `6666`) and **RFC 6665** are left alone, and so is the second placeholder family (`555`) | **done** |
 | **M6.22** | The calls answer themselves: one **system-wide** switch with a **timer** and an optional **SIP header** — the same answer the button makes, made only while the call is still ringing, and proved against the real stack over a UDP socket | **done** |
 | **M6.23** | The other line waits: a call that is answered or dialled puts the other line of the account **on hold** — a re-INVITE with `a=sendonly` that keeps the negotiated format and its payload type — and the held row says **on hold** and **blinks**, with a **Hold** and a **Resume** button of its own | **done** |
+| **M6.24** | The call is picked up: a watched extension that starts **ringing** makes the app dial the account's **pickup prefix** and the extension — `**` and `104` make `**104`, the Yealink's way — once per ring, and an account without a prefix picks nothing up | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -6233,7 +6311,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 634 tests, all passing.
+* `cargo test --workspace` — 645 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -6976,6 +7054,12 @@ player lands.
   makes of a re-INVITE that names **one** format is not known, and
   neither is the silence at the far end — which is the thing the user
   will hear.
+* **The pickup has not been seen against the real PBX.** The number that
+  is dialled — the prefix and the extension — is proved, and the lamp
+  that says *ringing* is the same `NOTIFY` the lamps have always been
+  read from. What has not been tried is the user's own Asterisk with a
+  `**` feature code in its dialplan: what the server does with `**104`
+  is the one thing that decides whether the pickup works.
 * **The ringtone and the ringback have not been heard.** The tones are
   made, the WAV is read and the decision is tested — and the sound
   itself has not been through a speaker, because no call has rung yet:

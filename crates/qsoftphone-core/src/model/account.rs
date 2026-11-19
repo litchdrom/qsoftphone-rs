@@ -108,6 +108,20 @@ pub struct Account {
     /// Empty = no lamps. An account that watches nothing sends no
     /// subscriptions at all.
     pub blf_extensions: Vec<BlfEntry>,
+    /// The prefix that turns a **ringing** lamp into a pickup.
+    ///
+    /// When a watched extension starts ringing, the app dials this
+    /// prefix and the extension — `**` and `104` make `**104` — and the
+    /// PBX hands the call over instead of letting it ring at a desk
+    /// that cannot answer it. It is the way a Yealink does it.
+    ///
+    /// It is per-account, because the prefix is a **feature code of the
+    /// server** this account is registered with: `**` on one PBX means
+    /// nothing on another.
+    ///
+    /// Empty = the pickup is off. A softphone that answers other
+    /// people's calls on its own is a softphone nobody leaves running.
+    pub blf_pickup_prefix: String,
     /// Which CRM plugin handles this account. Empty = local contacts.
     pub crm_preset_id: String,
     /// The WAV file this account rings with.
@@ -179,6 +193,26 @@ impl Account {
         let mut view = self.clone();
         view.password.clear();
         view
+    }
+
+    /// The number that picks up a call that is ringing on an extension.
+    ///
+    /// The prefix and the extension, with nothing between them: `**` and
+    /// `104` make `**104`, which is what the PBX reads as *pick up the
+    /// call that is ringing on 104*.
+    ///
+    /// `None` when the account has no pickup prefix — the feature is
+    /// off — or when there is no extension to pick up. The extension
+    /// that is picked up is the **watched** one: the lamp is about that
+    /// extension, and the number that reaches the extension may be a
+    /// different one altogether.
+    pub fn pickup_target(&self, extension: &str) -> Option<String> {
+        let prefix = self.blf_pickup_prefix.trim();
+        let extension = extension.trim();
+        if prefix.is_empty() || extension.is_empty() {
+            return None;
+        }
+        Some(format!("{prefix}{extension}"))
     }
 }
 
@@ -370,5 +404,40 @@ mod tests {
         assert_eq!(account.id.len(), 36);
         assert!(account.created_at > 0);
         assert_eq!(account.updated_at, account.created_at);
+    }
+
+    #[test]
+    fn the_pickup_number_is_the_prefix_and_the_extension() {
+        // The Yealink way: `**` and the extension make `**104`.
+        let mut account = Account::new("Office", "example.com", "104", "", "udp");
+        account.blf_pickup_prefix = "**".to_string();
+        assert_eq!(
+            account.pickup_target("104").as_deref(),
+            Some("**104"),
+            "the pickup number is the prefix and the extension"
+        );
+    }
+
+    #[test]
+    fn a_pickup_without_a_prefix_picks_nothing_up() {
+        // The feature is off until the user says which feature code the
+        // server uses.
+        let account = Account::new("Office", "example.com", "104", "", "udp");
+        assert_eq!(account.pickup_target("104"), None);
+    }
+
+    #[test]
+    fn a_pickup_without_an_extension_picks_nothing_up() {
+        let mut account = Account::new("Office", "example.com", "104", "", "udp");
+        account.blf_pickup_prefix = "**".to_string();
+        assert_eq!(account.pickup_target(""), None);
+        assert_eq!(account.pickup_target("   "), None);
+    }
+
+    #[test]
+    fn the_pickup_prefix_is_trimmed() {
+        let mut account = Account::new("Office", "example.com", "104", "", "udp");
+        account.blf_pickup_prefix = "  **  ".to_string();
+        assert_eq!(account.pickup_target(" 104 ").as_deref(), Some("**104"));
     }
 }
