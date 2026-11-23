@@ -6259,6 +6259,41 @@ Two words in a `match` and one `is_in_call`.
 
 ---
 
+## M6.26 — The call comes back when the line is pressed
+
+*"Can we add feature to return call from hold just pressing on the
+line."*
+
+### The line is the button
+
+A call that is on hold is a **button**: pressing its row takes it off
+the hold — the same re-INVITE that puts it there, with `a=sendrecv`
+this time. The row already said *on hold* and offered **Resume**; now
+the line itself is the way back, and a line that waits is a line the
+user picks.
+
+The **other** line waits for it, the way it does when a call is
+answered (M6.23): the call the user takes is the one that is talking
+to, and two lines that talk at once is a call nobody can follow.
+
+The row keeps saying *on hold* until the peer says it is talking again:
+the state is the peer's news, and the app does not paint a state the
+peer has not confirmed.
+
+### What is proved
+
+* **Pressing the line of a held call asks for the resume** — the app
+  says it is resuming that call, and names it.
+* **The other line waits**: the call the user was talking to goes on
+  hold, the same rule as answering a call.
+* **The held call is no longer held** as far as the app is concerned.
+
+### The dependency cost: nothing
+
+A click that was already there, and the resume that was already there.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -6330,6 +6365,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.23** | The other line waits: a call that is answered or dialled puts the other line of the account **on hold** — a re-INVITE with `a=sendonly` that keeps the negotiated format and its payload type — and the held row says **on hold** and **blinks**, with a **Hold** and a **Resume** button of its own | **done** |
 | **M6.24** | The call is picked up: a watched extension that starts **ringing** makes the app dial the account's **pickup prefix** and the extension — `**` and `104` make `**104`, the Yealink's way — once per ring, and an account without a prefix picks nothing up | **done** |
 | **M6.25** | The pickup, just in case: a PBX does not always say *ringing* — Asterisk sends `confirmed` for an extension that is ringing **while it is already in use** — so the pickup is made on **any** call a watched extension starts, once per call, and the reader learns FreeSWITCH's words (`ringing`, `seated`, `hold`, `idle`) | **done** |
+| **M6.26** | The call comes back when the line is pressed: a call row that is on hold is a button, and pressing it takes the call off the hold — and the other line waits, the way it does when a call is answered | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -6393,7 +6429,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 651 tests, all passing.
+* `cargo test --workspace` — 652 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and

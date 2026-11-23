@@ -368,13 +368,15 @@ struct CallView {
     ended_at: i64,
     /// Whether the call was answered.
     answered: bool,
-    /// Whether the app has asked for this call to be put on hold.
+    /// Whether this call is on hold, as far as the app knows.
     ///
-    /// The row says *on hold* when the peer has taken it — that is the
-    /// `CallOnHold` event, and it is the only thing that says so. This
-    /// is the request that goes out **before** that: the app's own
-    /// record that this line has been told to wait, so it does not ask
-    /// the peer twice for the same hold.
+    /// It is set when the app asks for the hold and when the peer takes
+    /// it (`CallOnHold`), and it comes off when the peer puts it back
+    /// (`CallResumed`) or when the user asks for the resume.
+    ///
+    /// The app keeps it so it does not ask the peer twice for the same
+    /// hold — and so the row knows the call is waiting without having
+    /// to read the state again.
     hold_requested: bool,
     /// The final SIP status code.
     sip_code: i32,
@@ -1015,6 +1017,16 @@ impl QSoftphoneApp {
                     if !self.active_pinned {
                         self.active_call_id = Some(call_id.clone());
                     }
+                }
+                CallEventType::CallOnHold => {
+                    // The peer has taken the hold: the call is waiting,
+                    // and the app knows it.
+                    view.hold_requested = true;
+                }
+                CallEventType::CallResumed => {
+                    // The peer has put it back: the line is talking
+                    // again.
+                    view.hold_requested = false;
                 }
                 CallEventType::TransferProgress => {
                     // §5.6: the banner says what the transfer is doing.
@@ -2150,13 +2162,17 @@ impl QSoftphoneApp {
         match self.calls.unhold(&call.account_id, &call.call_id) {
             Ok(()) => {
                 self.status = format!("Resuming the call to {}.", call.peer);
-                // The line is talking again: it can be put on hold once
-                // more.
-                if let Some(view) = self.call_views.get_mut(&call.call_id) {
-                    view.hold_requested = false;
-                }
             }
-            Err(e) => self.status = format!("Could not resume the call: {e}"),
+            Err(e) => {
+                self.status = format!("Could not resume the call to {}: {e}", call.peer);
+            }
+        }
+        // The app is not holding this call any more: it asked for the
+        // resume, and the peer is the one who says whether it worked.
+        // The row still says *on hold* until the peer answers — the
+        // state is the peer's news, not the app's.
+        if let Some(view) = self.call_views.get_mut(&call.call_id) {
+            view.hold_requested = false;
         }
     }
 
@@ -3537,6 +3553,17 @@ impl QSoftphoneApp {
                 // The user picked this call: the panel stays on it,
                 // even when another call is answered.
                 self.active_pinned = true;
+                // A call that is on hold comes **back** when the user
+                // presses its line: the line is the button, and a line
+                // that waits is a line the user picks.
+                //
+                // The other line waits for it, the way it does when a
+                // call is answered (M6.23): two lines that talk at
+                // once is a call nobody can follow.
+                if call.state == "onhold" {
+                    self.hold_the_other_call(&call.account_id, &call.call_id);
+                    self.resume_call(&call);
+                }
             }
             ui.label(if held {
                 "on hold".to_string()
@@ -8129,6 +8156,81 @@ mod tests {
             app.dial_number, "",
             "the call was picked up without a prefix: {}",
             app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn pressing_a_line_that_is_on_hold_brings_the_call_back() {
+        // The line is the button: a call that waits is a call the user
+        // picks, and picking it takes it off the hold.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        // Alice is calling and is on hold.
+        let mut incoming = CallEvent::new(CallEventType::IncomingCall);
+        incoming.user = "104".to_string();
+        incoming.call_id = "call-alice".to_string();
+        incoming.call_direction = Some(Direction::Incoming);
+        incoming.call_state = "ringing".to_string();
+        incoming.caller = "sip:alice@example.com".to_string();
+        incoming.caller_id = "Alice".to_string();
+        bus.publish("acct-ui-1", incoming);
+        let mut alice_answered = CallEvent::new(CallEventType::CallAnswered);
+        alice_answered.user = "104".to_string();
+        alice_answered.call_id = "call-alice".to_string();
+        alice_answered.call_direction = Some(Direction::Incoming);
+        alice_answered.call_state = "connected".to_string();
+        bus.publish("acct-ui-1", alice_answered);
+        let mut alice_held = CallEvent::new(CallEventType::CallOnHold);
+        alice_held.user = "104".to_string();
+        alice_held.call_id = "call-alice".to_string();
+        alice_held.call_direction = Some(Direction::Incoming);
+        alice_held.call_state = "onhold".to_string();
+        alice_held.caller = "sip:alice@example.com".to_string();
+        alice_held.caller_id = "Alice".to_string();
+        bus.publish("acct-ui-1", alice_held);
+
+        // And Bob is the call the user is talking to.
+        let mut outgoing = CallEvent::new(CallEventType::OutgoingCallInitiated);
+        outgoing.user = "104".to_string();
+        outgoing.call_id = "call-bob".to_string();
+        outgoing.call_direction = Some(Direction::Outgoing);
+        outgoing.call_state = "initiating".to_string();
+        outgoing.callee = "sip:bob@example.com".to_string();
+        bus.publish("acct-ui-1", outgoing);
+        let mut bob_answered = CallEvent::new(CallEventType::CallAnswered);
+        bob_answered.user = "104".to_string();
+        bob_answered.call_id = "call-bob".to_string();
+        bob_answered.call_direction = Some(Direction::Outgoing);
+        bob_answered.call_state = "connected".to_string();
+        bus.publish("acct-ui-1", bob_answered);
+
+        let output = frame(&mut app, &ctx);
+        let row = button_at(&output, "←  Alice").expect("the call list has no row for Alice");
+        click_at(&mut app, &ctx, row);
+
+        // The call is asked to come back.
+        assert!(
+            app.status.to_lowercase().contains("resum"),
+            "pressing the line did not bring the call back: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains("alice"),
+            "the status does not say which call came back: {}",
+            app.status
+        );
+        assert!(
+            !app.call_views["call-alice"].hold_requested,
+            "the call is still held after the user pressed its line"
+        );
+        // And the other line waits, the way it does when a call is
+        // answered: two lines that talk at once is a call nobody can
+        // follow.
+        assert!(
+            app.call_views["call-bob"].hold_requested,
+            "the other line was not put on hold"
         );
     }
 
