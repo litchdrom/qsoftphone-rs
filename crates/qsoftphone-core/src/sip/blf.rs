@@ -66,6 +66,22 @@ impl BlfState {
             BlfState::Busy => (231, 76, 60),
         }
     }
+
+    /// Is the extension **in a call**?
+    ///
+    /// A lamp that says *ringing* or *busy* is an extension that is in
+    /// a call; a lamp that says *free*, *offline* or *unknown* is not.
+    ///
+    /// This is what the pickup is decided on, and the reason it is
+    /// decided on **this** and not on *ringing*: a PBX does not always
+    /// say *ringing*. Asterisk sends `early` for an extension that is
+    /// ringing, and `confirmed` for one that is ringing **while it is
+    /// already in use** — so a call that is ringing arrives as *busy*
+    /// on a stock server, and a pickup that waits for *ringing* waits
+    /// for ever.
+    pub fn is_in_call(self) -> bool {
+        matches!(self, BlfState::Busy | BlfState::Ringing)
+    }
 }
 
 /// The state of one dialog in the document.
@@ -90,13 +106,36 @@ pub enum DialogState {
 
 impl DialogState {
     /// The state the document named.
+    ///
+    /// The words are the **PBX's**, not only the RFC's. A lamp that
+    /// only knows the RFC's five words says *free* about an extension
+    /// that is in a call, and a pickup that waits for *ringing* waits
+    /// for ever on a server that says *busy*.
+    ///
+    /// | the document says | it means |
+    /// |---|---|
+    /// | `trying`, `proceeding`, `early` | the call is up and not answered — the RFC's words |
+    /// | `ringing` | the same, in FreeSWITCH's word |
+    /// | `confirmed` | the call is answered |
+    /// | `seated` | the same, in FreeSWITCH's word — the extension is seated at the desk |
+    /// | `hold`, `onhold` | the call is on hold, which is still a call |
+    /// | `terminated` | the call is over |
+    /// | `idle` | the same, in FreeSWITCH's word — nobody is calling |
     pub fn parse(text: &str) -> DialogState {
         match text.trim() {
             "trying" => DialogState::Trying,
             "proceeding" => DialogState::Proceeding,
             "early" => DialogState::Early,
+            // FreeSWITCH's word for the same thing as "early".
+            "ringing" => DialogState::Early,
             "confirmed" => DialogState::Confirmed,
+            // FreeSWITCH's word for the same thing as "confirmed".
+            "seated" => DialogState::Confirmed,
+            // A call on hold is still a call: the extension is not free.
+            "hold" | "onhold" | "on-hold" => DialogState::Confirmed,
             "terminated" => DialogState::Terminated,
+            // FreeSWITCH's word for the same thing as "terminated".
+            "idle" => DialogState::Terminated,
             other => DialogState::Other(other.to_string()),
         }
     }
@@ -677,6 +716,84 @@ mod tests {
   <state>early</state>
  </dialog>
 </dialog-info>"#;
+
+    /// The document **FreeSWITCH** sends for an extension that is
+    /// ringing.
+    const FREESWITCH_RINGING: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" version="0" state="full" entity="sip:105@192.0.2.4">
+ <dialog id="105">
+  <state>ringing</state>
+ </dialog>
+</dialog-info>"#;
+
+    /// The document **FreeSWITCH** sends for an extension that is on a
+    /// call.
+    const FREESWITCH_BUSY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info" version="0" state="full" entity="sip:105@192.0.2.4">
+ <dialog id="105">
+  <state>seated</state>
+ </dialog>
+</dialog-info>"#;
+
+    #[test]
+    fn the_words_freeswitch_uses_are_read_too() {
+        // A lamp that only knows the RFC's words says *free* about an
+        // extension that is in a call — and a pickup that waits for
+        // *ringing* waits for ever.
+        let mut tracker = Tracker::new();
+        assert_eq!(
+            tracker.apply(&parse(FREESWITCH_RINGING).expect("not read")),
+            BlfState::Ringing,
+            "a ringing extension was not ringing"
+        );
+
+        let mut tracker = Tracker::new();
+        assert_eq!(
+            tracker.apply(&parse(FREESWITCH_BUSY).expect("not read")),
+            BlfState::Busy,
+            "an extension that is seated was not busy"
+        );
+    }
+
+    #[test]
+    fn a_call_on_hold_is_still_a_call() {
+        // The extension is not free: it is in a call, and the lamp says
+        // busy.
+        let mut tracker = Tracker::new();
+        let xml = r#"<dialog-info state="full" entity="sip:105@example.com">
+            <dialog id="x"><state>hold</state></dialog>
+          </dialog-info>"#;
+        assert_eq!(
+            tracker.apply(&parse(xml).expect("the document was not read")),
+            BlfState::Busy
+        );
+    }
+
+    #[test]
+    fn an_idle_extension_is_free() {
+        // FreeSWITCH's word for "nobody is calling".
+        let mut tracker = Tracker::new();
+        let xml = r#"<dialog-info state="full" entity="sip:105@example.com">
+            <dialog id="x"><state>idle</state></dialog>
+          </dialog-info>"#;
+        assert_eq!(
+            tracker.apply(&parse(xml).expect("the document was not read")),
+            BlfState::Available
+        );
+    }
+
+    #[test]
+    fn a_lamp_in_a_call_is_in_a_call_whatever_it_says() {
+        // The pickup is decided on this and not on *ringing*: Asterisk
+        // sends "confirmed" for an extension that is ringing **while it
+        // is already in use**, so a call that is ringing arrives as
+        // *busy* on a stock server.
+        assert!(BlfState::Ringing.is_in_call());
+        assert!(BlfState::Busy.is_in_call());
+        assert!(!BlfState::Available.is_in_call());
+        assert!(!BlfState::Offline.is_in_call());
+        assert!(!BlfState::Unavailable.is_in_call());
+    }
 
     #[test]
     fn the_state_is_read_out_of_the_element_asterisk_sends() {

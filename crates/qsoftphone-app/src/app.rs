@@ -859,7 +859,15 @@ impl QSoftphoneApp {
     /// account has, and the extension — and the PBX hands the call over
     /// instead of letting it ring at a desk that cannot answer it.
     ///
-    /// It happens **once** per ring. The lamp says *ringing* over and
+    /// It is made on **any** call, not only on a *ringing* one, and that
+    /// is the point: a PBX does not always say *ringing*. Asterisk
+    /// sends `early` for an extension that is ringing and `confirmed`
+    /// for one that is ringing **while it is already in use** — so on a
+    /// stock server a call that is ringing arrives as *busy*, and a
+    /// pickup that waits for *ringing* waits for ever. The pickup is
+    /// made just in case.
+    ///
+    /// It happens **once** per call. The lamp says *ringing* over and
     /// over, and a pickup that repeated would put the call through
     /// twice: the second one would find no call to pick up, and the
     /// user would hear the PBX say so.
@@ -889,8 +897,10 @@ impl QSoftphoneApp {
                 .blf_states
                 .insert(lamp_key(&account_id, &extension), state)
                 .unwrap_or_default();
-            // Only the **change** is a call to pick up.
-            if state != BlfState::Ringing || previous == BlfState::Ringing {
+            // A call that has **started** — and only the start of one.
+            // A lamp that goes from ringing to busy is the same call,
+            // not a second one.
+            if !state.is_in_call() || previous.is_in_call() {
                 continue;
             }
             let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() else {
@@ -902,7 +912,8 @@ impl QSoftphoneApp {
             tracing::info!(
                 extension = %extension,
                 number = %number,
-                "a watched extension is ringing: the call is picked up"
+                lamp = %state.label(),
+                "a watched extension is in a call: the call is picked up"
             );
             self.place_call_on(&account, &number);
         }
@@ -7970,6 +7981,22 @@ mod tests {
         );
     }
 
+    /// The lamp says the extension is on a call.
+    ///
+    /// This is what Asterisk sends for an extension that is ringing
+    /// **while it is already in use**: `confirmed`, not `early`.
+    fn busy(session: &qsoftphone_sip::AccountSession, extension: &str) {
+        let state = session.apply_blf(
+            &format!("blf-dialog-{extension}"),
+            &dialog_info(extension, qsoftphone_core::sip::blf::DialogState::Confirmed),
+        );
+        assert_eq!(
+            state,
+            Some(BlfState::Busy),
+            "the lamp does not say that the extension is on a call"
+        );
+    }
+
     /// An app with one account that watches an extension and picks the
     /// calls up.
     async fn app_that_picks_calls_up(
@@ -8047,6 +8074,44 @@ mod tests {
         assert_eq!(
             app.dial_number, "**105",
             "the pickup did not happen for the second ring"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_extension_that_is_in_a_call_picks_the_call_up() {
+        // Just in case. Asterisk sends "confirmed" for an extension
+        // that is ringing **while it is already in use**, so on a stock
+        // server a call that is ringing arrives as *busy* — and a
+        // pickup that waits for *ringing* waits for ever.
+        let (mut app, session, ctx) = app_that_picks_calls_up("**").await;
+
+        busy(&session, "105");
+        frame(&mut app, &ctx);
+
+        assert_eq!(
+            app.dial_number, "**105",
+            "the pickup did not follow the extension into the call"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pickup_happens_once_per_call() {
+        // A lamp that goes from ringing to busy is the **same** call,
+        // not a second one: a pickup that repeated would put the call
+        // through twice.
+        let (mut app, session, ctx) = app_that_picks_calls_up("**").await;
+
+        ring(&session, "105");
+        frame(&mut app, &ctx);
+        assert_eq!(app.dial_number, "**105");
+
+        // The call is answered: the lamp says busy now.
+        app.dial_number = "101".to_string();
+        busy(&session, "105");
+        frame(&mut app, &ctx);
+        assert_eq!(
+            app.dial_number, "101",
+            "the pickup happened twice for one call"
         );
     }
 

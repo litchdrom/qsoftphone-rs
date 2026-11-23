@@ -6141,6 +6141,10 @@ So the app remembers what each lamp said and acts on the **change**:
 nothing at all. The extension has to go free and ring again before there
 is a second pickup.
 
+**M6.25 widened this**: the pickup is made on any *call* the extension
+starts, not only on a ringing one — because a PBX does not always say
+*ringing*.
+
 The **first** look at a lamp counts as a change too: a lamp that is
 already ringing when the app starts is picked up as well. The rule the
 user asked for is the state of the lamp — *ringing means the call is
@@ -6175,6 +6179,83 @@ a task on the runtime, and the interface thread does not wait for it
 
 A column in the accounts table, a field in the account model, and one
 number that is dialled.
+
+---
+
+## M6.25 — The pickup, just in case
+
+*"Pickup code wasn't sent on ringing pickup. It is dial just in case
+(let's be oriented to asterisk/freeswitch)."*
+
+### Why the pickup did not go out
+
+The pickup was made when the lamp said **ringing**, and the lamp never
+said it. A PBX does not always use that word.
+
+Asterisk's own source says what it sends
+(`ast_sip_presence_exten_state_to_str`, Asterisk 22.8):
+
+| the extension is | the `<state>` says |
+|---|---|
+| ringing | `early` |
+| ringing **and already in use** | `confirmed` — unless `notify_early_inuse_ringing` is on |
+| in use, busy, on hold | `confirmed` |
+| free, or not there | `terminated` |
+
+So on a stock server an extension that is **ringing while it is already
+talking** is reported as `confirmed` — which is the word for *busy*. The
+lamp said *busy*, the pickup waited for *ringing*, and the code was
+never dialled. That is the whole reason.
+
+### The pickup is made on any call, just in case
+
+The pickup is now made when a watched extension **starts a call** — and
+"a call" is a lamp that says *ringing* **or** *busy*. A lamp that goes
+from ringing to busy is the same call, so the pickup is made **once** per
+call, and the extension has to go free before there is another one.
+
+The cost of the wider rule is one dial that the PBX answers with *there
+is no call to pick up* when the extension really is busy. The cost of
+the narrow rule is a call that rings at a desk nobody is at.
+
+### The words of both PBXs are read
+
+The reader knew the RFC's five words and nothing else, so a FreeSWITCH
+lamp said *free* about an extension that was **seated** at its desk. It
+knows them now:
+
+| the document says | it means |
+|---|---|
+| `trying`, `proceeding`, `early` | the call is up and not answered |
+| `ringing` | the same — FreeSWITCH's word |
+| `confirmed` | the call is answered |
+| `seated` | the same — FreeSWITCH's word |
+| `hold`, `onhold` | the call is on hold, which is still a call |
+| `terminated` | the call is over |
+| `idle` | the same — FreeSWITCH's word |
+
+### What the server can do as well
+
+`notify_early_inuse_ringing=yes` on the **endpoint** makes Asterisk send
+`early` for an extension that is ringing while it is in use — then the
+lamp says *ringing* and the pickup is made on the ringing state alone.
+The app cannot change the server, so it does not wait for it.
+
+### What is proved
+
+* **A lamp that starts ringing picks the call up**: the app dials
+  `**105` when the watched extension `105` starts ringing.
+* **A lamp that starts a call picks the call up** — the `confirmed`
+  case, the one Asterisk sends for a call that is ringing while the
+  extension is in use. This is the case that did not work.
+* **It happens once per call**: ringing, then busy, is one call and one
+  pickup.
+* **FreeSWITCH's words are read**: `ringing` says *ringing* and
+  `seated` says *busy*.
+
+### The dependency cost: nothing
+
+Two words in a `match` and one `is_in_call`.
 
 ---
 
@@ -6248,6 +6329,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.22** | The calls answer themselves: one **system-wide** switch with a **timer** and an optional **SIP header** — the same answer the button makes, made only while the call is still ringing, and proved against the real stack over a UDP socket | **done** |
 | **M6.23** | The other line waits: a call that is answered or dialled puts the other line of the account **on hold** — a re-INVITE with `a=sendonly` that keeps the negotiated format and its payload type — and the held row says **on hold** and **blinks**, with a **Hold** and a **Resume** button of its own | **done** |
 | **M6.24** | The call is picked up: a watched extension that starts **ringing** makes the app dial the account's **pickup prefix** and the extension — `**` and `104` make `**104`, the Yealink's way — once per ring, and an account without a prefix picks nothing up | **done** |
+| **M6.25** | The pickup, just in case: a PBX does not always say *ringing* — Asterisk sends `confirmed` for an extension that is ringing **while it is already in use** — so the pickup is made on **any** call a watched extension starts, once per call, and the reader learns FreeSWITCH's words (`ringing`, `seated`, `hold`, `idle`) | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -6311,7 +6393,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 645 tests, all passing.
+* `cargo test --workspace` — 651 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -7059,7 +7141,11 @@ player lands.
   that says *ringing* is the same `NOTIFY` the lamps have always been
   read from. What has not been tried is the user's own Asterisk with a
   `**` feature code in its dialplan: what the server does with `**104`
-  is the one thing that decides whether the pickup works.
+  is the one thing that decides whether the pickup works. The reason
+  the pickup did **not** go out is now known — Asterisk reports a call
+  that is ringing while the extension is in use as `confirmed`, and the
+  pickup was waiting for `early` (M6.25) — but the dialplan half is
+  still the user's to write.
 * **The ringtone and the ringback have not been heard.** The tones are
   made, the WAV is read and the decision is tested — and the sound
   itself has not been through a speaker, because no call has rung yet:
