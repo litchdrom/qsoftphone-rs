@@ -16,6 +16,7 @@ mod action;
 mod app;
 mod history;
 mod picker;
+mod tray;
 
 use std::process::ExitCode;
 
@@ -97,6 +98,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             bus.clone(),
             call_events,
         );
+        // The diagnostic has no window, so it has no tray either.
+        app.set_tray(None);
         diagnostic_run(&mut app, &number, seconds);
         return Ok(());
     }
@@ -239,11 +242,27 @@ fn run_window(
     let db = Db::open(&paths.accounts_db())?;
     let (bus, call_events) = qsoftphone_sip::CallBus::new();
 
+    // The tray icon: the app's home in the notification area. It is
+    // made here and not in the app, because the tests do not want a
+    // tray icon — and because the tray needs the wake, which the bus
+    // carries.
+    let wake = bus.wake();
+    let tray = match tray::Tray::new(&wake) {
+        Ok(tray) => Some(tray),
+        Err(e) => {
+            // No tray is not a reason to refuse to start: the app
+            // works without one, and the close button ends it as it
+            // always did.
+            tracing::warn!(error = %e, "the tray icon could not be made");
+            None
+        }
+    };
+
     eframe::run_native(
         "qsoftphone",
         options,
         Box::new(move |_cc| {
-            Ok(Box::new(app::QSoftphoneApp::new(
+            let mut app = app::QSoftphoneApp::new(
                 paths.clone(),
                 db,
                 config.clone(),
@@ -251,7 +270,10 @@ fn run_window(
                 sessions.clone(),
                 bus.clone(),
                 call_events,
-            )))
+            );
+            // The tray is the app's home in the notification area.
+            app.set_tray(tray);
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })

@@ -361,6 +361,42 @@ list is udp/tcp/tls only, so the `websocket` feature
 Re-enable either in one place — the workspace `Cargo.toml` — and pay
 the cost back.
 
+**M6.30 added three packages: `tray-icon`, the system tray.**
+The per-target tree grew by three package names: **Windows 321 → 324**.
+The three are `tray-icon` itself, `muda` (the menu) and `keyboard-types`
+(muda's one new crate). `crossbeam-channel`, `crossbeam-utils` and `dpi`
+were **already** in the tree — the first through `tracing-appender`, the
+last through winit — so the whole cost of a tray on Windows is three
+crates and no new system library: the icon is the shell's own
+`Shell_NotifyIcon`, and the menu is plain Win32.
+
+The default features are **off**:
+
+```toml
+tray-icon = { version = "0.24", default-features = false }
+```
+
+They are the **Linux** tray (`libappindicator`, and with it `gtk`) and
+`libxdo`, and this build does not pull GTK into the tree — the same
+reason `rfd` uses the portal backend above. So the tray is a Windows and
+macOS feature here; on Linux the icon cannot be made, the app says so in
+the log, and the close button ends the app as it always did. The Linux
+tree grows by `muda` and `keyboard-types`, and not by the GTK subtree.
+
+The `common-controls-v6` feature of `muda` is **not** enabled either.
+It swaps the *About* dialog of the menu for a `TaskDialog`, and that
+call lives in the common controls **version 6** — loaded side by side,
+and only with an application manifest. Without the manifest the loader
+cannot find the entry point, and the program **does not start at all**:
+the first build of this milestone died with `STATUS_ENTRYPOINT_NOT_FOUND`
+before it drew anything. The menu itself is plain Win32 and needs
+nothing of the sort.
+
+The version is 0.24 and not 0.25 on purpose: 0.25 (published
+2026-11-14) declares `rust-version = "1.90"`, which would raise this
+workspace's floor from 1.85 — for a tray icon. 0.24.2 declares 1.73 and
+brings the same crates.
+
 ### Deviations from the brief's pins
 
 * `rusqlite = "0.41"` — the brief said "0.3x"; 0.41 is the current
@@ -6528,6 +6564,100 @@ A click that was already there, and the number that was already computed.
 
 ---
 
+## M6.30 — The softphone lives in the tray
+
+*"Inbound call started to play ring only if user has softphone active. I
+would like to be able to keep it in tray and recieve the calls. Poping up
+some window with call action or whole softphone."*
+
+### The window is not the app
+
+The app **was** the window: close the window and the app ended, and the
+calls ended with it. A softphone that has to be in front of the user to
+receive a call is a softphone that misses calls.
+
+The app now has a **tray icon** — its home in the notification area — and
+the window can be put away while the app carries on:
+
+* it stays **registered** with the server;
+* the **lamps** keep their state;
+* the **calls** still come in, and the **ringtone** still plays.
+
+### The close button hides the window
+
+The X button does not end the app: the window goes to the tray and the
+app keeps working. An app that hides itself has to say where it went,
+and the tray icon does:
+
+* a **click** on the icon brings the window back;
+* the menu has **Show**, **Hide** and **Quit**.
+
+**Without a tray the close ends the app**, the way it always did: there
+is nowhere to hide to, and an app that hides itself and cannot be found
+again is worse than one that quits. The icon is made when the app starts,
+and a system that will not make one is a system where the app says so in
+the log and carries on.
+
+### A call brings the window back
+
+A call that comes in while the app is in the tray **brings the window
+back**, in front of everything else: a softphone that rings in the
+notification area is a call nobody hears.
+
+This is the *whole softphone* coming back, which is one of the two
+answers the user gave. The other — a small window with **Answer** and
+**Decline** in it, so that the main window can stay in the tray — is the
+next milestone.
+
+### The icon says what the app is doing
+
+The icon is a **lamp** with a handset on it — the app's own idea of a
+lamp, because the Busy Lamp Field is what this app is about — and its
+colour says what the app is doing:
+
+| the icon | what it means |
+|---|---|
+| grey | the app is not registered |
+| green | the app is registered, and there is nothing to say |
+| amber | a call is waiting to be answered |
+
+### What is proved
+
+* **The close button puts the app in the tray**: the close is cancelled,
+  the window is hidden, and the app is still there.
+* **Without a tray the close ends the app**: there is nowhere to hide
+  to, and the app is not left unreachable.
+* **A call that comes in brings the window back**: the app asks for the
+  window, and the window is visible again.
+* **The icon says what the app is doing**: grey, green and amber.
+
+### The dependency cost: three packages
+
+`tray-icon` is the cross-platform tray. On Windows it is the shell's own
+`Shell_NotifyIcon`, and it needs only `windows-sys`, which is **already
+in the tree** through winit. The menu is `muda`, and the
+`common-controls-v6` feature is the Windows backend of it — without it
+there is no menu on Windows at all.
+
+The Windows tree grew by **three package names** — 321 → 324:
+`tray-icon`, `muda` and `keyboard-types` (muda's one new crate).
+`crossbeam-channel`, `crossbeam-utils` and `dpi` were already in the
+tree.
+
+The **default features are off** on purpose. They are the Linux tray
+(`libappindicator`, and with it `gtk`) and `libxdo`, and this build does
+not pull GTK into the tree — the same reason `rfd` uses the portal
+backend. So the tray is a **Windows and macOS** feature here: on Linux
+the icon cannot be made, the app says so in the log, and the close
+button ends the app as it always did. The Linux tree grows by `muda` and
+`keyboard-types` and not by the GTK subtree.
+
+The version is 0.24 and not 0.25 on purpose: 0.25 declares
+`rust-version = "1.90"`, which would raise the workspace's floor from
+1.85 for a tray icon. 0.24.2 declares 1.73 and brings the same crates.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -6603,6 +6733,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.27** | The server's answer is on the screen: a refused call says the **code and the reason** the server gave — `404 Not Found`, `486 Busy Here` — and the number that was dialled, while a call that ended the ordinary way goes back to `Ready.` | **done** |
 | **M6.28** | The app stops chasing its own calls: it never picks up **its own extension** nor a call it is already in, and a refused pickup is not sent again for that number — while a lamp that says *ringing* is tried again at the next ring | **done** |
 | **M6.29** | The pickup is a **press**, not a habit: the app never dials a call nobody asked for, and a **press on a lamp that is ringing** dials the pickup number — while a free or busy lamp calls the extension as it always did | **done** |
+| **M6.30** | The softphone lives in the **tray**: the window can be hidden while the app keeps its registration, its lamps and its calls — the close button hides it, the tray icon brings it back, and a **call that comes in brings the window back** | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -6666,7 +6797,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 657 tests, all passing.
+* `cargo test --workspace` — 665 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -6679,6 +6810,9 @@ player lands.
   **106 MB** and the idle CPU is **1.1 %** of one core, against **428 MB**
   and **6.0 %** for the wgpu/Vulkan build it replaced (same machine, same
   profile, same protocol).
+* **The close button puts the app in the tray, and the app stays alive.**
+  Measured on the real app: a `WM_CLOSE` to the window made it hidden and
+  the process kept running, which is only possible with a live tray icon.
 * Account CRUD round-trips through SQLite, including the policy block.
 * The config file loads, saves and round-trips; a malformed file is an
   error, not a silent reset.

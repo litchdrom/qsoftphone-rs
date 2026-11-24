@@ -42,6 +42,37 @@ ureq = "3"
 rtc.workspace = true
 cpal.workspace = true
 
+# The system tray icon — the app lives in the notification area when
+# the window is hidden, and a call that comes in brings it back (M6.30).
+#
+# `tray-icon` is the cross-platform tray: on Windows it is the shell's
+# own `Shell_NotifyIcon` and it needs only `windows-sys`, which is
+# already in the tree through winit. The menu is `muda`, and it is
+# plain Win32 on Windows.
+#
+# The default features are **off** on purpose. They are the Linux tray
+# (`libappindicator`, and with it `gtk`) and `libxdo`, and this build
+# does not pull GTK into the tree — the same reason `rfd` uses the
+# portal backend below. So the tray is a Windows and macOS feature
+# here: on Linux the icon cannot be made, the app says so in the log,
+# and the close button ends the app as it always did.
+#
+# The `common-controls-v6` feature of `muda` is **not** enabled either.
+# It swaps the "About" dialog of the menu for a `TaskDialog`, and that
+# call lives in the common controls **version 6** — which is loaded
+# side by side and needs an application manifest. Without the manifest
+# the loader cannot find the entry point and the program does not
+# start at all: the app died with `STATUS_ENTRYPOINT_NOT_FOUND` before
+# it drew anything.
+#
+# The version is 0.24 and not 0.25 on purpose. 0.25 (published
+# 2026-11-14) declares `rust-version = "1.90"`, which would raise the
+# workspace's floor from 1.85 for a tray icon. 0.24.2 declares 1.73 and
+# brings the same crates.
+#
+# The dependency budget is in the README.
+tray-icon = { version = "0.24", default-features = false }
+
 # The native file dialog — the operating system's own "pick a file"
 # window, which is what the C++ has (Qt's `FileDialog`).
 #

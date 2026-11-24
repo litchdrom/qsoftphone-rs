@@ -38,6 +38,7 @@ use qsoftphone_sip::{
 use crate::action::{self, ActionReport};
 use crate::history::{HistoryService, HistoryUpdate};
 use crate::picker::{Picked, Picker, Target};
+use crate::tray::{Tray, TrayAction, TrayState};
 
 /// The application state.
 pub struct QSoftphoneApp {
@@ -59,6 +60,23 @@ pub struct QSoftphoneApp {
     /// The Busy Lamp Field: the lamps that say whether the extensions
     /// this account watches are free, busy or ringing.
     blf: qsoftphone_sip::BlfManager,
+    /// The tray icon, when the system has one.
+    ///
+    /// It is `None` when the icon could not be made — and then the
+    /// window's close button ends the app, because an app that hides
+    /// itself and cannot be found again is worse than one that quits.
+    tray: Option<Tray>,
+    /// Whether the window is hidden — in the tray.
+    ///
+    /// The app keeps working while it is: it stays registered, the
+    /// lamps keep their state, and the calls still come in. A call that
+    /// comes in brings the window back.
+    hidden: bool,
+    /// The app is on its way out.
+    ///
+    /// The close button hides the window; this is what tells the two
+    /// apart.
+    quitting: bool,
     /// The history, and the rows it last answered with.
     history: HistoryService,
     /// The history rows the UI shows.
@@ -651,6 +669,9 @@ impl QSoftphoneApp {
             registrations: RegistrationManager::new(runtime.clone(), sessions.clone(), bus.clone()),
             calls,
             blf,
+            tray: None,
+            hidden: false,
+            quitting: false,
             history,
             history_rows: Vec::new(),
             history_query: String::new(),
@@ -709,6 +730,19 @@ impl QSoftphoneApp {
         // app.
         app.arm_startup_scripts();
         app
+    }
+
+    /// Give the app its tray icon.
+    ///
+    /// The tray is made by whatever starts the app, and not by the app
+    /// itself: the tray needs the wake, which the bus carries, and the
+    /// tests do not want an icon in the notification area.
+    ///
+    /// `None` means there is no tray — and then the close button ends
+    /// the app, because an app that hides itself and cannot be found
+    /// again is worse than one that quits.
+    pub fn set_tray(&mut self, tray: Option<Tray>) {
+        self.tray = tray;
     }
 
     /// Move the hooks that used to be on the account onto the status.
@@ -907,6 +941,108 @@ impl QSoftphoneApp {
         !self.has_a_call_to(account, extension)
     }
 
+    /// Bring the window back from the tray.
+    ///
+    /// The window comes back **in front**: a call that is waiting is
+    /// worth the user's attention, and a window that appears behind
+    /// the other windows is a window nobody sees.
+    fn show_the_window(&mut self, ctx: &egui::Context) {
+        self.hidden = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        if let Some(tray) = self.tray.as_mut() {
+            tray.set_window_visible(true);
+        }
+    }
+
+    /// Put the window away.
+    ///
+    /// The app does not stop: it stays registered, the lamps keep their
+    /// state, and the calls still come in — and a call that comes in
+    /// brings the window back.
+    fn hide_the_window(&mut self, ctx: &egui::Context) {
+        self.hidden = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        if let Some(tray) = self.tray.as_mut() {
+            tray.set_window_visible(false);
+        }
+    }
+
+    /// What the tray asked for.
+    ///
+    /// The tray's events arrive on their own thread and are read here,
+    /// where the window is: the interface thread is the only place
+    /// that may touch the window (§3).
+    fn drain_tray(&mut self, ctx: &egui::Context) {
+        let Some(tray) = self.tray.as_ref() else {
+            return;
+        };
+        let actions = tray.poll();
+        for action in actions {
+            match action {
+                TrayAction::Show => self.show_the_window(ctx),
+                TrayAction::Hide => self.hide_the_window(ctx),
+                TrayAction::Quit => {
+                    // The app is on its way out: the window may close
+                    // for real this time.
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    /// The close button does not end the app: it puts it in the tray.
+    ///
+    /// An app that hides itself has to say where it went, and the tray
+    /// icon does: the menu has **Quit**, and a click on the icon brings
+    /// the window back. Without a tray icon there is nowhere to hide
+    /// to, so the close ends the app as it always did.
+    fn handle_the_close(&mut self, ctx: &egui::Context) {
+        if ctx.input(|input| input.viewport().close_requested()) {
+            self.on_close_requested(ctx);
+        }
+    }
+
+    /// The close button was pressed.
+    ///
+    /// `true` when the app hid instead of ending: the window goes to
+    /// the tray and the app keeps working.
+    fn on_close_requested(&mut self, ctx: &egui::Context) -> bool {
+        if self.quitting || self.tray.is_none() {
+            return false;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        self.hide_the_window(ctx);
+        true
+    }
+
+    /// What the tray icon says: grey when the app is not registered,
+    /// green when it is, amber when a call is waiting.
+    fn paint_the_tray(&mut self) {
+        // The state is worked out first: the app cannot be borrowed
+        // while it is being asked about the tray.
+        let calling = self
+            .calls()
+            .iter()
+            .any(|call| !call.ended && (call.state == "ringing" || call.state == "incoming"));
+        let registered = self
+            .accounts
+            .iter()
+            .any(|account| self.registration_state(&account.id).is_registered());
+        let state = if calling {
+            TrayState::Calling
+        } else if registered {
+            TrayState::Ready
+        } else {
+            TrayState::Idle
+        };
+        if let Some(tray) = self.tray.as_mut() {
+            tray.set_state(state);
+        }
+    }
+
     /// Whether the app has a call up to this extension.
     ///
     /// The number that was dialled is the extension itself — that is
@@ -929,7 +1065,7 @@ impl QSoftphoneApp {
     }
 
     /// Drain the call events that arrived since the last frame.
-    fn drain_calls(&mut self) {
+    fn drain_calls(&mut self, ctx: &egui::Context) {
         for update in self.calls.drain() {
             let event = update.event;
             if event.call_id.is_empty() {
@@ -969,6 +1105,10 @@ impl QSoftphoneApp {
             // Whether the transfer failed — the hold comes off then.
             let mut failed = false;
 
+            // Whether the window has to come back from the tray: a
+            // call that comes in while the app is hidden.
+            let mut bring_the_window_back = false;
+
             view.account_id = account_id.clone();
             if let Some(direction) = event.call_direction {
                 view.direction = Some(direction);
@@ -1000,6 +1140,15 @@ impl QSoftphoneApp {
                     // A call is coming in: show the call page, not the
                     // account settings.
                     self.view = View::Call;
+                    // And if the app is in the tray, the window comes
+                    // back: a call that is waiting is worth the user's
+                    // attention, and a softphone that rings in the
+                    // notification area is a call nobody hears.
+                    //
+                    // The window is shown after the row's borrow is
+                    // over — the app cannot be borrowed while it is
+                    // being asked about a call.
+                    bring_the_window_back = self.hidden;
                 }
                 CallEventType::OutgoingCallInitiated => {
                     view.peer_uri = event.callee.clone();
@@ -1079,6 +1228,16 @@ impl QSoftphoneApp {
             // The call panel follows the newest call that is not over.
             if !view.ended && self.active_call_id.is_none() {
                 self.active_call_id = Some(call_id.clone());
+            }
+
+            // A call that came in while the app was in the tray brings
+            // the window back.
+            //
+            // This is after the row's borrow: the window is the app's,
+            // and the app cannot be borrowed while it is being asked
+            // about a call.
+            if bring_the_window_back {
+                self.show_the_window(ctx);
             }
 
             // The call the user has just taken is the one they are
@@ -3126,11 +3285,17 @@ impl QSoftphoneApp {
         // §3: the UI reads cached state; the network events arrive on
         // a channel and are drained here.
         self.drain_registrations();
-        self.drain_calls();
+        self.drain_calls(ui.ctx());
         self.drain_history();
         self.drain_media();
         self.drain_actions();
         self.drain_picker();
+
+        // The tray: what the user asked for in it, the close button,
+        // and what the icon says.
+        self.drain_tray(ui.ctx());
+        self.handle_the_close(ui.ctx());
+        self.paint_the_tray();
 
         // The header. One line: who we are and whether we are
         // registered. Everything else is a page.
@@ -6760,6 +6925,10 @@ mod tests {
             bus.clone(),
             receiver,
         );
+        // The tests get a tray that is not there: there is no
+        // notification area to put an icon in, and the tests are about
+        // the window.
+        app.set_tray(Some(Tray::absent()));
 
         // The tests do not beep. The player still knows what it would
         // be playing, so the decision is still tested — a test suite
@@ -6839,6 +7008,33 @@ mod tests {
     /// the first row is culled.
     fn frame(app: &mut QSoftphoneApp, ctx: &egui::Context) -> egui::FullOutput {
         frame_with(app, ctx, egui::RawInput::default())
+    }
+
+    /// The viewport commands the app sent in this frame.
+    ///
+    /// The window is the app's own: showing it, hiding it and
+    /// cancelling a close are all commands to the window, and a command
+    /// is the only thing a test can see.
+    fn viewport_commands(output: &egui::FullOutput) -> Vec<egui::ViewportCommand> {
+        output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether the app asked the window to be visible (or not).
+    fn asked_for_visibility(output: &egui::FullOutput, visible: bool) -> bool {
+        viewport_commands(output).into_iter().any(|command| {
+            matches!(command, egui::ViewportCommand::Visible(wanted) if wanted == visible)
+        })
+    }
+
+    /// Whether the app cancelled the close.
+    fn cancelled_the_close(output: &egui::FullOutput) -> bool {
+        viewport_commands(output)
+            .into_iter()
+            .any(|command| matches!(command, egui::ViewportCommand::CancelClose))
     }
 
     /// Run one frame of the UI with a given input.
@@ -7818,6 +8014,106 @@ mod tests {
         assert!(!ready.has_stop_script());
     }
 
+    /// The close button puts the app in the tray instead of ending it.
+    ///
+    /// An app that hides itself has to say where it went, and the tray
+    /// icon does — the menu has **Quit**.
+    #[tokio::test]
+    async fn the_close_button_puts_the_app_in_the_tray() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        let hid = app.on_close_requested(&ctx);
+        let output = frame(&mut app, &ctx);
+
+        assert!(hid, "the close ended the app instead of hiding it");
+        assert!(app.hidden, "the app does not know it is in the tray");
+        assert!(
+            cancelled_the_close(&output),
+            "the close was not cancelled: the app would have ended"
+        );
+        assert!(
+            asked_for_visibility(&output, false),
+            "the window was not hidden"
+        );
+    }
+
+    /// Without a tray there is nowhere to hide to, so the close ends the
+    /// app — the way it always did.
+    #[tokio::test]
+    async fn without_a_tray_the_close_ends_the_app() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        // The app without a tray: the icon could not be made.
+        app.tray = None;
+        let ctx = egui::Context::default();
+
+        let hid = app.on_close_requested(&ctx);
+        let output = frame(&mut app, &ctx);
+
+        assert!(!hid, "the app hid itself with nowhere to be found");
+        assert!(!app.hidden, "the app is hidden and cannot be reached");
+        assert!(
+            !cancelled_the_close(&output),
+            "the close was cancelled: the app cannot be quit"
+        );
+    }
+
+    /// A call that comes in while the app is in the tray brings the
+    /// window back.
+    ///
+    /// A softphone that rings in the notification area is a call nobody
+    /// hears.
+    #[tokio::test]
+    async fn a_call_that_comes_in_brings_the_window_back() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        // The app is in the tray.
+        app.hidden = true;
+
+        // And a call comes in.
+        bus.publish("acct-ui-1", incoming_event());
+        let output = frame(&mut app, &ctx);
+
+        assert!(!app.hidden, "the window did not come back for the call");
+        assert!(
+            asked_for_visibility(&output, true),
+            "the app did not ask for the window"
+        );
+    }
+
+    /// The tray icon says what the app is doing.
+    #[tokio::test]
+    async fn the_tray_icon_says_what_the_app_is_doing() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        // Nothing has been registered yet: the icon is grey.
+        frame(&mut app, &ctx);
+        assert_eq!(
+            app.tray.as_ref().expect("the tray").state(),
+            TrayState::Idle,
+            "the icon says the app is ready when it is not registered"
+        );
+
+        // A call is waiting: the icon is amber.
+        let mut ringing = CallEvent::new(CallEventType::OutgoingCallInitiated);
+        ringing.user = "104".to_string();
+        ringing.call_id = "call-waiting".to_string();
+        ringing.call_direction = Some(Direction::Outgoing);
+        ringing.call_state = "ringing".to_string();
+        ringing.callee = "sip:105@example.com".to_string();
+        bus.publish("acct-ui-1", ringing);
+        frame(&mut app, &ctx);
+
+        assert_eq!(
+            app.tray.as_ref().expect("the tray").state(),
+            TrayState::Calling,
+            "the icon does not say that a call is waiting"
+        );
+    }
+
+    /// A frame draws without a panic.
     #[tokio::test]
     async fn a_frame_draws_without_a_panic() {
         let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
