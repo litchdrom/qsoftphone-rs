@@ -66,6 +66,24 @@ pub struct QSoftphoneApp {
     /// call. So the app keeps what each lamp said, and acts on the
     /// difference.
     blf_states: HashMap<String, BlfState>,
+    /// The calls the app has made to pick one up, and what they were
+    /// for.
+    ///
+    /// The key is the call id and the value is the lamp and the number
+    /// that were dialled: it is how the app learns that the server
+    /// **refused** a pickup, and a refused pickup is not sent again.
+    pickup_calls: HashMap<String, (String, String)>,
+    /// The lamps whose last pickup was refused, and the number that
+    /// was refused.
+    ///
+    /// The server said no, and the error is in the status line.
+    /// Sending it again says it again.
+    ///
+    /// The number is part of the key because the number is what the
+    /// lamp is about: a refused `*8105` says nothing about `*8106`, and
+    /// a pickup prefix that has been changed since must be tried
+    /// again.
+    pickup_failed: HashMap<String, String>,
     /// The history, and the rows it last answered with.
     history: HistoryService,
     /// The history rows the UI shows.
@@ -659,6 +677,8 @@ impl QSoftphoneApp {
             calls,
             blf,
             blf_states: HashMap::new(),
+            pickup_calls: HashMap::new(),
+            pickup_failed: HashMap::new(),
             history,
             history_rows: Vec::new(),
             history_query: String::new(),
@@ -895,30 +915,104 @@ impl QSoftphoneApp {
         }
 
         for (account_id, extension, state) in lamps {
+            let key = lamp_key(&account_id, &extension);
             let previous = self
                 .blf_states
-                .insert(lamp_key(&account_id, &extension), state)
+                .insert(key.clone(), state)
                 .unwrap_or_default();
+
+            // The lamp is quiet: there is no call to pick up.
+            if !state.is_in_call() {
+                continue;
+            }
             // A call that has **started** — and only the start of one.
             // A lamp that goes from ringing to busy is the same call,
             // not a second one.
-            if !state.is_in_call() || previous.is_in_call() {
+            if previous.is_in_call() {
                 continue;
             }
             let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() else {
                 continue;
             };
+            // The app's own calls: the app cannot pick up its own
+            // extension, and a lamp that is busy because of the app's
+            // own call is not a call to pick up.
+            if !self.may_pick_up(&account, &extension) {
+                continue;
+            }
             let Some(number) = account.pickup_target(&extension) else {
                 continue;
             };
+            // The "just in case" case: a lamp that says only **busy**
+            // is tried **once per number**. A PBX that reports a call
+            // that is ringing *while the extension is in use* as "in
+            // use" is the reason the busy case is there at all, and the
+            // server gets one answer about a number that may not
+            // exist — and then the app believes it.
+            //
+            // A lamp that says **ringing** is tried every time: that is
+            // a call to take over, and the server may have been fixed
+            // since the last attempt.
+            if state != BlfState::Ringing && self.pickup_failed.get(&key) == Some(&number) {
+                continue;
+            }
             tracing::info!(
                 extension = %extension,
                 number = %number,
                 lamp = %state.label(),
                 "a watched extension is in a call: the call is picked up"
             );
-            self.place_call_on(&account, &number);
+            if let Some(call_id) = self.place_call_on(&account, &number) {
+                // The app remembers which call was the pickup, and for
+                // which number: that is how it learns that the server
+                // refused it.
+                self.pickup_calls.insert(call_id, (key, number));
+            }
         }
+    }
+
+    /// Whether the app may pick up a call on this extension.
+    ///
+    /// Two things say **no**, and both are the app's own calls:
+    ///
+    /// * the extension is the account's **own number** — the app *is*
+    ///   that extension, and the lamp is talking about the app's own
+    ///   calls. An account that watches itself is what an account does
+    ///   by accident, and the pickup that follows is the app picking
+    ///   up its own call;
+    /// * the app already has a call up **to that extension** — the
+    ///   lamp is busy because of the app's own call, and picking it up
+    ///   would be picking up the call the app is already in.
+    ///
+    /// The third reason — the last pickup was **refused** — needs the
+    /// number that was dialled, so it is asked in `poll_blf`, where the
+    /// number is known.
+    fn may_pick_up(&self, account: &Account, extension: &str) -> bool {
+        if extension == account.user.trim() {
+            return false;
+        }
+        !self.has_a_call_to(account, extension)
+    }
+
+    /// Whether the app has a call up to this extension.
+    ///
+    /// The number that was dialled is the extension itself — that is
+    /// what the lamp button dials — or the pickup number, which is the
+    /// prefix and the extension. Both are the app's own call, and both
+    /// are what the lamp is talking about.
+    fn has_a_call_to(&self, account: &Account, extension: &str) -> bool {
+        let pickup = account.pickup_target(extension);
+        self.calls().iter().any(|call| {
+            if call.ended {
+                return false;
+            }
+            [call.dialed_number.as_str(), call.peer.as_str()]
+                .iter()
+                .any(|target| {
+                    !target.is_empty()
+                        && (*target == extension || Some(*target) == pickup.as_deref())
+                })
+        })
     }
 
     /// Drain the call events that arrived since the last frame.
@@ -1064,6 +1158,15 @@ impl QSoftphoneApp {
                     // over — and a status line that lies about the
                     // state of the app is worse than no status line at
                     // all.
+                    // A pickup that was **refused** is not sent again
+                    // until the lamp goes quiet: the server said no,
+                    // and saying it again says it again. The error is
+                    // in the status line.
+                    if let Some((key, number)) = self.pickup_calls.remove(&call_id)
+                        && view.sip_code >= 300
+                    {
+                        self.pickup_failed.insert(key, number);
+                    }
                     self.status = Self::ended_status(view);
                 }
                 _ => {}
@@ -8074,16 +8177,61 @@ mod tests {
         );
     }
 
+    /// The id of the app's own call to a number.
+    ///
+    /// The pickup is dialled through the call layer, so the app has a
+    /// real call for it — and a test that wants to end that call the
+    /// way the server ends it has to know its id.
+    fn call_id_to(app: &QSoftphoneApp, number: &str) -> String {
+        app.calls()
+            .iter()
+            .find(|call| call.peer == number || call.dialed_number == number)
+            .map(|call| call.call_id.clone())
+            .unwrap_or_else(|| panic!("there is no call to {number}"))
+    }
+
+    /// The server ends the call.
+    fn end_call(bus: &CallBus, call_id: &str, number: &str, code: i32, cause: &str) {
+        let mut ended = CallEvent::new(CallEventType::CallEnded);
+        ended.user = "104".to_string();
+        ended.call_id = call_id.to_string();
+        ended.call_direction = Some(Direction::Outgoing);
+        ended.call_state = "ended".to_string();
+        ended.callee = format!("sip:{number}@example.com");
+        ended.dialed_number = number.to_string();
+        ended.sip_code = code;
+        ended.hangup_cause = cause.to_string();
+        bus.publish("acct-ui-1", ended);
+    }
+
     /// An app with one account that watches an extension and picks the
     /// calls up.
+    ///
+    /// The bus is handed back as well: the app's own calls arrive on
+    /// it, and whether the app picks a lamp up depends on the calls it
+    /// already has.
     async fn app_that_picks_calls_up(
         prefix: &str,
     ) -> (
         QSoftphoneApp,
         Arc<qsoftphone_sip::AccountSession>,
         egui::Context,
+        CallBus,
     ) {
-        let (mut app, _bus, sessions) = build_app_with_sessions(
+        app_that_watches(prefix, "105").await
+    }
+
+    /// An app with one account that watches **any** extension.
+    async fn app_that_watches(
+        prefix: &str,
+        watch: &str,
+    ) -> (
+        QSoftphoneApp,
+        Arc<qsoftphone_sip::AccountSession>,
+        egui::Context,
+        CallBus,
+    ) {
+        let (mut app, bus, sessions) = build_app_with_sessions(
             Db::open_in_memory().expect("db"),
             tokio::runtime::Handle::current(),
         );
@@ -8091,14 +8239,14 @@ mod tests {
 
         let mut account = app.accounts[0].clone();
         account.blf_extensions = vec![BlfEntry {
-            watch: "105".to_string(),
+            watch: watch.to_string(),
             dial: String::new(),
         }];
         account.blf_pickup_prefix = prefix.to_string();
         app.accounts[0] = account.clone();
 
-        let session = session_with_lamp(&sessions, &account, "105").await;
-        (app, session, ctx)
+        let session = session_with_lamp(&sessions, &account, watch).await;
+        (app, session, ctx, bus)
     }
 
     #[tokio::test]
@@ -8106,7 +8254,7 @@ mod tests {
         // The lamp is the feature: a watched extension that starts
         // ringing is a call to pick up, and the number that picks it up
         // is the prefix and the extension.
-        let (mut app, session, ctx) = app_that_picks_calls_up("**").await;
+        let (mut app, session, ctx, _bus) = app_that_picks_calls_up("**").await;
 
         // The extension starts ringing.
         ring(&session, "105");
@@ -8128,7 +8276,7 @@ mod tests {
         // The lamp says *ringing* over and over, and a pickup that
         // repeated would put the call through twice: the second one
         // would find no call to pick up.
-        let (mut app, session, ctx) = app_that_picks_calls_up("**").await;
+        let (mut app, session, ctx, bus) = app_that_picks_calls_up("**").await;
 
         ring(&session, "105");
         frame(&mut app, &ctx);
@@ -8142,8 +8290,11 @@ mod tests {
             "the pickup happened twice for one ring"
         );
 
-        // The extension is free again, and rings once more: the pickup
+        // The pickup call is over — the server answered it. The
+        // extension is free again, and rings once more: the pickup
         // happens again — it is a new call.
+        let call_id = call_id_to(&app, "**105");
+        end_call(&bus, &call_id, "**105", 200, "OK");
         free(&session, "105");
         frame(&mut app, &ctx);
         ring(&session, "105");
@@ -8160,7 +8311,7 @@ mod tests {
         // that is ringing **while it is already in use**, so on a stock
         // server a call that is ringing arrives as *busy* — and a
         // pickup that waits for *ringing* waits for ever.
-        let (mut app, session, ctx) = app_that_picks_calls_up("**").await;
+        let (mut app, session, ctx, _bus) = app_that_picks_calls_up("**").await;
 
         busy(&session, "105");
         frame(&mut app, &ctx);
@@ -8176,7 +8327,7 @@ mod tests {
         // A lamp that goes from ringing to busy is the **same** call,
         // not a second one: a pickup that repeated would put the call
         // through twice.
-        let (mut app, session, ctx) = app_that_picks_calls_up("**").await;
+        let (mut app, session, ctx, _bus) = app_that_picks_calls_up("**").await;
 
         ring(&session, "105");
         frame(&mut app, &ctx);
@@ -8197,7 +8348,7 @@ mod tests {
         // The feature is off until the user says which feature code the
         // server uses: a softphone that answers other people's calls on
         // its own is a softphone nobody leaves running.
-        let (mut app, session, ctx) = app_that_picks_calls_up("").await;
+        let (mut app, session, ctx, _bus) = app_that_picks_calls_up("").await;
 
         ring(&session, "105");
         frame(&mut app, &ctx);
@@ -8206,6 +8357,164 @@ mod tests {
             app.dial_number, "",
             "the call was picked up without a prefix: {}",
             app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn the_app_does_not_pick_up_its_own_extension() {
+        // An account that watches itself is an accident, not a wish.
+        // The lamp is then talking about the app's own calls, and the
+        // pickup that follows is the app picking up its own call — the
+        // live system's `*8104` was exactly that, and the server
+        // answered "404 Not Found".
+        let (mut app, session, ctx, _bus) = app_that_watches("*8", "104").await;
+
+        ring(&session, "104");
+        frame(&mut app, &ctx);
+
+        assert_eq!(
+            app.dial_number, "",
+            "the app picked up its own extension: {}",
+            app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn the_app_does_not_pick_up_a_call_it_is_already_in() {
+        // The lamp is busy **because the app is talking to it**. A
+        // pickup here would put the same call through twice: the
+        // second one would find no call to pick up.
+        let (mut app, session, ctx, bus) = app_that_picks_calls_up("**").await;
+
+        // The app calls 105 itself.
+        let mut outgoing = CallEvent::new(CallEventType::OutgoingCallInitiated);
+        outgoing.user = "104".to_string();
+        outgoing.call_id = "call-to-105".to_string();
+        outgoing.call_direction = Some(Direction::Outgoing);
+        outgoing.call_state = "initiating".to_string();
+        outgoing.callee = "sip:105@example.com".to_string();
+        outgoing.dialed_number = "105".to_string();
+        bus.publish("acct-ui-1", outgoing);
+        frame(&mut app, &ctx);
+
+        // The lamp says the extension is busy: that is the app's own
+        // call, not somebody else's.
+        busy(&session, "105");
+        frame(&mut app, &ctx);
+
+        assert_eq!(
+            app.dial_number, "",
+            "the app picked up a call it is already in: {}",
+            app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_pickup_is_not_sent_again() {
+        // The server said no — the pickup code does not exist, the
+        // extension is busy, the transfer was rejected. Saying it
+        // again says it again: the app believes the server.
+        //
+        // The lamp says only **busy** here, and that is the "just in
+        // case" case: the server may not even know what the number is.
+        let (mut app, session, ctx, bus) = app_that_picks_calls_up("*8").await;
+
+        busy(&session, "105");
+        frame(&mut app, &ctx);
+        assert_eq!(app.dial_number, "*8105", "the pickup did not go out");
+
+        // The call layer reports the call on the next frame — the
+        // pickup goes out while the frame is being drawn.
+        frame(&mut app, &ctx);
+
+        // The server refuses it.
+        let call_id = call_id_to(&app, "*8105");
+        end_call(&bus, &call_id, "*8105", 404, "404 Not Found");
+        frame(&mut app, &ctx);
+        assert!(
+            app.status.contains("404"),
+            "the error is not in the status line: {}",
+            app.status
+        );
+
+        // The lamp goes quiet and is busy again: the same call, the
+        // same refusal — the app does not ask a second time.
+        free(&session, "105");
+        frame(&mut app, &ctx);
+        app.dial_number = String::new();
+        busy(&session, "105");
+        frame(&mut app, &ctx);
+        assert_eq!(
+            app.dial_number, "",
+            "the app asked again after the server said no"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ringing_lamp_is_picked_up_again_after_a_refusal() {
+        // A lamp that says **ringing** is a call to take over, and the
+        // server may have been fixed since the last attempt: the
+        // pickup is tried again at the next ring.
+        let (mut app, session, ctx, bus) = app_that_picks_calls_up("*8").await;
+
+        ring(&session, "105");
+        frame(&mut app, &ctx);
+        assert_eq!(app.dial_number, "*8105", "the pickup did not go out");
+
+        // The call layer reports the call on the next frame.
+        frame(&mut app, &ctx);
+
+        // The server refuses it.
+        let call_id = call_id_to(&app, "*8105");
+        end_call(&bus, &call_id, "*8105", 404, "404 Not Found");
+        frame(&mut app, &ctx);
+
+        // The call is over, the lamp goes quiet and rings once more.
+        app.dial_number = String::new();
+        free(&session, "105");
+        frame(&mut app, &ctx);
+        ring(&session, "105");
+        frame(&mut app, &ctx);
+
+        assert_eq!(
+            app.dial_number, "*8105",
+            "the pickup was not tried again for the next ring"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pickup_prefix_that_is_changed_is_tried_again() {
+        // The refusal is about the **number**: the server said no to
+        // `*8105`, and a prefix that has been changed since is a
+        // different number with a different answer.
+        let (mut app, session, ctx, bus) = app_that_picks_calls_up("*8").await;
+
+        busy(&session, "105");
+        frame(&mut app, &ctx);
+        assert_eq!(app.dial_number, "*8105");
+
+        // The call layer reports the call on the next frame.
+        frame(&mut app, &ctx);
+
+        let call_id = call_id_to(&app, "*8105");
+        end_call(&bus, &call_id, "*8105", 404, "404 Not Found");
+        frame(&mut app, &ctx);
+
+        // The user fixes the prefix on the account.
+        let mut account = app.accounts[0].clone();
+        account.blf_pickup_prefix = "**".to_string();
+        app.accounts[0] = account;
+
+        // The lamp is busy again: the new number is tried.
+        free(&session, "105");
+        frame(&mut app, &ctx);
+        app.dial_number = String::new();
+        busy(&session, "105");
+        frame(&mut app, &ctx);
+
+        assert_eq!(
+            app.dial_number, "**105",
+            "the new prefix was not tried after the old one was refused"
         );
     }
 

@@ -6349,6 +6349,86 @@ One function that reads the code the event already carries.
 
 ---
 
+## M6.28 — The app stops chasing its own calls
+
+*"\*8 actually sends but after it sends again 105. But needs to … stop
+trying."*
+
+### What the live system was doing
+
+The user's own database says what happened, call after call:
+
+| the app dialled | the server said |
+|---|---|
+| `*8105` | `404 Not Found` |
+| `*8104` | `404 Not Found` |
+| `105` | `200 OK` / `486 Busy Here` — the user's own calls |
+
+Three things are wrong with that, and none of them is the PBX.
+
+**The app picked up its own extension.** The account watches `105` **and
+`104`** — itself. The lamp for `104` is the app's own lamp, and a pickup
+that follows it is the app picking up its own call: `*8104`, answered with
+`404 Not Found` by a server that has no idea what `*8104` means.
+
+**The app picked up a call it was already in.** The lamp for `105` is busy
+because the app is talking to `105`. The pickup follows the lamp, and the
+lamp says *busy* — so the app dialled `*8105` for a call it was already in.
+
+**The app kept asking.** Every refusal was answered with a dial, and the
+answer was invisible. The user saw a softphone that was busy for no reason.
+
+### The three rules
+
+| the app may pick a lamp up | the rule |
+|---|---|
+| **not** its own extension | the extension is the account's own number — the lamp is talking about the app's own calls |
+| **not** a call it is already in | the app has a call up to that extension, or to its pickup number |
+| **once per number** after a refusal | the server said no to `*8105`; saying it again says it again |
+
+The first two are about the app's own calls, and they are checked **before**
+the pickup goes out — not after the server has said no.
+
+### Busy is tried once, ringing is tried again
+
+The two cases are not the same, and the difference matters:
+
+* a lamp that says **busy** is the *just in case* case (M6.25): the server
+  may not even know what the number is. The pickup is tried **once per
+  number** — the app believes the server, and does not ask again for the
+  same number;
+* a lamp that says **ringing** is a call to take over, and the server may
+  have been **fixed** since the last attempt. The pickup is tried again at
+  the next ring.
+
+The refusal is remembered **per number**, not per lamp: a refused `*8105`
+says nothing about `*8106`, and a pickup prefix that has been changed since
+is a different number with a different answer.
+
+The memory is the app's own and lasts as long as it runs: **closing and
+reopening the app forgets it**, and so is the way to try the same number
+again after the server has been fixed. A lamp that says *ringing* does not
+need that — it is tried again at the next ring anyway.
+
+### What is proved
+
+* **The app never picks up its own extension** — the account's own number
+  is not a call to pick up.
+* **The app never picks up a call it is already in** — the lamp that is
+  busy because the app is talking to it is left alone.
+* **A refused pickup is not sent again** — the server's `404` ends the
+  trying for that number.
+* **A ringing lamp is picked up again after a refusal** — a server that was
+  fixed since the last attempt gets another chance at the next ring.
+* **A changed prefix is tried again** — the refusal was about the number,
+  not about the lamp.
+
+### The dependency cost: nothing
+
+Two maps and two comparisons.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -6422,6 +6502,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.25** | The pickup, just in case: a PBX does not always say *ringing* — Asterisk sends `confirmed` for an extension that is ringing **while it is already in use** — so the pickup is made on **any** call a watched extension starts, once per call, and the reader learns FreeSWITCH's words (`ringing`, `seated`, `hold`, `idle`) | **done** |
 | **M6.26** | The call comes back when the line is pressed: a call row that is on hold is a button, and pressing it takes the call off the hold — and the other line waits, the way it does when a call is answered | **done** |
 | **M6.27** | The server's answer is on the screen: a refused call says the **code and the reason** the server gave — `404 Not Found`, `486 Busy Here` — and the number that was dialled, while a call that ended the ordinary way goes back to `Ready.` | **done** |
+| **M6.28** | The app stops chasing its own calls: it never picks up **its own extension** nor a call it is already in, and a refused pickup is not sent again for that number — while a lamp that says *ringing* is tried again at the next ring | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -6485,7 +6566,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 655 tests, all passing.
+* `cargo test --workspace` — 660 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -7123,6 +7204,15 @@ player lands.
   `NOTIFY` with `Event: presence` on the wire, and — for the lamp to
   say anything at all — `res_pjsip_exten_state` loaded and a **hint**
   for the watched extension in `extensions.conf`.
+* **The pickup has no feature code on the user's own Asterisk yet.** The app
+  dials the account's prefix and the extension — `*8` and `105` make
+  `*8105` — and the server answers `404 Not Found`, because
+  `extensions.conf` has no rule for it. What the server needs is a
+  **directed pickup**, something like `exten => _**X!,1,Dial(PJSIP/${EXTEN:2},30)`
+  (or `_*8X!` for the `*8` prefix), and what the app owes is the **error on
+  the screen** — which M6.27 gives it, and which is the only half of this
+  the app can do alone. An app cannot make a server answer for a number the
+  server does not know.
 * **No third-party softphone has been called.** The calls in the test
   suite were made against the hand-written peer in this repository; the
   Asterisk run above ended in a `404`. The SIP messages on the wire are
