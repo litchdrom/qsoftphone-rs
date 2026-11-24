@@ -6113,6 +6113,11 @@ softphone dials prefix described in the account settings like **104 where
 
 ### The lamp picks the call up
 
+> **M6.29 replaced this.** The pickup is made by a **press** on the lamp
+> now, and not by the app on its own: the app never dials a call the user
+> did not ask for. The number, the prefix and the lamp are all as they are
+> described below — what changed is *who* presses the button.
+
 A **watched extension** that starts ringing is a call to pick up. The app
 dials the pickup number — the **prefix** the account has, and the
 extension — and the PBX hands the call over instead of letting it ring
@@ -6208,6 +6213,12 @@ lamp said *busy*, the pickup waited for *ringing*, and the code was
 never dialled. That is the whole reason.
 
 ### The pickup is made on any call, just in case
+
+> **M6.29 replaced this.** The lamp that says *busy* is **not** a call to
+> pick up any more: a directed pickup would take a colleague's call away
+> from them, so a press on a *busy* lamp calls the extension as it always
+> did. Only a lamp that says **ringing** is taken over — and only when the
+> user presses it.
 
 The pickup is now made when a watched extension **starts a call** — and
 "a call" is a lamp that says *ringing* **or** *busy*. A lamp that goes
@@ -6356,6 +6367,13 @@ trying."*
 
 ### What the live system was doing
 
+> **M6.29 changed the shape of this.** The pickup is made by a **press**
+> on the lamp now, so there is nothing to stop the app from repeating
+> itself: the user presses, and the press is answered. The two rules
+> that are still here are the two about the app's **own** calls — its own
+> extension, and a call it is already in — and they are asked when the
+> lamp is **pressed**.
+
 The user's own database says what happened, call after call:
 
 | the app dialled | the server said |
@@ -6426,6 +6444,87 @@ need that — it is tried again at the next ring anyway.
 ### The dependency cost: nothing
 
 Two maps and two comparisons.
+
+---
+
+## M6.29 — The pickup is a press, not a habit
+
+*"I dont need auto pickup the call. If user click BLF in ringing state user
+avail to pickup. Now any call in ringing state goes to send auto pickup
+code."*
+
+### The app was dialling calls nobody asked for
+
+M6.24 made the pickup **automatic**: a watched extension that started
+ringing made the app dial the pickup number by itself. M6.25 widened it to
+*any* call a watched extension started, and M6.28 stopped the app from
+chasing its own calls — but the shape was wrong the whole time. The app
+picked up calls **on its own**, and the user had no say in it.
+
+A softphone that answers other people's calls without being asked is a
+softphone nobody leaves running.
+
+So the pickup is made by a **press on the lamp** — the Yealink's way, and
+the way a person takes a call over at somebody else's desk.
+
+### What the lamp does when it is pressed
+
+| the lamp says | the press dials |
+|---|---|
+| **ringing** | the **pickup number** — the prefix and the extension |
+| **busy** | the extension, as it always did |
+| **free** | the extension, as it always did |
+
+**A busy lamp is not a call to take over.** A directed pickup takes the
+call *away* from the colleague who is in it — that is what a *directed*
+pickup is for, and it is the user's decision, not the app's. So only a
+lamp that says **ringing** is taken over.
+
+This is the one place where the M6.25 "just in case" rule gave way: a PBX
+that reports a call ringing *while the extension is in use* as *busy* — and
+Asterisk 22.8 does exactly that — will show a **busy** lamp for a call that
+is ringing, and a press on it calls the extension instead of taking the
+call over. The server is the one that hides it, and the server is the one
+that has to say `early`: `notify_early_inuse_ringing=yes` on the
+**endpoint**.
+
+### The app's own calls are still left alone
+
+Two rules survive from M6.28, and they are asked when the lamp is pressed:
+
+* **not your own extension** — an account that watches itself is an
+  accident, and the lamp is then talking about the app's own calls;
+* **not a call you are already in** — the lamp is busy because the app is
+  talking to it, and picking it up would be picking up the app's own call.
+
+A press that either of these refuses falls back to the plain call: the
+lamp is a button, and a button that does nothing is worse than one that
+does the smaller thing.
+
+### The error is still on the screen
+
+M6.27 stands: the press that the server refuses says what the server said
+— `The call to *8105 failed: 404 Not Found.` — and the user decides what
+to do about it. There is no automatic retry to stop any more, and nothing
+is remembered between the press and the answer.
+
+### What is proved
+
+* **A lamp that starts ringing does nothing on its own** — the app does
+  not dial a call the user did not ask for.
+* **Pressing a ringing lamp picks the call up** — the press dials the
+  pickup number, `*8` and `105` make `*8105`.
+* **Pressing a free lamp calls the extension** — the speed dial is what it
+  was.
+* **Pressing a busy lamp calls the extension** — a colleague's call is not
+  taken away from them.
+* **Without a prefix there is no pickup** — the press calls the extension.
+* **Your own extension is not picked up** and **a call you are already in
+  is not picked up** — both fall back to the plain call.
+
+### The dependency cost: nothing
+
+A click that was already there, and the number that was already computed.
 
 ---
 
@@ -6503,6 +6602,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.26** | The call comes back when the line is pressed: a call row that is on hold is a button, and pressing it takes the call off the hold — and the other line waits, the way it does when a call is answered | **done** |
 | **M6.27** | The server's answer is on the screen: a refused call says the **code and the reason** the server gave — `404 Not Found`, `486 Busy Here` — and the number that was dialled, while a call that ended the ordinary way goes back to `Ready.` | **done** |
 | **M6.28** | The app stops chasing its own calls: it never picks up **its own extension** nor a call it is already in, and a refused pickup is not sent again for that number — while a lamp that says *ringing* is tried again at the next ring | **done** |
+| **M6.29** | The pickup is a **press**, not a habit: the app never dials a call nobody asked for, and a **press on a lamp that is ringing** dials the pickup number — while a free or busy lamp calls the extension as it always did | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -6566,7 +6666,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 660 tests, all passing.
+* `cargo test --workspace` — 657 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -7206,9 +7306,9 @@ player lands.
   for the watched extension in `extensions.conf`.
 * **The pickup has no feature code on the user's own Asterisk yet.** The app
   dials the account's prefix and the extension — `*8` and `105` make
-  `*8105` — and the server answers `404 Not Found`, because
-  `extensions.conf` has no rule for it. What the server needs is a
-  **directed pickup**, something like `exten => _**X!,1,Dial(PJSIP/${EXTEN:2},30)`
+  `*8105` — when the lamp is **pressed** (M6.29), and the server answers
+  `404 Not Found`, because `extensions.conf` has no rule for it. What the
+  server needs is a **directed pickup**, something like `exten => _**X!,1,Dial(PJSIP/${EXTEN:2},30)`
   (or `_*8X!` for the `*8` prefix), and what the app owes is the **error on
   the screen** — which M6.27 gives it, and which is the only half of this
   the app can do alone. An app cannot make a server answer for a number the
@@ -7327,7 +7427,9 @@ player lands.
   the pickup did **not** go out is now known — Asterisk reports a call
   that is ringing while the extension is in use as `confirmed`, and the
   pickup was waiting for `early` (M6.25) — but the dialplan half is
-  still the user's to write.
+  still the user's to write. What the app does now is press the lamp
+  and dial the number (M6.29), and say what the server answered
+  (M6.27).
 * **The ringtone and the ringback have not been heard.** The tones are
   made, the WAV is read and the decision is tested — and the sound
   itself has not been through a speaker, because no call has rung yet:
