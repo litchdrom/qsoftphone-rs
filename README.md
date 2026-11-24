@@ -6294,6 +6294,61 @@ A click that was already there, and the resume that was already there.
 
 ---
 
+## M6.27 — The server's answer is on the screen
+
+*"But needs to show error recieved from server."*
+
+### "Ready." was a lie
+
+Every finished call put **Ready.** in the status line — a call that the
+server had just refused with `404 Not Found` ended with the same word as a
+call that was hung up politely. The user was left with a softphone that
+looked fine and a PBX that had said no, and nothing in between.
+
+The status line now says **what the server said**:
+
+| what happened | what the status line says |
+|---|---|
+| the call was hung up | `Ready.` |
+| the pickup code does not exist | `The call to *8105 failed: 404 Not Found.` |
+| the extension was busy | `The call to 105 failed: 486 Busy Here.` |
+| the transfer was declined | `The call to 105 failed: 603 Decline.` |
+
+The words are the **server's own**: the code and the reason that came with
+it, in the order the server wrote them. The app does not translate `404` into
+"no such number" — the user reads the same words the PBX logs, and the
+number that was dialled is named, because `*8105` and `*8104` are two
+different mistakes.
+
+The direction is right too: a call that came **from** somebody says *from*,
+not *to*.
+
+The reason often carries the code with it — the server's own words are
+`404 Not Found` — and saying it twice is noise, so the reason is used as it
+is when it already names the code.
+
+### A call that ended the ordinary way says nothing
+
+A call that was hung up is not news. The status line goes back to *Ready.*
+— a status line that always has something to say is a status line nobody
+reads.
+
+### What is proved
+
+* **A refused call says the code and the reason** — `404` and
+  `404 Not Found` are both on the screen, and so is the number that was
+  dialled.
+* **An incoming refusal says where the call came from** — *from alice*,
+  not *to alice*.
+* **A call that ended the ordinary way says nothing** — the status line
+  goes back to `Ready.`, and it does not stay on *Hanging up…* for ever.
+
+### The dependency cost: nothing
+
+One function that reads the code the event already carries.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -6366,6 +6421,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.24** | The call is picked up: a watched extension that starts **ringing** makes the app dial the account's **pickup prefix** and the extension — `**` and `104` make `**104`, the Yealink's way — once per ring, and an account without a prefix picks nothing up | **done** |
 | **M6.25** | The pickup, just in case: a PBX does not always say *ringing* — Asterisk sends `confirmed` for an extension that is ringing **while it is already in use** — so the pickup is made on **any** call a watched extension starts, once per call, and the reader learns FreeSWITCH's words (`ringing`, `seated`, `hold`, `idle`) | **done** |
 | **M6.26** | The call comes back when the line is pressed: a call row that is on hold is a button, and pressing it takes the call off the hold — and the other line waits, the way it does when a call is answered | **done** |
+| **M6.27** | The server's answer is on the screen: a refused call says the **code and the reason** the server gave — `404 Not Found`, `486 Busy Here` — and the number that was dialled, while a call that ended the ordinary way goes back to `Ready.` | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -6429,7 +6485,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 652 tests, all passing.
+* `cargo test --workspace` — 655 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and

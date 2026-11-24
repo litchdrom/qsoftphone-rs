@@ -1049,13 +1049,22 @@ impl QSoftphoneApp {
                     if let Some(record) = Self::history_record(view) {
                         self.history.record(record);
                     }
-                    // The status line goes back to what it says when
-                    // there is nothing to say. It used to stay on
-                    // "Hanging up…" for ever, because nothing ever
-                    // said the call was over — and a status line that
-                    // lies about the state of the app is worse than no
-                    // status line at all.
-                    self.status = "Ready.".to_string();
+                    // The status line says **what the server said**.
+                    //
+                    // A call that was refused is not a call that ended:
+                    // the pickup code that does not exist, the
+                    // extension that is busy, the transfer that was
+                    // rejected — the user has to know which, or the
+                    // app is guessing on their behalf. "Ready." after
+                    // a `404 Not Found` is a lie: nothing is ready.
+                    //
+                    // It goes back to what it says when there is
+                    // nothing to say. It used to stay on "Hanging up…"
+                    // for ever, because nothing ever said the call was
+                    // over — and a status line that lies about the
+                    // state of the app is worse than no status line at
+                    // all.
+                    self.status = Self::ended_status(view);
                 }
                 _ => {}
             }
@@ -1148,6 +1157,47 @@ impl QSoftphoneApp {
             .rev()
             .find(|id| self.call_views.get(*id).is_some_and(|call| !call.ended))
             .cloned();
+    }
+
+    /// What the status line says when a call is over.
+    ///
+    /// A call that was **refused** says what the server said: the
+    /// status code and the reason the server gave with it. A call that
+    /// ended the ordinary way says "Ready." — there is nothing to
+    /// report, and a status line that always has something to say is a
+    /// status line nobody reads.
+    ///
+    /// The code is the server's own: `404` is a number that does not
+    /// exist, `486` is a peer that is busy, `603` is a call that was
+    /// declined. The app does not translate them — the user reads the
+    /// same words the server said.
+    ///
+    /// The reason often carries the code with it — the server's own
+    /// words are `404 Not Found` — and saying it twice is noise, so the
+    /// reason is used as it is when it already names the code.
+    fn ended_status(view: &CallView) -> String {
+        let code = view.sip_code;
+        if code < 300 {
+            return "Ready.".to_string();
+        }
+        let peer = view.peer.trim();
+        let who = if peer.is_empty() {
+            "The call".to_string()
+        } else if view.direction == Some(Direction::Incoming) {
+            // The call came **from** the peer: it was not dialled to
+            // them.
+            format!("The call from {peer}")
+        } else {
+            format!("The call to {peer}")
+        };
+        let cause = view.hangup_cause.trim();
+        if cause.is_empty() {
+            format!("{who} failed: {code}.")
+        } else if cause.starts_with(&code.to_string()) {
+            format!("{who} failed: {cause}.")
+        } else {
+            format!("{who} failed: {code} {cause}.")
+        }
     }
 
     /// The history row for a finished call — §5.3.
@@ -8231,6 +8281,125 @@ mod tests {
         assert!(
             app.call_views["call-bob"].hold_requested,
             "the other line was not put on hold"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_that_was_refused_says_what_the_server_said() {
+        // The pickup code does not exist, the extension is busy, the
+        // transfer was rejected: the user has to know **which**, or the
+        // app is guessing on their behalf. "Ready." after a 404 is a
+        // lie — nothing is ready.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        let mut outgoing = CallEvent::new(CallEventType::OutgoingCallInitiated);
+        outgoing.user = "104".to_string();
+        outgoing.call_id = "call-pickup".to_string();
+        outgoing.call_direction = Some(Direction::Outgoing);
+        outgoing.call_state = "initiating".to_string();
+        outgoing.callee = "sip:*8105@193.178.169.164:5161".to_string();
+        outgoing.dialed_number = "*8105".to_string();
+        bus.publish("acct-ui-1", outgoing);
+        frame(&mut app, &ctx);
+
+        let mut ended = CallEvent::new(CallEventType::CallEnded);
+        ended.user = "104".to_string();
+        ended.call_id = "call-pickup".to_string();
+        ended.call_direction = Some(Direction::Outgoing);
+        ended.call_state = "ended".to_string();
+        ended.callee = "sip:*8105@193.178.169.164:5161".to_string();
+        ended.sip_code = 404;
+        ended.hangup_cause = "404 Not Found".to_string();
+        bus.publish("acct-ui-1", ended);
+        frame(&mut app, &ctx);
+
+        assert!(
+            app.status.contains("404"),
+            "the status line does not say the code: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains("Not Found"),
+            "the status line does not say what the server said: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains("*8105"),
+            "the status line does not say which call failed: {}",
+            app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_incoming_call_says_where_it_came_from() {
+        // The call came **from** the peer: it was not dialled to them,
+        // and a status line that says otherwise is the app guessing.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        let mut incoming = CallEvent::new(CallEventType::IncomingCall);
+        incoming.user = "104".to_string();
+        incoming.call_id = "call-from-alice".to_string();
+        incoming.call_direction = Some(Direction::Incoming);
+        incoming.call_state = "ringing".to_string();
+        incoming.caller = "sip:alice@example.com".to_string();
+        bus.publish("acct-ui-1", incoming);
+        frame(&mut app, &ctx);
+
+        let mut ended = CallEvent::new(CallEventType::CallEnded);
+        ended.user = "104".to_string();
+        ended.call_id = "call-from-alice".to_string();
+        ended.call_direction = Some(Direction::Incoming);
+        ended.call_state = "ended".to_string();
+        ended.caller = "sip:alice@example.com".to_string();
+        ended.sip_code = 486;
+        ended.hangup_cause = "Busy Here".to_string();
+        bus.publish("acct-ui-1", ended);
+        frame(&mut app, &ctx);
+
+        assert!(
+            app.status.contains("from alice"),
+            "the status line does not say where the call came from: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains("486 Busy Here"),
+            "the status line does not say what the server said: {}",
+            app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_that_ended_the_ordinary_way_says_nothing() {
+        // A call that was hung up is not news: the status line goes
+        // back to what it says when there is nothing to say.
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        let mut outgoing = CallEvent::new(CallEventType::OutgoingCallInitiated);
+        outgoing.user = "104".to_string();
+        outgoing.call_id = "call-1".to_string();
+        outgoing.call_direction = Some(Direction::Outgoing);
+        outgoing.call_state = "initiating".to_string();
+        outgoing.callee = "sip:105@example.com".to_string();
+        bus.publish("acct-ui-1", outgoing);
+        frame(&mut app, &ctx);
+
+        let mut ended = CallEvent::new(CallEventType::CallEnded);
+        ended.user = "104".to_string();
+        ended.call_id = "call-1".to_string();
+        ended.call_direction = Some(Direction::Outgoing);
+        ended.call_state = "ended".to_string();
+        ended.callee = "sip:105@example.com".to_string();
+        ended.sip_code = 200;
+        ended.hangup_cause = "OK".to_string();
+        bus.publish("acct-ui-1", ended);
+        frame(&mut app, &ctx);
+
+        assert_eq!(
+            app.status, "Ready.",
+            "the status line is talking about a call that ended"
         );
     }
 
