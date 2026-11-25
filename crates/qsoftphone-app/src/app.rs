@@ -36,6 +36,7 @@ use qsoftphone_sip::{
 };
 
 use crate::action::{self, ActionReport};
+use crate::callbar::{CallBar, CallBarAction, CallBarView};
 use crate::history::{HistoryService, HistoryUpdate};
 use crate::picker::{Picked, Picker, Target};
 use crate::tray::{Tray, TrayAction, TrayState};
@@ -72,6 +73,21 @@ pub struct QSoftphoneApp {
     /// lamps keep their state, and the calls still come in. A call that
     /// comes in brings the window back.
     hidden: bool,
+    /// The small window that says who is calling.
+    ///
+    /// It is for the app in the tray: when the window is on the
+    /// screen, the call page says who is calling already. Answering in
+    /// the bar brings the window back — the user is going to talk, and
+    /// the call page is where the talk happens.
+    call_bar: CallBar,
+    /// The call the user has already acted on in the bar.
+    ///
+    /// The bar does not come back for it: the user has said what they
+    /// want — answered it, turned it down, or told the bar to leave it
+    /// alone — and a bar that keeps coming back is a bar nobody can get
+    /// rid of. The call ends by itself, and the next call may be said
+    /// again.
+    call_bar_acted: Option<String>,
     /// The app is on its way out.
     ///
     /// The close button hides the window; this is what tells the two
@@ -671,6 +687,8 @@ impl QSoftphoneApp {
             blf,
             tray: None,
             hidden: false,
+            call_bar: CallBar::new(wake.clone()),
+            call_bar_acted: None,
             quitting: false,
             history,
             history_rows: Vec::new(),
@@ -1041,9 +1059,98 @@ impl QSoftphoneApp {
         } else {
             TrayState::Idle
         };
+        // And who is calling: the icon says that a call is waiting, and
+        // the tooltip says who. The user finds out without opening
+        // anything.
+        //
+        // It is worked out before the tray is borrowed: the app cannot
+        // be borrowed while it is being asked about the tray.
+        let detail = self.call_bar_view().map(|view| view.headline());
         if let Some(tray) = self.tray.as_mut() {
             tray.set_state(state);
+            tray.set_detail(detail);
         }
+    }
+
+    /// What the bar — and the tray's tooltip — says about the call
+    /// that is coming in.
+    ///
+    /// `None` when there is no call coming in.
+    fn call_bar_view(&self) -> Option<CallBarView> {
+        let call = self.incoming_call()?;
+        Some(CallBarView {
+            call_id: call.call_id.clone(),
+            account: self.account_name_of(&call.account_id),
+            number: call.peer.clone(),
+            caller: call.caller_id.clone(),
+        })
+    }
+
+    /// What the user did in the call bar.
+    ///
+    /// The bar is a window of its own, and what the user did in it
+    /// arrives here — on the app's window's thread, which is the only
+    /// place that may touch the calls (§3).
+    fn drain_the_call_bar(&mut self, ctx: &egui::Context) {
+        for action in self.call_bar.take_actions() {
+            tracing::info!(?action, "the call bar was used");
+            // The call the user acted on. The bar does not come back
+            // for it: the user has said what they want.
+            let acted = self.incoming_call().map(|call| call.call_id.clone());
+            match action {
+                CallBarAction::Answer => {
+                    self.answer_call();
+                    // The user is going to talk, and the call page is
+                    // where the talk happens: the window comes back.
+                    self.show_the_window(ctx);
+                }
+                CallBarAction::Decline => {
+                    self.decline_call();
+                    // The app stays in the tray, where it was.
+                }
+                CallBarAction::Ignore => {
+                    // The call keeps ringing; the bar goes away.
+                }
+            }
+            if let Some(call_id) = acted {
+                self.call_bar_acted = Some(call_id);
+            }
+            self.call_bar.close();
+        }
+    }
+
+    /// Whether the call bar is on the screen, and what it says.
+    ///
+    /// The bar is for the app in the tray: when the window is on the
+    /// screen, the call page says who is calling already, and two
+    /// windows saying the same thing is one window too many.
+    fn sync_the_call_bar(&mut self, ctx: &egui::Context) {
+        let ringing = self.incoming_call().map(|call| call.call_id.clone());
+        let acted = self.call_bar_acted.clone();
+        let view = if self.hidden {
+            self.call_bar_view()
+        } else {
+            None
+        };
+        // A call the user has already acted on does not get the bar
+        // again.
+        let view = view.filter(|view| acted.as_deref() != Some(view.call_id.as_str()));
+        match view {
+            Some(view) => {
+                if !self.call_bar.is_open() {
+                    tracing::info!(caller = %view.headline(), "the call bar is on the screen");
+                }
+                self.call_bar.open(view);
+            }
+            None => {
+                self.call_bar.close();
+                // The call is over: the next one may be said again.
+                if ringing.is_none() {
+                    self.call_bar_acted = None;
+                }
+            }
+        }
+        self.call_bar.sync_visibility(ctx);
     }
 
     /// Whether the app has a call up to this extension.
@@ -1068,7 +1175,7 @@ impl QSoftphoneApp {
     }
 
     /// Drain the call events that arrived since the last frame.
-    fn drain_calls(&mut self, ctx: &egui::Context) {
+    fn drain_calls(&mut self) {
         for update in self.calls.drain() {
             let event = update.event;
             if event.call_id.is_empty() {
@@ -1108,10 +1215,6 @@ impl QSoftphoneApp {
             // Whether the transfer failed — the hold comes off then.
             let mut failed = false;
 
-            // Whether the window has to come back from the tray: a
-            // call that comes in while the app is hidden.
-            let mut bring_the_window_back = false;
-
             view.account_id = account_id.clone();
             if let Some(direction) = event.call_direction {
                 view.direction = Some(direction);
@@ -1143,15 +1246,21 @@ impl QSoftphoneApp {
                     // A call is coming in: show the call page, not the
                     // account settings.
                     self.view = View::Call;
-                    // And if the app is in the tray, the window comes
-                    // back: a call that is waiting is worth the user's
-                    // attention, and a softphone that rings in the
-                    // notification area is a call nobody hears.
+                    // And if the app is in the tray, the **call bar**
+                    // says who is calling: a window of its own, in the
+                    // corner of the screen, with **Answer** and
+                    // **Decline** on it.
                     //
-                    // The window is shown after the row's borrow is
-                    // over — the app cannot be borrowed while it is
-                    // being asked about a call.
-                    bring_the_window_back = self.hidden;
+                    // The app's own window does not come back for it:
+                    // the user asked for the call to be said in one
+                    // place, and a window that takes over the screen
+                    // is the thing the bar was made to avoid. The
+                    // window comes back when the call is **answered** —
+                    // that is where the talk happens.
+                    //
+                    // The bar is opened in `sync_the_call_bar`, after
+                    // this row's borrow is over: the app cannot be
+                    // borrowed while it is being asked about a call.
                 }
                 CallEventType::OutgoingCallInitiated => {
                     view.peer_uri = event.callee.clone();
@@ -1231,16 +1340,6 @@ impl QSoftphoneApp {
             // The call panel follows the newest call that is not over.
             if !view.ended && self.active_call_id.is_none() {
                 self.active_call_id = Some(call_id.clone());
-            }
-
-            // A call that came in while the app was in the tray brings
-            // the window back.
-            //
-            // This is after the row's borrow: the window is the app's,
-            // and the app cannot be borrowed while it is being asked
-            // about a call.
-            if bring_the_window_back {
-                self.show_the_window(ctx);
             }
 
             // The call the user has just taken is the one they are
@@ -3240,7 +3339,13 @@ impl QSoftphoneApp {
         if !self.wake_armed {
             self.wake_armed = true;
             let ctx = ctx.clone();
-            self.wake.set(move || ctx.request_repaint());
+            // The **root** window is asked for, and not "the window
+            // that is being drawn": the call bar is a window of its
+            // own, and a wake that landed on it would leave the app's
+            // own window asleep.
+            self.wake.set(move || {
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            });
         }
 
         // Ask to be drawn again.
@@ -3263,7 +3368,7 @@ impl QSoftphoneApp {
         // §3: the UI reads cached state; the network events arrive on
         // a channel and are drained here.
         self.drain_registrations();
-        self.drain_calls(ctx);
+        self.drain_calls();
         self.drain_history();
         self.drain_media();
         self.drain_actions();
@@ -3274,6 +3379,17 @@ impl QSoftphoneApp {
         self.drain_tray(ctx);
         self.handle_the_close(ctx);
         self.paint_the_tray();
+
+        // The call bar: what the user did in it, and whether it is on
+        // the screen.
+        //
+        // The bar's window is asked for in **every** frame — a viewport
+        // that is not asked for again is thrown away — and the window
+        // is made in the first one, hidden, so that it is there when
+        // the call comes in.
+        self.drain_the_call_bar(ctx);
+        self.sync_the_call_bar(ctx);
+        self.call_bar.show(ctx);
     }
 
     /// Draw one frame.
@@ -6884,6 +7000,7 @@ fn media_config_of(config: &AppConfig) -> qsoftphone_media::MediaConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::callbar;
     use qsoftphone_core::model::call_event::CallEvent;
     use qsoftphone_core::storage::Db;
     use qsoftphone_core::storage::history::HistoryStore;
@@ -7075,18 +7192,6 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// The viewport commands the app sent while it was only thinking.
-    ///
-    /// A window that is hidden is given the logic and no picture, so
-    /// the commands of a hidden window come out of the logic.
-    fn logic_commands(output: &egui::LogicOutput) -> Vec<egui::ViewportCommand> {
-        output
-            .viewport_commands
-            .get(&egui::ViewportId::ROOT)
-            .cloned()
-            .unwrap_or_default()
-    }
-
     /// Whether the app asked the window to be visible (or not).
     fn asked_for_visibility(output: &egui::FullOutput, visible: bool) -> bool {
         viewport_commands(output).into_iter().any(|command| {
@@ -7114,6 +7219,11 @@ mod tests {
             egui::pos2(0.0, 0.0),
             egui::vec2(1100.0, 700.0),
         ));
+        // The call bar is a window of its own, and eframe on the
+        // desktop gives it one: the viewports are **not** embedded.
+        // A test that embedded it would draw the bar inside the app's
+        // own window, which is not what the app does.
+        ctx.set_embed_viewports(false);
         let mut output = ctx.run_ui(input, |ui| {
             // eframe runs the logic before the UI, in the same pass —
             // and only the logic when the window is hidden. A test
@@ -8129,13 +8239,15 @@ mod tests {
         );
     }
 
-    /// A call that comes in while the app is in the tray brings the
-    /// window back.
+    /// A call that comes in while the app is in the tray does **not**
+    /// take the window.
     ///
-    /// A softphone that rings in the notification area is a call nobody
-    /// hears.
+    /// The call is said in the **call bar**: a small window in the
+    /// corner of the screen, with **Answer** and **Decline** on it.
+    /// The app's own window comes back when the call is answered —
+    /// that is where the talk happens.
     #[tokio::test]
-    async fn a_call_that_comes_in_brings_the_window_back() {
+    async fn a_call_that_comes_in_does_not_take_the_window() {
         let (mut app, bus) = build_app(tokio::runtime::Handle::current());
         let ctx = egui::Context::default();
 
@@ -8146,24 +8258,24 @@ mod tests {
         bus.publish("acct-ui-1", incoming_event());
         let output = frame(&mut app, &ctx);
 
-        assert!(!app.hidden, "the window did not come back for the call");
+        assert!(app.hidden, "the window came back for the call");
         assert!(
-            asked_for_visibility(&output, true),
-            "the app did not ask for the window"
+            !asked_for_visibility(&output, true),
+            "the app did ask for the window"
         );
+        assert!(app.call_bar.is_open(), "the bar did not open for the call");
     }
 
-    /// A call that comes in while the app is in the tray brings the
-    /// window back — **even when the window is not drawn**.
+    /// A call that comes in while the app is in the tray opens the
+    /// **call bar** — even when the window is not drawn.
     ///
     /// eframe gives a hidden window the app's *logic* and nothing else:
     /// there is nothing to draw on a window that nobody can see. So
     /// everything that has to happen while the app is in the tray has
     /// to happen there. If it does not, the app in the tray is an app
-    /// that hears nothing — the call comes in, and the window stays
-    /// where it is.
+    /// that hears nothing — the call comes in, and nothing says so.
     #[tokio::test]
-    async fn a_call_brings_the_window_back_while_the_window_is_not_drawn() {
+    async fn a_call_opens_the_call_bar_while_the_window_is_not_drawn() {
         let (mut app, bus) = build_app(tokio::runtime::Handle::current());
         let ctx = egui::Context::default();
 
@@ -8175,14 +8287,26 @@ mod tests {
 
         // The window is not drawn: only the logic runs, the way eframe
         // runs it for a hidden window.
+        ctx.set_embed_viewports(false);
         let output = ctx.run_logic(&egui::RawInput::default(), |ctx| app.think(ctx));
 
-        assert!(!app.hidden, "the window did not come back for the call");
         assert!(
-            logic_commands(&output)
-                .into_iter()
-                .any(|command| matches!(command, egui::ViewportCommand::Visible(true))),
-            "the app did not ask for the window"
+            app.call_bar.is_open(),
+            "the bar did not open for the call: the app in the tray heard nothing"
+        );
+        // And the bar's own window is put on the screen: that is a
+        // command to the bar, and a command is the one thing that
+        // reaches a window while nothing is being drawn.
+        assert!(
+            output
+                .viewport_commands
+                .get(&callbar::viewport_id())
+                .is_some_and(|commands| {
+                    commands
+                        .iter()
+                        .any(|command| matches!(command, egui::ViewportCommand::Visible(true)))
+                }),
+            "the bar was not put on the screen"
         );
     }
 
@@ -8247,6 +8371,143 @@ mod tests {
             app.tray.as_ref().expect("the tray").state(),
             TrayState::Calling,
             "the icon does not say that a call is waiting"
+        );
+    }
+
+    /// A call that comes in while the app is in the tray opens the call
+    /// bar.
+    ///
+    /// The bar says who is calling, in a window of its own: the app's
+    /// window is in the tray, and the user cannot see it.
+    #[tokio::test]
+    async fn a_call_that_comes_in_while_the_app_is_in_the_tray_opens_the_call_bar() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        // The app is in the tray.
+        app.hidden = true;
+
+        // And a call comes in.
+        bus.publish("acct-ui-1", incoming_event());
+        frame(&mut app, &ctx);
+
+        assert!(app.call_bar.is_open(), "the bar did not open for the call");
+        let view = app.call_bar.view();
+        assert_eq!(view.caller, "Alice", "the bar does not name the caller");
+        assert_eq!(view.number, "6666", "the bar does not name the number");
+    }
+
+    /// The bar is for the app in the tray.
+    ///
+    /// When the window is on the screen, the call page says who is
+    /// calling already — two windows saying the same thing is one
+    /// window too many.
+    #[tokio::test]
+    async fn the_call_bar_stays_away_when_the_window_is_on_the_screen() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        bus.publish("acct-ui-1", incoming_event());
+        frame(&mut app, &ctx);
+
+        assert!(!app.call_bar.is_open(), "the bar opened over the window");
+    }
+
+    /// Answering in the bar brings the window back.
+    ///
+    /// The user is going to talk, and the call page is where the talk
+    /// happens.
+    #[tokio::test]
+    async fn answering_in_the_call_bar_brings_the_window_back() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.hidden = true;
+        bus.publish("acct-ui-1", incoming_event());
+        frame(&mut app, &ctx);
+        assert!(app.call_bar.is_open(), "the bar did not open for the call");
+
+        app.call_bar.ask(CallBarAction::Answer);
+        let output = frame(&mut app, &ctx);
+
+        assert!(!app.hidden, "the window did not come back for the call");
+        assert!(
+            asked_for_visibility(&output, true),
+            "the app did not ask for the window"
+        );
+        assert!(!app.call_bar.is_open(), "the bar is still on the screen");
+    }
+
+    /// Declining in the bar leaves the app in the tray.
+    ///
+    /// The call is turned down: there is nothing to talk about, and the
+    /// window stays where it was.
+    #[tokio::test]
+    async fn declining_in_the_call_bar_leaves_the_app_in_the_tray() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.hidden = true;
+        bus.publish("acct-ui-1", incoming_event());
+        frame(&mut app, &ctx);
+        assert!(app.call_bar.is_open(), "the bar did not open for the call");
+
+        app.call_bar.ask(CallBarAction::Decline);
+        frame(&mut app, &ctx);
+
+        assert!(
+            app.hidden,
+            "the window came back for a call that was turned down"
+        );
+        assert!(!app.call_bar.is_open(), "the bar is still on the screen");
+    }
+
+    /// A call the user has ignored does not get the bar again.
+    ///
+    /// The **✕** says "leave it ringing": the bar goes away, and it
+    /// does not come back by itself. A bar that keeps coming back is a
+    /// bar nobody can get rid of.
+    #[tokio::test]
+    async fn a_call_the_user_ignored_does_not_get_the_bar_again() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        app.hidden = true;
+        bus.publish("acct-ui-1", incoming_event());
+        frame(&mut app, &ctx);
+        assert!(app.call_bar.is_open(), "the bar did not open for the call");
+
+        app.call_bar.ask(CallBarAction::Ignore);
+        frame(&mut app, &ctx);
+        assert!(!app.call_bar.is_open(), "the bar did not go away");
+
+        // The call is still ringing, and the bar stays away.
+        frame(&mut app, &ctx);
+        assert!(!app.call_bar.is_open(), "the bar came back on its own");
+    }
+
+    /// The tray says who is calling.
+    ///
+    /// The icon says that a call is waiting; the tooltip says **who**.
+    /// The user finds out without opening anything.
+    #[tokio::test]
+    async fn the_tray_tooltip_names_the_caller() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        frame(&mut app, &ctx);
+        assert_eq!(
+            app.tray.as_ref().expect("the tray").tooltip(),
+            "qsoftphone — not registered"
+        );
+
+        bus.publish("acct-ui-1", incoming_event());
+        frame(&mut app, &ctx);
+
+        assert_eq!(
+            app.tray.as_ref().expect("the tray").tooltip(),
+            "qsoftphone — Alice (6666)",
+            "the tray does not say who is calling"
         );
     }
 

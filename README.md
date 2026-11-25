@@ -402,6 +402,11 @@ the app's own instead of from the crate's channel, and everything that
 happens while the app is in the tray moved from the drawing to the
 app's *logic*. The Windows tree is still **324** package names.
 
+**M6.32 added no package.** The call bar is an egui **child viewport** —
+a native window of its own, made by egui and eframe — and what the user
+does in it travels on a channel of the app's own. The Windows tree is
+still **324** package names, measured the same way.
+
 ### Deviations from the brief's pins
 
 * `rusqlite = "0.41"` — the brief said "0.3x"; 0.41 is the current
@@ -6758,6 +6763,103 @@ draining from the drawing to the thinking, and a log line.
 
 ---
 
+## M6.32 — The call bar
+
+*"That would be fine to have call information in the tray and poping window.
+If answer was clicked main screen also appers."*
+
+The app lives in the tray, and M6.31 made the tray **work** — the events
+are read, the icon says what the app is doing. But a call that comes in
+still brought the **whole window** back, which is the one thing a softphone
+in the notification area should not do: a window that takes over the screen
+is a window the user did not ask for.
+
+The call is now said in a **window of its own** — a short bar in the corner
+of the screen, with the caller, the number, the account, and **Answer** and
+**Decline**. Answering brings the main window up, because that is where the
+talk happens. Declining leaves the app in the tray, where it was.
+
+The variant was chosen with the user: **a small bar with Answer and
+Decline**, in the **bottom right above the tray**, and it **may take the
+focus**. The third button — the **✕** — is ours: it takes the bar off the
+screen and lets the call keep ringing, and the bar does **not** come back
+for that call. A bar that keeps coming back is a bar nobody can get rid of.
+
+### The bar is a window of its own
+
+It is an egui **child viewport**: a native window of its own, owned by the
+app's window. Three things about that are worth knowing, and all three were
+read out of the egui and eframe sources before the first line was written:
+
+* the window has to **exist** before it can be shown, and a window is only
+  made when the app draws a frame — so the bar's viewport is asked for from
+  the first frame, with the window **hidden**, and the bar is only *shown*
+  when a call comes in;
+* a viewport that is not asked for again is **thrown away** — so the bar is
+  asked for in **every** frame, visible or not;
+* a hidden window is given the app's *logic* and no picture — so the bar is
+  shown and hidden by a **command**, because a command is the one thing that
+  reaches a window while nothing is being drawn.
+
+That last one is why the bar's window is asked for in `App::logic` and not
+in the drawing: the app's window is hidden exactly when the bar is needed.
+
+### The window does not come back for a call any more
+
+M6.30 and M6.31 brought the window back when a call came in. That is
+reversed: the call opens the **bar**, and the window comes back when the
+call is **answered**. The tray's icon still turns amber, the ringtone still
+plays, and the tray's **tooltip** now says **who** is calling:
+
+```
+qsoftphone — Alice (6666)
+```
+
+The bar only appears when the app's window is **hidden**. When the window is
+on the screen, the call page says who is calling already — two windows
+saying the same thing is one window too many.
+
+### What is proved, and how
+
+* **The bar appears, in the corner, while the window stays in the tray.**
+  Measured on the real app: the window was hidden (a `WM_CLOSE`), a real
+  SIP `INVITE` went to the app's own UDP socket, and the bar's own window
+  came up at `1488,775 — 1901,1000` on a 1920×1080 screen — the bottom
+  right, above the tray — while the app's own window stayed `visible=False`.
+  The log says it: `the call bar is on the screen caller=6666`.
+* **The bar says who is calling.** The bar's window was read off the
+  screen: *Incoming call*, the caller, the number, the account the call is
+  on, and the green **Answer** and red **Decline**.
+* **Answering brings the main window back.** The user's own click, in the
+  log: `the call bar was used action=Answer` and, a moment later, `the
+  window is coming back`.
+* **The whole chain, in the log, on the real app.** The window is hidden,
+  the call comes in, and the log says it in order:
+  `the window is going to the tray` → `the tray tooltip says tooltip=qsoftphone
+  — 6666` → `the tray says state=Calling` → `the call bar is on the screen
+  caller=6666` → `the sound is playing sound=Ringtone` → `the call bar was
+  used action=Answer` → `the window is coming back`.
+* **The tray's tooltip names the caller.** The tooltip is the one thing
+  about the tray that cannot be seen without hovering, so it is said out
+  loud in the log: `the tray tooltip says tooltip=qsoftphone — 6666`, right
+  beside `the tray says state=Calling`. Read off the screen, the icon's
+  own accessible name carries the tooltip too: `qsoftphone qsoftphone —
+  ready` when there is nothing to say.
+* **The bar opens even when the window is not drawn.** The test drives the
+  app the way eframe drives a hidden window: the logic and no picture. The
+  bar still opens, and the command that puts it on the screen is still
+  sent.
+* **A call the user ignored does not get the bar again.** The **✕** takes
+  the bar away, and it stays away while that call is ringing.
+
+### The dependency cost: nothing
+
+No new package: the bar is egui's own child viewport, and the actions it
+sends travel on a channel of the app's own. The dependency tree is **324
+packages**, the same as M6.31.
+
+---
+
 ## Policy decisions
 
 Taken from the brief, recorded here so they are not re-litigated:
@@ -6835,6 +6937,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.29** | The pickup is a **press**, not a habit: the app never dials a call nobody asked for, and a **press on a lamp that is ringing** dials the pickup number — while a free or busy lamp calls the extension as it always did | **done** |
 | **M6.30** | The softphone lives in the **tray**: the window can be hidden while the app keeps its registration, its lamps and its calls — the close button hides it, the tray icon brings it back, and a **call that comes in brings the window back** | **done** |
 | **M6.31** | The tray that **listens**: the tray's events are read instead of thrown away, and everything that happens while the app is out of sight happens in the app's **logic** — so a call that comes in brings the window back, the icon says what the app is doing, and **Show**, **Hide** and **Quit** do what they say | **done** |
+| **M6.32** | The **call bar**: a call that comes in while the app is in the tray is said in a small window of its own — the caller, the number, the account, **Answer** and **Decline** — in the bottom right above the tray; answering brings the main window up, declining leaves the app in the tray, and the tray's tooltip names the caller | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -6898,7 +7001,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 667 tests, all passing.
+* `cargo test --workspace` — 679 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -6918,9 +7021,13 @@ player lands.
   log: `action=Show` → `the window is coming back`; `action=Hide` → `the
   window is going to the tray`; `action=Quit` → `qsoftphone-rs exited
   cleanly`.
-* **A call that comes in while the app is in the tray brings the window
-  back.** A real SIP `INVITE` to the app's own UDP socket, the window
-  hidden: the app answered `100 Trying` and the window came back.
+* **A call that comes in while the app is in the tray opens the call bar,
+  and the app's own window stays in the tray.** A real SIP `INVITE` to the
+  app's own UDP socket, the window hidden: the app answered `100 Trying`,
+  the bar's window came up in the bottom right, and the app's window stayed
+  hidden. Answering in the bar brings the window back — the user's own
+  click, in the log: `the call bar was used action=Answer` → `the window is
+  coming back`.
 * **The icon is the colour it says it is.** The pixels of the icon in
   the notification area, read off the screen: `58,160,108` — the green
   of *ready* — and the tooltip read `qsoftphone — ready`.

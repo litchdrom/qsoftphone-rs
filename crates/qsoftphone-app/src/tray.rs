@@ -109,6 +109,16 @@ pub struct Tray {
     /// is what the tests put an action into, and it keeps a test from
     /// putting an action into every tray of the process at once.
     pending: Mutex<Vec<TrayAction>>,
+    /// Who is calling, when somebody is.
+    ///
+    /// It is the tooltip's other half: the icon says that a call is
+    /// waiting, and the tooltip says **who**.
+    detail: Option<String>,
+    /// The tooltip as it was last set.
+    ///
+    /// A tooltip is a message to the shell, and the shell is not a
+    /// place to send messages for nothing.
+    tooltip: String,
 }
 
 impl Tray {
@@ -190,9 +200,14 @@ impl Tray {
             items: vec![show, hide, quit],
             state: TrayState::Idle,
             pending: Mutex::new(Vec::new()),
+            detail: None,
+            tooltip: String::new(),
         };
         // The window is there to begin with: the menu says *Hide*.
         tray.set_window_visible(true);
+        // The tooltip starts by saying what the app is doing — which is
+        // nothing yet: the app has not registered.
+        tray.refresh_the_tooltip();
         Ok(tray)
     }
 
@@ -209,6 +224,8 @@ impl Tray {
             items: Vec::new(),
             state: TrayState::Idle,
             pending: Mutex::new(Vec::new()),
+            detail: None,
+            tooltip: String::new(),
         }
     }
 
@@ -248,15 +265,63 @@ impl Tray {
         if let Err(e) = icon.set_icon(Some(draw(state))) {
             tracing::warn!(error = %e, "the tray icon could not be changed");
         }
-        let tooltip = match state {
+        self.refresh_the_tooltip();
+        tracing::info!(state = ?state, "the tray says");
+    }
+
+    /// Say who is calling, in the tooltip.
+    ///
+    /// The icon says that a call is waiting; the tooltip says **who**.
+    /// It is the same line the call bar says, so the tray answers the
+    /// question on its own: the user does not have to open anything to
+    /// find out who is calling.
+    pub fn set_detail(&mut self, detail: Option<String>) {
+        if self.detail == detail {
+            return;
+        }
+        self.detail = detail;
+        self.refresh_the_tooltip();
+    }
+
+    /// Put the tooltip on the screen, if it is not there already.
+    fn refresh_the_tooltip(&mut self) {
+        let Some(icon) = self.icon.as_ref() else {
+            return;
+        };
+        let tooltip = self.tooltip_text();
+        if tooltip == self.tooltip {
+            return;
+        }
+        self.tooltip = tooltip.clone();
+        if let Err(e) = icon.set_tooltip(Some(tooltip.clone())) {
+            tracing::warn!(error = %e, "the tray tooltip could not be changed");
+        }
+        // The tooltip is the one thing about the tray that cannot be
+        // seen without hovering, so it is said out loud: when a user
+        // asks "what does the icon say?", the log has the answer.
+        tracing::info!(tooltip = %tooltip, "the tray tooltip says");
+    }
+
+    /// What the tooltip says.
+    fn tooltip_text(&self) -> String {
+        let base = match self.state {
             TrayState::Idle => "qsoftphone — not registered",
             TrayState::Ready => "qsoftphone — ready",
             TrayState::Calling => "qsoftphone — a call is waiting",
         };
-        if let Err(e) = icon.set_tooltip(Some(tooltip.to_string())) {
-            tracing::warn!(error = %e, "the tray tooltip could not be changed");
+        match self.detail.as_deref() {
+            Some(detail) if !detail.is_empty() => format!("qsoftphone — {detail}"),
+            _ => base.to_string(),
         }
-        tracing::info!(state = ?state, "the tray says");
+    }
+
+    /// What the tooltip says now.
+    ///
+    /// The tests use it: the tooltip is what the user reads when the
+    /// window is in the tray, and the job is proved by reading it.
+    #[cfg(test)]
+    pub fn tooltip(&self) -> String {
+        self.tooltip_text()
     }
 
     /// What the icon is saying now.

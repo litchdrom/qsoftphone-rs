@@ -14,6 +14,7 @@
 
 mod action;
 mod app;
+mod callbar;
 mod history;
 mod picker;
 mod tray;
