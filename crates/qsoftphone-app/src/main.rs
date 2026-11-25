@@ -340,7 +340,12 @@ fn diagnostic_run(app: &mut app::QSoftphoneApp, number: &str, seconds: u64) {
     };
 
     let frame = |app: &mut app::QSoftphoneApp| {
-        let mut output = ctx.run_ui(input.clone(), |ui| app.draw(ui));
+        let mut output = ctx.run_ui(input.clone(), |ui| {
+            // The same two halves eframe runs: the logic, and then the
+            // picture.
+            app.think(ui.ctx());
+            app.draw(ui);
+        });
         output.textures_delta.clear();
         output
     };

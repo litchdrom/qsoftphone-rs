@@ -948,6 +948,7 @@ impl QSoftphoneApp {
     /// the other windows is a window nobody sees.
     fn show_the_window(&mut self, ctx: &egui::Context) {
         self.hidden = false;
+        tracing::info!("the window is coming back");
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -963,6 +964,7 @@ impl QSoftphoneApp {
     /// brings the window back.
     fn hide_the_window(&mut self, ctx: &egui::Context) {
         self.hidden = true;
+        tracing::info!("the window is going to the tray");
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         if let Some(tray) = self.tray.as_mut() {
             tray.set_window_visible(false);
@@ -980,6 +982,7 @@ impl QSoftphoneApp {
         };
         let actions = tray.poll();
         for action in actions {
+            tracing::info!(?action, "the tray asked for something");
             match action {
                 TrayAction::Show => self.show_the_window(ctx),
                 TrayAction::Hide => self.hide_the_window(ctx),
@@ -3209,6 +3212,70 @@ impl QSoftphoneApp {
 }
 
 impl QSoftphoneApp {
+    /// Everything the app does between two frames — visible or not.
+    ///
+    /// eframe splits the work of a frame in two: [`eframe::App::logic`]
+    /// runs for a window that is **hidden**, and only
+    /// [`eframe::App::ui`] waits for a window that is on the screen.
+    ///
+    /// That split is the whole answer to "the app is in the tray and
+    /// nothing happens". An app in the tray is a hidden window, and a
+    /// hidden window is given the logic and nothing else — so the
+    /// events are drained **here**, the lamps keep their state, the
+    /// icon says what the app is doing, and a call that comes in asks
+    /// for the window back.
+    ///
+    /// The picture itself is drawn by [`QSoftphoneApp::draw`], which
+    /// is the other half of the same frame.
+    pub fn think(&mut self, ctx: &egui::Context) {
+        // Point the wake at the window.
+        //
+        // The callback is egui's own "draw again": it may be called
+        // from any thread, and it is what the registration, the calls
+        // and the workers use to say "there is something new".
+        //
+        // It is armed here and not in the drawing: a window that is
+        // hidden is not drawn, and a wake that was never armed is a
+        // wake that never wakes.
+        if !self.wake_armed {
+            self.wake_armed = true;
+            let ctx = ctx.clone();
+            self.wake.set(move || ctx.request_repaint());
+        }
+
+        // Ask to be drawn again.
+        //
+        // The poll is the safety net: something that changes without
+        // saying so — a lamp, a timer, a state that was written by
+        // another thread — is still noticed, just later. A second is
+        // enough for that, and it costs a hundredth of what the old
+        // ten-a-second poll cost.
+        //
+        // The echo test is on its own thread, but it still has to be
+        // given up on if the sound card never answers, and its level
+        // has to be picked up while it runs. The level meter moves, so
+        // while the echo test runs the window is drawn faster. A tenth
+        // of a second is too slow for a bar.
+        self.check_echo_test_deadline();
+        self.poll_echo_level();
+        ctx.request_repaint_after(self.repaint_interval());
+
+        // §3: the UI reads cached state; the network events arrive on
+        // a channel and are drained here.
+        self.drain_registrations();
+        self.drain_calls(ctx);
+        self.drain_history();
+        self.drain_media();
+        self.drain_actions();
+        self.drain_picker();
+
+        // The tray: what the user asked for in it, the close button,
+        // and what the icon says.
+        self.drain_tray(ctx);
+        self.handle_the_close(ctx);
+        self.paint_the_tray();
+    }
+
     /// Draw one frame.
     ///
     /// This is the whole UI. It is a separate method from
@@ -3237,9 +3304,9 @@ impl QSoftphoneApp {
         // that change in this app all arrive from **outside** egui:
         // the registration, the calls, the media, the history. Those
         // producers wake the window themselves (§3) — the wake is
-        // installed below, on the first frame — so the window is drawn
-        // when there is something to draw, and not ten times a second
-        // when there is not.
+        // installed by [`QSoftphoneApp::think`], on the first tick —
+        // so the window is drawn when there is something to draw, and
+        // not ten times a second when there is not.
         //
         // The poll that is left is the safety net: something that
         // changes without saying so — a lamp, a timer, a state that
@@ -3261,17 +3328,6 @@ impl QSoftphoneApp {
         let poll = self.repaint_interval();
         ui.ctx().request_repaint_after(poll);
 
-        // Point the wake at the window.
-        //
-        // The callback is egui's own "draw again": it may be called
-        // from any thread, and it is what the registration, the calls
-        // and the workers use to say "there is something new".
-        if !self.wake_armed {
-            self.wake_armed = true;
-            let ctx = ui.ctx().clone();
-            self.wake.set(move || ctx.request_repaint());
-        }
-
         if !self.theme_applied {
             self.theme_applied = true;
             let visuals = if self.config.ui.theme.eq_ignore_ascii_case("light") {
@@ -3281,21 +3337,6 @@ impl QSoftphoneApp {
             };
             ui.ctx().set_visuals(visuals);
         }
-
-        // §3: the UI reads cached state; the network events arrive on
-        // a channel and are drained here.
-        self.drain_registrations();
-        self.drain_calls(ui.ctx());
-        self.drain_history();
-        self.drain_media();
-        self.drain_actions();
-        self.drain_picker();
-
-        // The tray: what the user asked for in it, the close button,
-        // and what the icon says.
-        self.drain_tray(ui.ctx());
-        self.handle_the_close(ui.ctx());
-        self.paint_the_tray();
 
         // The header. One line: who we are and whether we are
         // registered. Everything else is a page.
@@ -6500,6 +6541,17 @@ fn device_label(name: &str) -> String {
 }
 
 impl eframe::App for QSoftphoneApp {
+    /// What the app does when it ticks, visible or not.
+    ///
+    /// eframe calls this for a window that is **hidden** — and a
+    /// window that is hidden is an app that is in the tray, still
+    /// registered, still answering the calls. Everything that has to
+    /// happen while the app is out of sight happens here; see
+    /// [`QSoftphoneApp::think`].
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.think(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.draw(ui);
     }
@@ -7023,6 +7075,18 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// The viewport commands the app sent while it was only thinking.
+    ///
+    /// A window that is hidden is given the logic and no picture, so
+    /// the commands of a hidden window come out of the logic.
+    fn logic_commands(output: &egui::LogicOutput) -> Vec<egui::ViewportCommand> {
+        output
+            .viewport_commands
+            .get(&egui::ViewportId::ROOT)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Whether the app asked the window to be visible (or not).
     fn asked_for_visibility(output: &egui::FullOutput, visible: bool) -> bool {
         viewport_commands(output).into_iter().any(|command| {
@@ -7050,7 +7114,14 @@ mod tests {
             egui::pos2(0.0, 0.0),
             egui::vec2(1100.0, 700.0),
         ));
-        let mut output = ctx.run_ui(input, |ui| app.draw(ui));
+        let mut output = ctx.run_ui(input, |ui| {
+            // eframe runs the logic before the UI, in the same pass —
+            // and only the logic when the window is hidden. A test
+            // that drives the app has to do the same, or it would not
+            // be testing the app that runs.
+            app.think(ui.ctx());
+            app.draw(ui);
+        });
         output.textures_delta.clear();
         output
     }
@@ -8079,6 +8150,72 @@ mod tests {
         assert!(
             asked_for_visibility(&output, true),
             "the app did not ask for the window"
+        );
+    }
+
+    /// A call that comes in while the app is in the tray brings the
+    /// window back — **even when the window is not drawn**.
+    ///
+    /// eframe gives a hidden window the app's *logic* and nothing else:
+    /// there is nothing to draw on a window that nobody can see. So
+    /// everything that has to happen while the app is in the tray has
+    /// to happen there. If it does not, the app in the tray is an app
+    /// that hears nothing — the call comes in, and the window stays
+    /// where it is.
+    #[tokio::test]
+    async fn a_call_brings_the_window_back_while_the_window_is_not_drawn() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        // The app is in the tray.
+        app.hidden = true;
+
+        // And a call comes in.
+        bus.publish("acct-ui-1", incoming_event());
+
+        // The window is not drawn: only the logic runs, the way eframe
+        // runs it for a hidden window.
+        let output = ctx.run_logic(&egui::RawInput::default(), |ctx| app.think(ctx));
+
+        assert!(!app.hidden, "the window did not come back for the call");
+        assert!(
+            logic_commands(&output)
+                .into_iter()
+                .any(|command| matches!(command, egui::ViewportCommand::Visible(true))),
+            "the app did not ask for the window"
+        );
+    }
+
+    /// The menu of the tray does what it says.
+    ///
+    /// **Show** brings the window back, and **Quit** ends the app: the
+    /// app that hides itself has to say where it went, and the tray
+    /// menu is where it says it.
+    #[tokio::test]
+    async fn the_tray_menu_does_what_it_says() {
+        let (mut app, _bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        // The app is in the tray.
+        app.hidden = true;
+        frame(&mut app, &ctx);
+
+        // The user asks for the window back.
+        app.tray.as_ref().expect("the tray").ask(TrayAction::Show);
+        let output = frame(&mut app, &ctx);
+        assert!(!app.hidden, "the window did not come back");
+        assert!(
+            asked_for_visibility(&output, true),
+            "the app did not ask for the window"
+        );
+
+        // The user asks for the app to end.
+        app.tray.as_ref().expect("the tray").ask(TrayAction::Quit);
+        let output = frame(&mut app, &ctx);
+        assert!(app.quitting, "the app did not hear the quit");
+        assert!(
+            !cancelled_the_close(&output),
+            "the close was cancelled: the app cannot be quit"
         );
     }
 

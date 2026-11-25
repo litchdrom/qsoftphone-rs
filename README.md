@@ -397,6 +397,11 @@ The version is 0.24 and not 0.25 on purpose: 0.25 (published
 workspace's floor from 1.85 — for a tray icon. 0.24.2 declares 1.73 and
 brings the same crates.
 
+**M6.31 added no package.** The tray's events are read from a queue of
+the app's own instead of from the crate's channel, and everything that
+happens while the app is in the tray moved from the drawing to the
+app's *logic*. The Windows tree is still **324** package names.
+
 ### Deviations from the brief's pins
 
 * `rusqlite = "0.41"` — the brief said "0.3x"; 0.41 is the current
@@ -6631,6 +6636,14 @@ colour says what the app is doing:
   window, and the window is visible again.
 * **The icon says what the app is doing**: grey, green and amber.
 
+> **M6.31 corrects this milestone.** The three claims above are what
+> M6.30 was *meant* to be true; two of them were not true yet, and the
+> reason was in the frame: everything the app does while it is in the
+> tray was done inside the **drawing**, and eframe does not draw a
+> window that nobody can see. M6.31 moves it into the app's **logic**
+> and reads the tray's events from a queue of the app's own. See
+> [M6.31](#m631--the-tray-that-listens).
+
 ### The dependency cost: three packages
 
 `tray-icon` is the cross-platform tray. On Windows it is the shell's own
@@ -6655,6 +6668,93 @@ button ends the app as it always did. The Linux tree grows by `muda` and
 The version is 0.24 and not 0.25 on purpose: 0.25 declares
 `rust-version = "1.90"`, which would raise the workspace's floor from
 1.85 for a tray icon. 0.24.2 declares 1.73 and brings the same crates.
+
+---
+
+## M6.31 — The tray that listens
+
+*"Not working. No poping on call. Tray shows but with gray show. hide and
+quit do nothing."*
+
+M6.30 put the app in the tray. It did not **work** there, and there were
+two reasons — both of them in the same place, and neither of them
+visible in the code.
+
+### The first: the tray's events were thrown away
+
+`muda` and `tray-icon` each have **one** handler for the whole process,
+and each of them says this about it:
+
+> This will not receive any events if `set_event_handler` has been called
+> with a `Some` value.
+
+The handler and the channel are **alternatives, not a pair**. The M6.30
+code installed a handler — the app's *wake*, so that the window would
+hear about a click — and then read the events from the **channel**. The
+handler had just switched that channel off.
+
+So every click and every menu choice went into the handler, the handler
+woke the window, and the window read an empty channel. The icon was
+there, the menu was there, and **Show**, **Hide** and **Quit** did
+nothing at all.
+
+The handler now does **both** jobs: it puts the action in a queue and it
+wakes the window. The queue is the app's own — a global one, because the
+handler is global — and the app reads the action from there.
+
+### The second: the hidden window never ticked
+
+This is the one that explains *no popping on call* and *a grey icon*.
+
+eframe 0.37 splits the work of a frame in two:
+
+* `App::logic` — what the app **thinks**;
+* `App::ui` — what the app **draws**.
+
+And a window that is **hidden** is given the first and not the second:
+
+> A hidden window is not painted, since nothing would be shown.
+
+The M6.30 code drained every channel, handled the tray and painted the
+icon **inside `App::ui`** — inside the drawing. So a window that was in
+the tray was a window that was not drawn, and an app that was not drawn
+was an app that:
+
+* never heard about the call that came in — the event sat on the
+  channel, and nobody was there to read it;
+* never repainted the icon — so the icon stayed **grey** while the app
+  was in the tray, whatever the app was doing;
+* never heard the tray — the click went into the queue, and the queue
+  was read by the drawing.
+
+Everything that has to happen while the app is out of sight now happens
+in `App::logic` — the events are drained, the lamps keep their state,
+the icon says what the app is doing, and a call that comes in asks for
+the window back. The drawing is what is left for the drawing.
+
+### What is proved, and how
+
+* **The window comes back when a call comes in.** Measured on the real
+  app: the window was hidden (`visible after close: False`, the process
+  alive), a real SIP `INVITE` went to the app's own UDP socket, the app
+  answered `100 Trying`, and the window came back (`visible after the
+  call: True`). The log says it in two lines: `the window is going to
+  the tray` and, three seconds later, `the window is coming back`.
+* **The icon is the colour it says it is.** The pixels of the icon in
+  the notification area were read off the screen: `58,160,108` — the
+  green of *ready* — and the tooltip read `qsoftphone — ready`.
+* **Show, Hide and Quit all do what they say.** The user's own clicks
+  on the tray, in the log: `action=Show` → `the window is coming back`;
+  `action=Hide` → `the window is going to the tray`; `action=Quit` →
+  `qsoftphone-rs exited cleanly`.
+* **A call brings the window back while the window is not drawn.** The
+  test drives the app the way eframe drives a hidden window: the logic
+  and no picture. The window comes back.
+
+### The dependency cost: nothing
+
+No new package: the fix is a queue of the app's own, a move of the
+draining from the drawing to the thinking, and a log line.
 
 ---
 
@@ -6734,6 +6834,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.28** | The app stops chasing its own calls: it never picks up **its own extension** nor a call it is already in, and a refused pickup is not sent again for that number — while a lamp that says *ringing* is tried again at the next ring | **done** |
 | **M6.29** | The pickup is a **press**, not a habit: the app never dials a call nobody asked for, and a **press on a lamp that is ringing** dials the pickup number — while a free or busy lamp calls the extension as it always did | **done** |
 | **M6.30** | The softphone lives in the **tray**: the window can be hidden while the app keeps its registration, its lamps and its calls — the close button hides it, the tray icon brings it back, and a **call that comes in brings the window back** | **done** |
+| **M6.31** | The tray that **listens**: the tray's events are read instead of thrown away, and everything that happens while the app is out of sight happens in the app's **logic** — so a call that comes in brings the window back, the icon says what the app is doing, and **Show**, **Hide** and **Quit** do what they say | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -6797,7 +6898,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 665 tests, all passing.
+* `cargo test --workspace` — 667 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -6813,6 +6914,16 @@ player lands.
 * **The close button puts the app in the tray, and the app stays alive.**
   Measured on the real app: a `WM_CLOSE` to the window made it hidden and
   the process kept running, which is only possible with a live tray icon.
+* **The tray's menu does what it says.** The user's own clicks, in the
+  log: `action=Show` → `the window is coming back`; `action=Hide` → `the
+  window is going to the tray`; `action=Quit` → `qsoftphone-rs exited
+  cleanly`.
+* **A call that comes in while the app is in the tray brings the window
+  back.** A real SIP `INVITE` to the app's own UDP socket, the window
+  hidden: the app answered `100 Trying` and the window came back.
+* **The icon is the colour it says it is.** The pixels of the icon in
+  the notification area, read off the screen: `58,160,108` — the green
+  of *ready* — and the tooltip read `qsoftphone — ready`.
 * Account CRUD round-trips through SQLite, including the policy block.
 * The config file loads, saves and round-trips; a malformed file is an
   error, not a silent reset.

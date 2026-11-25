@@ -13,6 +13,8 @@
 //! app is doing: grey when it is not registered, green when it is, amber
 //! when a call is waiting.
 
+use std::sync::{Mutex, OnceLock};
+
 use qsoftphone_core::wake::Wake;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -42,6 +44,47 @@ pub enum TrayState {
 /// The size of the icon. Windows asks for 32 pixels and scales it.
 const SIZE: u32 = 32;
 
+/// The id of the **Show** item of the menu.
+const SHOW: &str = "show";
+/// The id of the **Hide** item of the menu.
+const HIDE: &str = "hide";
+/// The id of the **Quit** item of the menu.
+const QUIT: &str = "quit";
+
+/// The actions the tray has asked for.
+///
+/// A tray crate has **one** handler for the whole process, and setting
+/// it turns **off** the channel the crate would otherwise send to — the
+/// two are alternatives, not a pair:
+///
+/// > This will not receive any events if `set_event_handler` has been
+/// > called with a `Some` value.
+///
+/// So the handler puts the action in here, and the app reads it from
+/// here. The queue is global for the same reason the handler is: there
+/// is one handler, so there is one queue.
+static ACTIONS: OnceLock<Mutex<Vec<TrayAction>>> = OnceLock::new();
+
+/// The queue the handler writes to and the app reads from.
+fn queue() -> &'static Mutex<Vec<TrayAction>> {
+    ACTIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Put an action in the queue.
+///
+/// The handler runs on the tray's own thread and the app reads the
+/// queue on the window's thread: the queue is what the two share.
+fn push(action: TrayAction) {
+    let mut actions = queue().lock().expect("the tray queue is poisoned");
+    actions.push(action);
+}
+
+/// Take everything the tray has asked for since the last time.
+fn take_actions() -> Vec<TrayAction> {
+    let mut actions = queue().lock().expect("the tray queue is poisoned");
+    std::mem::take(&mut *actions)
+}
+
 /// The tray icon and its menu.
 pub struct Tray {
     /// The icon itself. Dropping it takes the icon off the screen.
@@ -50,19 +93,22 @@ pub struct Tray {
     /// area would be a mess — and in an app whose icon could not be
     /// made.
     icon: Option<TrayIcon>,
-    /// The menu items, kept because the menu holds them.
-    menu: Option<MenuItems>,
+    /// The items of the menu.
+    ///
+    /// They are kept because the menu holds them: an item that is
+    /// dropped is an item that is gone.
+    items: Vec<MenuItem>,
     /// What the icon is showing now, so it is only redrawn when it
     /// changes: redrawing an icon is a message to the shell, and the
     /// shell is not a place to send messages for nothing.
     state: TrayState,
-}
-
-/// The three items of the tray menu.
-struct MenuItems {
-    show: MenuItem,
-    hide: MenuItem,
-    quit: MenuItem,
+    /// The actions asked for in **this** tray.
+    ///
+    /// The actions the handler receives go into the global queue,
+    /// because the handler is global. This one is the tray's own: it
+    /// is what the tests put an action into, and it keeps a test from
+    /// putting an action into every tray of the process at once.
+    pending: Mutex<Vec<TrayAction>>,
 }
 
 impl Tray {
@@ -73,15 +119,21 @@ impl Tray {
     /// thread, and nothing would look at them until the window happened
     /// to be drawn. The wake says *now*.
     pub fn new(wake: &Wake) -> Result<Self, String> {
-        let show = MenuItem::with_id(MenuId::new("show"), "Show", true, None);
-        let hide = MenuItem::with_id(MenuId::new("hide"), "Hide", true, None);
-        let quit = MenuItem::with_id(MenuId::new("quit"), "Quit", true, None);
+        let show = MenuItem::with_id(MenuId::new(SHOW), "Show", true, None);
+        let hide = MenuItem::with_id(MenuId::new(HIDE), "Hide", true, None);
+        let quit = MenuItem::with_id(MenuId::new(QUIT), "Quit", true, None);
 
         let menu = Menu::new();
         for item in [&show, &hide, &quit] {
             menu.append(item)
                 .map_err(|e| format!("the tray menu: {e}"))?;
         }
+
+        // The ids the handler compares against. They are the items'
+        // own ids, so the menu and the handler cannot drift apart.
+        let show_id = show.id().clone();
+        let hide_id = hide.id().clone();
+        let quit_id = quit.id().clone();
 
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -93,15 +145,51 @@ impl Tray {
         // The tray's events are on their own thread. Without a wake the
         // window would not hear about a click until it was drawn for
         // some other reason.
+        //
+        // The handler does two things: it puts the event in the queue,
+        // and it wakes the window. It cannot leave the event to the
+        // crate's own channel — setting a handler turns that channel
+        // off, and an event that is nowhere is an event that never
+        // happened.
         let waker = wake.clone();
-        TrayIconEvent::set_event_handler(Some(move |_event| waker.wake()));
+        TrayIconEvent::set_event_handler(Some(move |event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                // A click on the icon is the shortest way back to the
+                // window: the tray is where the app is, and a click on
+                // it means "show me".
+                push(TrayAction::Show);
+            }
+            waker.wake();
+        }));
         let waker = wake.clone();
-        MenuEvent::set_event_handler(Some(move |_event| waker.wake()));
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            // The ids are the items' own, so the menu and the handler
+            // cannot drift apart.
+            let action = if event.id == show_id {
+                Some(TrayAction::Show)
+            } else if event.id == hide_id {
+                Some(TrayAction::Hide)
+            } else if event.id == quit_id {
+                Some(TrayAction::Quit)
+            } else {
+                None
+            };
+            if let Some(action) = action {
+                push(action);
+            }
+            waker.wake();
+        }));
 
         let mut tray = Self {
             icon: Some(icon),
-            menu: Some(MenuItems { show, hide, quit }),
+            items: vec![show, hide, quit],
             state: TrayState::Idle,
+            pending: Mutex::new(Vec::new()),
         };
         // The window is there to begin with: the menu says *Hide*.
         tray.set_window_visible(true);
@@ -118,39 +206,28 @@ impl Tray {
     pub fn absent() -> Self {
         Self {
             icon: None,
-            menu: None,
+            items: Vec::new(),
             state: TrayState::Idle,
+            pending: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Ask for something, as the user would in the tray.
+    ///
+    /// The tests use it: the menu of a tray that is not there cannot be
+    /// clicked, and the thing that is being tested is what the app
+    /// does with what the tray says.
+    #[cfg(test)]
+    pub fn ask(&self, action: TrayAction) {
+        let mut pending = self.pending.lock().expect("the tray is poisoned");
+        pending.push(action);
     }
 
     /// What the user asked for, since the last time.
     pub fn poll(&self) -> Vec<TrayAction> {
-        let mut actions = Vec::new();
-        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            // A click on the icon is the shortest way back to the
-            // window: the tray is where the app is, and a click on it
-            // means "show me".
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                actions.push(TrayAction::Show);
-            }
-        }
-        let Some(menu) = self.menu.as_ref() else {
-            return actions;
-        };
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id == menu.show.id() {
-                actions.push(TrayAction::Show);
-            } else if event.id == menu.hide.id() {
-                actions.push(TrayAction::Hide);
-            } else if event.id == menu.quit.id() {
-                actions.push(TrayAction::Quit);
-            }
-        }
+        let mut actions = take_actions();
+        let mut pending = self.pending.lock().expect("the tray is poisoned");
+        actions.append(&mut pending);
         actions
     }
 
@@ -166,13 +243,20 @@ impl Tray {
         let Some(icon) = self.icon.as_ref() else {
             return;
         };
-        let _ = icon.set_icon(Some(draw(state)));
+        // The icon and the tooltip are what the user sees; a failure to
+        // change them is worth saying out loud rather than swallowing.
+        if let Err(e) = icon.set_icon(Some(draw(state))) {
+            tracing::warn!(error = %e, "the tray icon could not be changed");
+        }
         let tooltip = match state {
             TrayState::Idle => "qsoftphone — not registered",
             TrayState::Ready => "qsoftphone — ready",
             TrayState::Calling => "qsoftphone — a call is waiting",
         };
-        let _ = icon.set_tooltip(Some(tooltip.to_string()));
+        if let Err(e) = icon.set_tooltip(Some(tooltip.to_string())) {
+            tracing::warn!(error = %e, "the tray tooltip could not be changed");
+        }
+        tracing::info!(state = ?state, "the tray says");
     }
 
     /// What the icon is saying now.
@@ -187,11 +271,14 @@ impl Tray {
     /// Whether the window is there: the menu says *Hide* only when
     /// there is a window to hide.
     pub fn set_window_visible(&mut self, visible: bool) {
-        let Some(menu) = self.menu.as_ref() else {
-            return;
-        };
-        menu.hide.set_enabled(visible);
-        menu.show.set_enabled(!visible);
+        for item in &self.items {
+            let id = item.id().0.as_str();
+            if id == SHOW {
+                item.set_enabled(!visible);
+            } else if id == HIDE {
+                item.set_enabled(visible);
+            }
+        }
     }
 }
 /// The icon: a lamp with a handset on it.
