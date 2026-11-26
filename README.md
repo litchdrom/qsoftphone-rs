@@ -407,6 +407,11 @@ a native window of its own, made by egui and eframe — and what the user
 does in it travels on a channel of the app's own. The Windows tree is
 still **324** package names, measured the same way.
 
+**M6.33 added no package.** The tray's menu moved to the right click,
+which is a flag on the crate that is already there, and the minimized
+window is read out of egui's own viewport state. The Windows tree is
+still **324** package names, measured the same way.
+
 ### Deviations from the brief's pins
 
 * `rusqlite = "0.41"` — the brief said "0.3x"; 0.41 is the current
@@ -6815,9 +6820,10 @@ plays, and the tray's **tooltip** now says **who** is calling:
 qsoftphone — Alice (6666)
 ```
 
-The bar only appears when the app's window is **hidden**. When the window is
-on the screen, the call page says who is calling already — two windows
-saying the same thing is one window too many.
+The bar only appears when the app's window is **hidden** — M6.33 widened that
+to a **minimized** window as well, which is a different thing and was a hole
+of its own. When the window is on the screen, the call page says who is
+calling already — two windows saying the same thing is one window too many.
 
 ### What is proved, and how
 
@@ -6857,6 +6863,116 @@ saying the same thing is one window too many.
 No new package: the bar is egui's own child viewport, and the actions it
 sends travel on a channel of the app's own. The dependency tree is **324
 packages**, the same as M6.31.
+
+---
+
+## M6.33 — The tray click and the minimized window
+
+*"if you click tray icon with left key that rises context menu and rise main
+window without posibility to do something with fleacking"*
+*"Is it possible to rise call popup if softfon is minmized?"*
+
+Two things were wrong with the tray, and both of them were found by using
+it. One is the click; the other is the call bar, which M6.32 put in the
+right place for the app in the tray and left a hole for the app that is
+merely minimized.
+
+### The left click raised the menu and the window
+
+The tray icon had **two** meanings on one button, and they fought.
+
+`tray-icon` shows its menu on the **left** click by default — that is
+`menu_on_left_click`, and it is `true` out of the box. The app was also
+treating the same left click as *"show me the window"*. So one click
+raised the menu **and** the window, and the window — 1393×922 pixels —
+came up over a menu that is 149×84. The menu was not hard to use; it was
+impossible to use, because the click that was meant for it had already
+been spent on the window.
+
+The two meanings are now on two buttons:
+
+| Click | What it does |
+|---|---|
+| **left** | the window comes back — and nothing else comes up |
+| **right** | the menu: **Show**, **Hide**, **Quit** |
+
+The right click is the menu's because the crate's `menu_on_right_click`
+is `true` by default and was never turned off. The left click gave the
+menu up on purpose: `with_menu_on_left_click(false)`.
+
+Nothing else moved. **Show**, **Hide** and **Quit** are the same three
+items, and the window still comes back when the menu says **Show** — the
+menu is not the only way to the window any more, but it is still a way.
+
+### The call bar did not come up for a minimized window
+
+M6.32 opened the bar when the app's window was **hidden** — the app in
+the notification area, nothing on the screen at all. A **minimized**
+window is a different thing: the window is still there, on the taskbar,
+and a call that came in said nothing at all. The bar was the one thing
+that was supposed to say it, and it said nothing.
+
+The bar now opens when the window is out of the way in **either** way —
+hidden or minimized:
+
+```rust
+fn window_is_away(&self, ctx: &egui::Context) -> bool {
+    self.hidden || ctx.input(|input| input.viewport().minimized).unwrap_or(false)
+}
+```
+
+Where the flag comes from was read out of the sources before it was used.
+eframe asks winit for the window's state **every frame**
+(`egui_winit::update_viewport_info`), winit answers with `IsIconic(hwnd)`,
+and the answer travels into egui as `ViewportInfo::minimized` in
+`RawInput::viewports`. The app's **logic** half reads it — the half that
+runs while the window is out of the way, which is the half that has to
+know.
+
+Answering the call in the bar brings the window back **and un-minimizes
+it**: `show_the_window` sends `Visible(true)`, `Minimized(false)` and
+`Focus`.
+
+### What is proved, and how
+
+* **The left click brings the window back, and no menu comes with it.**
+  Measured on the real app: the window was hidden (a `WM_CLOSE`), and the
+  message the shell sends on a click — `WM_USER_TRAYICON` with
+  `WM_LBUTTONUP`, sent to the tray's own window — was delivered. The log
+  says `the tray asked for something action=Show` and then `the window is
+  coming back`, and **no menu window was on the screen** (`menus=0`).
+* **The right click opens the menu, and the window stays where it is.**
+  The same message with `WM_RBUTTONUP`: a menu window came up at the
+  cursor — 149×84 at `1500,816` — and the app's window stayed hidden.
+  Read off the screen, the menu is **Show**, **Hide**, **Quit**.
+* **A call opens the bar while the window is minimized.** The window was
+  minimized for real (`ShowWindow(hwnd, 6)`, `IsIconic` true), a real SIP
+  `INVITE` went to the app's own UDP socket, and the bar's own window came
+  up at `1488,803 — 1901,1001` — bottom right, above the tray — with
+  `visible=True`, while the app's own window was `minimized=True`. Read
+  off the screen: *Incoming call*, the caller, the number, the account,
+  and the green **Answer** and red **Decline**.
+* **Answering in the bar brings the window back and un-minimizes it.** The
+  log: `the call bar was used action=Answer` → `the window is coming
+  back`, and the window was then `visible=True minimized=False`.
+* **The two rules, in the tests.** `a_left_click_brings_the_window_back
+  _and_the_menu_is_on_the_right` says the menu is not on the left click
+  and that a left click is `Show`; `a_call_opens_the_call_bar_while_the
+  _window_is_minimized` drives the app the way eframe drives a window
+  that is out of the way and says the bar opens.
+
+One thing about the measurement is worth saying out loud: the icon in the
+overflow popup has **no usable rectangle** for an automated click — the
+shell reports its position as infinity — so the click was delivered the
+way the shell delivers it, as the callback message to the tray's own
+window. What the shell does with a click is not what changed; what the
+app does with it is.
+
+### The dependency cost: nothing
+
+No new package: the menu moved with a flag the crate already has, and
+the minimized state is egui's own. The dependency tree is **324
+packages**, the same as M6.32.
 
 ---
 
@@ -6938,6 +7054,7 @@ Taken from the brief, recorded here so they are not re-litigated:
 | **M6.30** | The softphone lives in the **tray**: the window can be hidden while the app keeps its registration, its lamps and its calls — the close button hides it, the tray icon brings it back, and a **call that comes in brings the window back** | **done** |
 | **M6.31** | The tray that **listens**: the tray's events are read instead of thrown away, and everything that happens while the app is out of sight happens in the app's **logic** — so a call that comes in brings the window back, the icon says what the app is doing, and **Show**, **Hide** and **Quit** do what they say | **done** |
 | **M6.32** | The **call bar**: a call that comes in while the app is in the tray is said in a small window of its own — the caller, the number, the account, **Answer** and **Decline** — in the bottom right above the tray; answering brings the main window up, declining leaves the app in the tray, and the tray's tooltip names the caller | **done** |
+| **M6.33** | The **tray click** and the **minimized window**: a **left** click on the tray icon brings the window back and nothing else comes up, the menu (**Show**, **Hide**, **Quit**) is on the **right** click, and a call that comes in while the window is **minimized** opens the call bar as well | **done** |
 | M6 | Settings & polish: accounts UI, transport selection, SIP domain, outbound proxy, ringtone, the feature codes of §5.9 | the ringtone is done in M6.1 and M6.2 |
 
 One milestone at a time; M3 does not start before M2 works end to end.
@@ -7001,7 +7118,7 @@ player lands.
 **Verified in this repository:**
 
 * `cargo build --workspace` succeeds (rustc 1.98.1, MSVC).
-* `cargo test --workspace` — 679 tests, all passing.
+* `cargo test --workspace` — 681 tests, all passing.
 * `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 * `cargo fmt --all --check` is clean.
 * `--smoke` starts the app, creates the directories, the log file and
@@ -7028,6 +7145,17 @@ player lands.
   hidden. Answering in the bar brings the window back — the user's own
   click, in the log: `the call bar was used action=Answer` → `the window is
   coming back`.
+* **The bar opens for a minimized window too.** The window minimized for
+  real (`IsIconic` true), a real `INVITE`: the bar's own window came up in
+  the bottom right with `visible=True` while the app's window was
+  `minimized=True`. Answering in it brings the window back **and**
+  un-minimizes it — `visible=True minimized=False`.
+* **The tray's left click brings the window back and raises no menu.** The
+  message the shell sends on a click (`WM_USER_TRAYICON` /
+  `WM_LBUTTONUP`) was delivered to the tray's own window: the log says
+  `action=Show` → `the window is coming back`, and no menu window was on
+  the screen. The **right** click opens the menu — **Show**, **Hide**,
+  **Quit**, read off the screen — and the app's window stays where it is.
 * **The icon is the colour it says it is.** The pixels of the icon in
   the notification area, read off the screen: `58,160,108` — the green
   of *ready* — and the tooltip read `qsoftphone — ready`.

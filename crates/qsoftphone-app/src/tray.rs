@@ -51,6 +51,17 @@ const HIDE: &str = "hide";
 /// The id of the **Quit** item of the menu.
 const QUIT: &str = "quit";
 
+/// Whether the menu opens on a left click.
+///
+/// **No.** A left click brings the app's window back, and a right click
+/// opens the menu.
+///
+/// Both on the left click was the M6.30 shape, and it was a trap: the
+/// click raised the menu **and** the app's window, and the window came
+/// up over the menu — so the menu could not be used at all, and the
+/// click that was meant for the menu was spent on the window instead.
+const MENU_ON_LEFT_CLICK: bool = false;
+
 /// The actions the tray has asked for.
 ///
 /// A tray crate has **one** handler for the whole process, and setting
@@ -83,6 +94,23 @@ fn push(action: TrayAction) {
 fn take_actions() -> Vec<TrayAction> {
     let mut actions = queue().lock().expect("the tray queue is poisoned");
     std::mem::take(&mut *actions)
+}
+
+/// What a click on the icon means.
+///
+/// A left click brings the window back: the tray is where the app is,
+/// and a click on the icon means "show me". The **right** click opens
+/// the menu — see [`MENU_ON_LEFT_CLICK`] — so the window and the menu
+/// never come up at the same time.
+fn action_of_click(event: &TrayIconEvent) -> Option<TrayAction> {
+    match event {
+        TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        } => Some(TrayAction::Show),
+        _ => None,
+    }
 }
 
 /// The tray icon and its menu.
@@ -147,6 +175,7 @@ impl Tray {
 
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
+            .with_menu_on_left_click(MENU_ON_LEFT_CLICK)
             .with_tooltip("qsoftphone")
             .with_icon(draw(TrayState::Idle))
             .build()
@@ -163,16 +192,8 @@ impl Tray {
         // happened.
         let waker = wake.clone();
         TrayIconEvent::set_event_handler(Some(move |event| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                // A click on the icon is the shortest way back to the
-                // window: the tray is where the app is, and a click on
-                // it means "show me".
-                push(TrayAction::Show);
+            if let Some(action) = action_of_click(&event) {
+                push(action);
             }
             waker.wake();
         }));
@@ -436,6 +457,46 @@ fn segment_distance(x: f32, y: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tray_icon::{Rect, dpi};
+
+    #[test]
+    fn a_left_click_brings_the_window_back_and_the_menu_is_on_the_right() {
+        // The click that raised the menu *and* the window was a trap:
+        // the window came up over the menu, and the menu could not be
+        // used at all.
+        const {
+            assert!(
+                !MENU_ON_LEFT_CLICK,
+                "the menu and the window would fight over the same click"
+            );
+        };
+
+        let left = TrayIconEvent::Click {
+            id: tray_icon::TrayIconId::new("test"),
+            position: dpi::PhysicalPosition::new(0.0, 0.0),
+            rect: Rect::default(),
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+        };
+        assert_eq!(
+            action_of_click(&left),
+            Some(TrayAction::Show),
+            "a left click is the shortest way back to the window"
+        );
+
+        let right = TrayIconEvent::Click {
+            id: tray_icon::TrayIconId::new("test"),
+            position: dpi::PhysicalPosition::new(0.0, 0.0),
+            rect: Rect::default(),
+            button: MouseButton::Right,
+            button_state: MouseButtonState::Up,
+        };
+        assert_eq!(
+            action_of_click(&right),
+            None,
+            "the right click is the menu's, and the menu does not raise the window"
+        );
+    }
 
     #[test]
     fn the_icon_is_the_size_it_says() {

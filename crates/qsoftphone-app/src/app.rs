@@ -1072,6 +1072,20 @@ impl QSoftphoneApp {
         }
     }
 
+    /// Whether the app's window is out of the way.
+    ///
+    /// Two things put it out of the way: the close button, which puts it
+    /// in the tray, and the minimise button, which puts it on the
+    /// taskbar where nobody looks. A call that comes in while the window
+    /// is out of the way is said in the **call bar** — a small window of
+    /// its own — and not by taking the screen.
+    fn window_is_away(&self, ctx: &egui::Context) -> bool {
+        self.hidden
+            || ctx
+                .input(|input| input.viewport().minimized)
+                .unwrap_or(false)
+    }
+
     /// What the bar — and the tray's tooltip — says about the call
     /// that is coming in.
     ///
@@ -1121,13 +1135,14 @@ impl QSoftphoneApp {
 
     /// Whether the call bar is on the screen, and what it says.
     ///
-    /// The bar is for the app in the tray: when the window is on the
+    /// The bar is for the app whose window is **out of the way**: in the
+    /// tray, or minimised on the taskbar. When the window is on the
     /// screen, the call page says who is calling already, and two
     /// windows saying the same thing is one window too many.
     fn sync_the_call_bar(&mut self, ctx: &egui::Context) {
         let ringing = self.incoming_call().map(|call| call.call_id.clone());
         let acted = self.call_bar_acted.clone();
-        let view = if self.hidden {
+        let view = if self.window_is_away(ctx) {
             self.call_bar_view()
         } else {
             None
@@ -8395,6 +8410,37 @@ mod tests {
         let view = app.call_bar.view();
         assert_eq!(view.caller, "Alice", "the bar does not name the caller");
         assert_eq!(view.number, "6666", "the bar does not name the number");
+    }
+
+    /// A call that comes in while the window is **minimized** opens the
+    /// call bar.
+    ///
+    /// The window is on the taskbar, where nobody looks: the call has to
+    /// say itself in a window of its own, the same as when the app is in
+    /// the tray.
+    #[tokio::test]
+    async fn a_call_opens_the_call_bar_while_the_window_is_minimized() {
+        let (mut app, bus) = build_app(tokio::runtime::Handle::current());
+        let ctx = egui::Context::default();
+
+        // The window is minimized.
+        let mut input = egui::RawInput::default();
+        input.viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                minimized: Some(true),
+                ..Default::default()
+            },
+        );
+
+        // And a call comes in.
+        bus.publish("acct-ui-1", incoming_event());
+        frame_with(&mut app, &ctx, input);
+
+        assert!(
+            app.call_bar.is_open(),
+            "the bar did not open: a minimized window is a window nobody sees"
+        );
     }
 
     /// The bar is for the app in the tray.
